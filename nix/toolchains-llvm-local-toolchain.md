@@ -536,11 +536,26 @@ or even `grep`).
 The `toolchains_llvm` CC toolchain avoids this by **statically** linking
 libc++ (`-l:libc++.a -l:libc++abi.a`) for all configurations.
 
-**Fix:** Changed to static libc++ linking for exec config:
+**First attempt:** Static libc++ linking (`--host_linkopt -l:libc++.a`)
+caused **duplicate symbol errors** in ragel build — both `libstdc++.a`
+(from Nix wrapper's `NIX_LDFLAGS`) and `libc++.a` (from our flag) were
+being linked. `std::bad_exception`, `std::bad_alloc` etc. defined in
+both archives.
+
+**Fix:** Dynamic libc++ linking + suppress ProtocAuthenticityCheck:
 ```bazelrc
-build:system-clang --host_linkopt -l:libc++.a --host_linkopt -l:libc++abi.a
+# .bazelrc system-clang config:
+build:system-clang --host_linkopt -stdlib=libc++
 build:system-clang --host_linkopt --unwindlib=libgcc
 build:system-clang --linkopt -fuse-ld=lld --host_linkopt -fuse-ld=lld
+```
+
+The `ProtocAuthenticityCheck` rule uses `ctx.actions.run_shell()`
+**without** `use_default_shell_env = True`, so it gets a minimal
+environment where `grep`, `LD_LIBRARY_PATH`, and `PATH` aren't
+available. Suppressed via `.bazelrc.nix`:
+```bazelrc
+build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
 ```
 
 ---
@@ -551,7 +566,7 @@ build:system-clang --linkopt -fuse-ld=lld --host_linkopt -fuse-ld=lld
 |------|--------|---------|
 | `nix/shell.nix` | LLVM packages (using `libcxxClang` for libc++ headers) + `stdenv`, shellHook generates `.bazelrc.nix` with `--shell_executable`, `--action_env=PATH`, `NIX_*` vars, `LIBRARY_PATH`, `LD_LIBRARY_PATH`, `ACLOCAL_PATH` | Nix dev environment for Bazel builds |
 | `MODULE.bazel` | Added `cc_configure_extension` + `use_repo(cc_configure, "local_config_cc_toolchains")` | Make `@local_config_cc_toolchains` visible for `system-clang` config |
-| `.bazelrc` | Added `try-import %workspace%/.bazelrc.nix`; `system-clang` config: added `--host_linkopt -fuse-ld=lld`, `--host_linkopt --unwindlib=libgcc`, `--host_linkopt -l:libc++.a -l:libc++abi.a` | Load Nix-specific settings; static libc++ for exec-config tools |
+| `.bazelrc` | Added `try-import %workspace%/.bazelrc.nix`; `system-clang` config: added `--host_linkopt -fuse-ld=lld`, `--host_linkopt -stdlib=libc++`, `--host_linkopt --unwindlib=libgcc` | Load Nix-specific settings; exec-config libc++ linking |
 | `.gitignore` | Added `.bazelrc.nix` | Don't track generated file |
 | `src/v/version/expand_with_stamp_vars.bzl` | Handle `None` interpreter, `use_default_shell_env = True`, use File object for executable | Fix for local Python toolchain + NixOS |
 | `rules_python/.../stage1_bootstrap_template.sh` | `#!/bin/bash` -> `#!/usr/bin/env bash` | NixOS compat (no `/bin/bash`) |
@@ -570,9 +585,10 @@ build:system-clang --linkopt -fuse-ld=lld --host_linkopt -fuse-ld=lld
 8. Attempt 10: `protoc_minimal` can't find libstdc++.so.6 → fixed with GCC lib in `LD_LIBRARY_PATH`
 9. Attempt 11: Seastar `future.hh` template error → fixed with `libcxxClang`
 10. Attempt 11b: `-stdlib=libc++` cxxopt "unused during compilation" with `-Werror` → removed cxxopt, Nix wrapper handles it
-11. Attempt 12a: exec-config `protoc-gen-upb_stage0` link fails (undefined libc++ symbols) → added `--host_linkopt` flags
-12. Attempt 12b: exec-config `protoc` can't find `libc++.so.1` at runtime → switched to static `libc++.a` linking
-13. **Attempt 13 (2026-03-05, in progress): Build running with static libc++ for exec config**
+11. Attempt 12a: exec-config `protoc-gen-upb_stage0` link fails (undefined libc++ symbols) → added `--host_linkopt -stdlib=libc++`
+12. Attempt 12b: `ProtocAuthenticityCheck` fails (no grep/libc++.so in minimal env) → suppressed with `--@protobuf//...allow_nonstandard_protoc`
+13. Attempt 12c: static `libc++.a` caused duplicate symbols with `libstdc++.a` (ragel) → reverted to dynamic `-stdlib=libc++`
+14. **Attempt 14 (2026-03-05, in progress): Build at 6,800+ / 8,500 actions — ZERO errors**
 
 ## Open Questions
 
@@ -638,6 +654,10 @@ where `-stdlib=libc++` is the primary mechanism for finding headers.
 
 ## Next Steps
 
-1. Wait for current build to complete — already past 6,000+ actions
-2. Achieve a full clean build of `//src/v/redpanda:redpanda`
+1. **Current build in progress (2026-03-05):** 6,800+ / 8,500 actions
+   with zero errors. Building OpenSSL and other `rules_foreign_cc`
+   dependencies.
+2. If build succeeds: clean up, test a clean build from scratch
 3. Consider upstreaming the `#!/usr/bin/env bash` fix to rules_python
+4. Consider upstreaming `use_default_shell_env = True` fix to
+   protobuf's `ProtocAuthenticityCheck` rule

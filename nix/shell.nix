@@ -79,6 +79,7 @@ build --action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
 build --host_action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
 build --action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
 build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
 RCEOF
   '';
 }
