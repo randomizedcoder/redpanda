@@ -43,6 +43,7 @@ useful to contributors and users of both ecosystems.
   - [6.3 The ELF Interpreter Problem](#63-the-elf-interpreter-problem)
   - [6.4 Repository Rules: The Hardest Case](#64-repository-rules-the-hardest-case)
   - [6.5 Why "Just Mount /nix/store" Isn't Enough](#65-why-just-mount-nixstore-isnt-enough)
+  - [6.6 Why Not Just Use the System Python?](#66-why-not-just-use-the-system-python)
 - [7. Potential Changes to Improve Interoperability](#7-potential-changes-to-improve-interoperability)
   - [7.1 Changes on the Bazel Side](#71-changes-on-the-bazel-side)
   - [7.2 Changes on the Nix Side](#72-changes-on-the-nix-side)
@@ -828,6 +829,139 @@ to. The only way to get `/lib64` into the environment is to either:
 This is why targeted changes to either Bazel's repo rule execution path or
 Nix's sandbox configuration are needed — sandbox mount flags alone cannot
 solve the problem.
+
+### 6.6 Why Not Just Use the System Python?
+
+A deeper question: repository rules don't use Bazel's sandbox — they run
+directly in the parent environment. Inside a Nix sandbox, tools like `python3`
+are on PATH and have proper Nix store ELF interpreters. If Bazel's repo rules
+just called `python3` and let the environment resolve it, everything would
+"just work." No `/lib64` needed, no patchelf needed. Why doesn't this happen?
+
+The answer is that **Bazel toolchain rules download their own binaries by
+design, regardless of what's available on PATH.** This is a philosophical
+choice, not a technical limitation.
+
+#### The `python.toolchain()` decision tree
+
+When a MODULE.bazel file contains:
+
+```starlark
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.12")
+```
+
+The code path is unconditional:
+
+1. [`python.bzl:215`](https://github.com/bazelbuild/rules_python/blob/main/python/private/python.bzl#L215)
+   — `_python_impl()` processes the toolchain tag
+2. Calls `python_register_toolchains()` in
+   [`python_register_toolchains.bzl:37`](https://github.com/bazelbuild/rules_python/blob/main/python/private/python_register_toolchains.bzl#L37)
+3. For each platform with a sha256 in `TOOL_VERSIONS`, creates a
+   `python_repository()` rule that calls `rctx.download_and_extract()` in
+   [`python_repository.bzl:76-88`](https://github.com/bazelbuild/rules_python/blob/main/python/private/python_repository.bzl#L76-L88)
+
+There is no `interpreter_path` parameter on `python.toolchain()`. No
+environment variable to skip the download. No "check if python3 is already
+available" logic. It always downloads a pre-built CPython from
+python-build-standalone — an FHS binary with `/lib64/ld-linux-x86-64.so.2`
+hardcoded as its ELF interpreter.
+
+#### `local_runtime_repo` exists but isn't wired up
+
+rules_python *does* have a mechanism for using a system Python:
+[`local_runtime_repo`](https://github.com/bazelbuild/rules_python/blob/main/python/private/local_runtime_repo.bzl#L108),
+added in v1.4.0. It does exactly the right thing — resolves `python3` via PATH:
+
+[`local_runtime_repo.bzl:358`](https://github.com/bazelbuild/rules_python/blob/main/python/private/local_runtime_repo.bzl#L358)
+```python
+interpreter_path = rctx.attr.interpreter_path or "python3"
+if "/" not in interpreter_path:
+    result = repo_utils.which_unchecked(rctx, interpreter_path)
+```
+
+In a Nix sandbox with `python3` on PATH, this would find
+`/nix/store/...-python3-3.12/bin/python3` — a binary with a Nix store ELF
+interpreter. No `/lib64` needed. No patchelf needed. It would just work.
+
+**But `local_runtime_repo` is only available as a WORKSPACE macro** (via
+[`python/local_toolchains/repos.bzl`](https://github.com/bazelbuild/rules_python/blob/main/python/local_toolchains/repos.bzl)).
+It is not exposed through the `python` module extension. There is no
+`python.local_toolchain()` tag class. It cannot be used from MODULE.bazel.
+
+#### `pip.parse()` already does the right thing (almost)
+
+The `pip.parse()` extension, which runs `pip` to resolve Python package
+dependencies, has a simpler fallback:
+
+[`pip_repository.bzl:38-53`](https://github.com/bazelbuild/rules_python/blob/main/python/private/pypi/pip_repository.bzl#L38-L53)
+```python
+def _get_python_interpreter_attr(rctx):
+    if rctx.attr.python_interpreter:
+        return rctx.attr.python_interpreter
+    if "win" in rctx.os.name:
+        return "python.exe"
+    else:
+        return "python3"
+```
+
+If `python3` is on PATH, this works — it just calls `python3` and lets the
+environment resolve it. In a Nix sandbox, this would use the Nix-provided
+Python. But in practice, `pip.parse()` is typically configured to use the
+interpreter from the downloaded `python_3_12_host` repo, so when that repo
+fails, `pip.parse()` fails too.
+
+#### The same pattern across all toolchain rules
+
+This isn't unique to rules_python. The same download-first pattern appears in
+every major Bazel toolchain rule:
+
+| Rule set | Downloads | System alternative |
+|----------|-----------|-------------------|
+| `rules_python` | CPython from python-build-standalone | `local_runtime_repo` (WORKSPACE only, not MODULE.bazel) |
+| `rules_rust` | cargo, rustc, rust-std from static.rust-lang.org | No system alternative in MODULE.bazel |
+| `rules_go` | Go toolchain from golang.org | `go_host_sdk` (WORKSPACE only) |
+| `toolchains_llvm` | LLVM/Clang pre-built tarballs | No system alternative |
+
+In every case, the rule downloads an FHS binary. In every case, a system
+alternative either doesn't exist or exists only for WORKSPACE (not
+MODULE.bazel). And in every case, the Nix-provided version of the same tool
+would work without any FHS compatibility layer.
+
+#### What would fix this
+
+The fix is surprisingly small for each rule set — expose the existing local
+toolchain mechanism through the module extension:
+
+**For rules_python**: Add a `python.local_toolchain()` tag class that creates a
+`local_runtime_repo` instead of a `python_repository`:
+
+```starlark
+python.local_toolchain(
+    python_version = "3.12",
+    interpreter_path = "python3",  # resolved via PATH at repo rule time
+)
+```
+
+This would benefit NixOS, Guix, any system with a package-manager-provided
+Python, and CI environments where Python is pre-installed. It requires no
+changes to Bazel core — only to the rule set.
+
+**For rules_rust**: Accept `CARGO` and `RUSTC` environment variables in the
+`rust.toolchain()` extension, or add a `rust.local_toolchain()` that uses
+system-provided Rust.
+
+**For rules_go**: `go_host_sdk` already exists for WORKSPACE; expose it
+through the `go_sdk` module extension.
+
+**For toolchains_llvm**: Accept a system-provided LLVM via a module extension
+tag.
+
+These are rule-level changes, not Bazel core changes. They don't compromise
+Bazel's hermeticity model — the toolchain is still declared, just resolved
+from the environment rather than downloaded. And they align with how Nix
+already provides these tools: as content-addressed store paths with correct
+ELF interpreters, available on PATH.
 
 ---
 
