@@ -43,6 +43,10 @@ bazel_dep(name = "rules_go", version = "0.59.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_python", version = "1.5.1")
+local_path_override(
+    module_name = "rules_python",
+    path = "/home/das/Downloads/rules_python",
+)
 bazel_dep(name = "rules_rust", version = "0.60.0")
 bazel_dep(name = "snappy", version = "1.2.1")
 bazel_dep(name = "yaml-cpp", version = "0.8.0")
@@ -70,6 +74,12 @@ python.toolchain(
     is_default = True,
     python_version = "3.12",
 )
+python.local_toolchain(
+    python_version = "3.12",
+    interpreter_path = "python3",
+)
+use_repo(python, "local_python_3_12", "local_python_3_12_toolchains")
+register_toolchains("@local_python_3_12_toolchains//:all")
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(

@@ -49,6 +49,13 @@ useful to contributors and users of both ecosystems.
   - [7.2 Changes on the Nix Side](#72-changes-on-the-nix-side)
   - [7.3 Changes in the Bazel Rule Ecosystem](#73-changes-in-the-bazel-rule-ecosystem)
 - [8. Summary](#8-summary)
+- [9. Implementation: Patching rules_python to Use Nix-Provided Python](#9-implementation-patching-rules_python-to-use-nix-provided-python)
+  - [9.1 Goal](#91-goal)
+  - [9.2 The Code Path Today](#92-the-code-path-today)
+  - [9.3 What Already Exists](#93-what-already-exists)
+  - [9.4 The Patch: Add `local_toolchain` Tag Class](#94-the-patch-add-local_toolchain-tag-class)
+  - [9.5 Usage in Redpanda's MODULE.bazel](#95-usage-in-redpandas-modulebazel)
+  - [9.6 Files Changed in rules_python](#96-files-changed-in-rules_python)
 
 ---
 
@@ -1170,6 +1177,232 @@ environment provisioning. Bazel excels at fast, incremental, fine-grained build
 execution with remote caching. A well-integrated combination — where Nix
 provides toolchains and Bazel orchestrates builds — would be more powerful than
 either system alone.
+
+---
+
+## 9. Implementation: Patching rules_python to Use Nix-Provided Python
+
+This section documents the concrete patch to `rules_python` (v1.5.1) that
+wires up the existing `local_runtime_repo` mechanism through the MODULE.bazel
+extension, so that `python.local_toolchain()` can be used instead of (or
+alongside) `python.toolchain()`.
+
+### 9.1 Goal
+
+Make Bazel call the Nix-provided `python3` (resolved via `PATH` to a
+`/nix/store/...` path) instead of downloading a pre-built CPython binary with
+a hardcoded `/lib64/ld-linux-x86-64.so.2` ELF interpreter.
+
+We don't care whether Bazel still *downloads* the FHS binary — we care that
+when it *executes* Python (for pip, for build scripts, for tests), it uses
+the Nix-provided one.
+
+### 9.2 The Code Path Today
+
+When MODULE.bazel contains `python.toolchain(python_version = "3.12")`, the
+call chain is:
+
+```
+MODULE.bazel
+  └─ python.toolchain(python_version = "3.12")
+       └─ _python_impl()                          # python/private/python.bzl:215
+            └─ python_register_toolchains()        # python/private/python_register_toolchains.bzl
+                 └─ for each platform:
+                      python_repository()          # python/private/python_repository.bzl
+                        ├─ rctx.download_and_extract()   # downloads FHS CPython
+                        └─ py_runtime(interpreter = "bin/python3")  # points to downloaded binary
+```
+
+Every step is unconditional. There is no `interpreter_path` parameter, no
+environment variable override, no "check if python3 is on PATH" logic.
+
+### 9.3 What Already Exists
+
+rules_python v1.5.1 already has all the pieces for local Python toolchains,
+just not wired to MODULE.bazel:
+
+| Component | File | What it does |
+|-----------|------|--------------|
+| `local_runtime_repo` | `python/private/local_runtime_repo.bzl:230` | Repository rule that discovers a system Python. Calls `which python3` (or uses a provided path), queries it for version/ABI/library info, generates a `py_runtime` with `interpreter_path` pointing to the resolved binary. |
+| `_resolve_interpreter_path` | `python/private/local_runtime_repo.bzl:339` | The PATH lookup logic. If the value has no slashes, calls `repo_utils.which_unchecked(rctx, interpreter_path)`. In a Nix sandbox, this resolves to `/nix/store/...-python3-3.12.x/bin/python3`. |
+| `local_runtime_toolchains_repo` | `python/private/local_runtime_toolchains_repo.bzl:51` | Creates `toolchain()` definitions that point at a `local_runtime_repo`. Supports both version-aware and version-unaware registration. |
+| `define_local_runtime_toolchain_impl` | `python/private/local_runtime_repo_setup.bzl` | Generates the `BUILD.bazel` inside a local runtime repo with `py_runtime(interpreter_path = "/nix/store/.../bin/python3")`. |
+
+The gap is in `python/private/python.bzl` — the module extension's
+`tag_classes` dict (line 1352, unpatched) has no `local_toolchain` entry. The
+`_python_impl()` function (line 215) only processes `toolchain` tags and
+always calls `python_register_toolchains()`, which always calls
+`python_repository()`, which always downloads.
+
+### 9.4 The Patch
+
+The patch modifies a single file: `python/private/python.bzl`. It was applied
+to a branch (`nix-local-toolchain`) based on the `1.5.1` tag. Four changes:
+
+#### 9.4.1 New imports (lines 21–22)
+
+```starlark
+load(":local_runtime_repo.bzl", "local_runtime_repo")
+load(":local_runtime_toolchains_repo.bzl", "local_runtime_toolchains_repo")
+```
+
+These symbols already exist in the rules_python codebase but were not
+imported by the module extension file.
+
+#### 9.4.2 Processing logic in `_python_impl()` (lines 507–525)
+
+Inserted after the `multi_toolchain_aliases()` call and before the
+`debug_info` check:
+
+```starlark
+    # Process local_toolchain tags: create repos backed by a system-provided
+    # Python interpreter (e.g. one provided by Nix) instead of downloading
+    # a pre-built binary.
+    for mod in module_ctx.modules:
+        for tag in mod.tags.local_toolchain:
+            repo_name = "local_python_{}".format(
+                tag.python_version.replace(".", "_"),
+            )
+            local_runtime_repo(
+                name = repo_name,
+                interpreter_path = tag.interpreter_path,
+                on_failure = tag.on_failure,
+            )
+            toolchains_repo_name = repo_name + "_toolchains"
+            local_runtime_toolchains_repo(
+                name = toolchains_repo_name,
+                runtimes = [repo_name],
+            )
+```
+
+For each `local_toolchain` tag, this creates two repos:
+- `local_python_3_12` — a `local_runtime_repo` that discovers the system
+  Python and generates a `py_runtime` with `interpreter_path`
+- `local_python_3_12_toolchains` — a `local_runtime_toolchains_repo` that
+  creates `toolchain()` targets pointing at the runtime repo
+
+#### 9.4.3 New `_local_toolchain` tag class (line 1107)
+
+```starlark
+_local_toolchain = tag_class(
+    doc = """Tag class to register a local (system-provided) Python as a toolchain.
+    ...
+    """,
+    attrs = {
+        "interpreter_path": attr.string(default = "python3", ...),
+        "on_failure": attr.string(default = "warn", values = ["skip", "warn", "fail"], ...),
+        "python_version": attr.string(mandatory = True, ...),
+    },
+)
+```
+
+Three attributes:
+- `interpreter_path` — bare name (looked up on `PATH`) or absolute path;
+  defaults to `"python3"`
+- `on_failure` — `"skip"` (silent fallback), `"warn"` (log + fallback),
+  or `"fail"` (hard error); defaults to `"warn"`
+- `python_version` — mandatory, e.g. `"3.12"`
+
+#### 9.4.4 Extension registration (lines 960, 1421)
+
+Added `"local_toolchain": _local_toolchain` to the `tag_classes` dict
+(line 1421) and `"PATH"` to the `environ` list (line 960) so the extension
+re-evaluates when PATH changes.
+
+### 9.5 Consuming the Patch
+
+#### Redpanda's MODULE.bazel
+
+```starlark
+bazel_dep(name = "rules_python", version = "1.5.1")
+local_path_override(
+    module_name = "rules_python",
+    path = "/home/das/Downloads/rules_python",
+)
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python", dev_dependency = True)
+python.toolchain(
+    ignore_root_user_error = True,
+    is_default = True,
+    python_version = "3.12",
+)
+python.local_toolchain(
+    python_version = "3.12",
+    interpreter_path = "python3",
+)
+use_repo(python, "local_python_3_12", "local_python_3_12_toolchains")
+register_toolchains("@local_python_3_12_toolchains//:all")
+```
+
+The `python.toolchain()` line stays — it is needed for non-Nix builds and
+provides the download-based fallback. The `local_toolchain` takes precedence
+when a local Python is found (via `register_toolchains` ordering). When no
+local Python is found (e.g. on a non-Nix CI machine), `on_failure = "warn"`
+causes it to generate an incompatible-platform stub, and the downloaded
+toolchain is used instead.
+
+#### Nix dev shell (`nix/shell.nix`)
+
+The dev shell was updated to use `bazelisk` (which reads `.bazelversion` to
+select Bazel 8.4.1) and includes `python312` on PATH.
+
+### 9.6 Outcome
+
+Tested inside `nix develop` on the Redpanda repository:
+
+```
+$ bazelisk query --output=build @local_python_3_12//:_py3_runtime
+```
+
+```starlark
+py_runtime(
+  name = "_py3_runtime",
+  implementation_name = "cpython",
+  interpreter_path = "/nix/store/flbw79qdmvzbdrafd93avy5a7d29m2vb-python3-3.12.12/bin/python3",
+  interpreter_version_info = {"major": "3", "micro": "12", "minor": "12"},
+  python_version = "PY3",
+)
+```
+
+The toolchain resolved `python3` via PATH to the Nix store path. The
+generated `py_runtime` uses `interpreter_path` (a platform runtime) rather
+than `interpreter` (a hermetic/in-build runtime), meaning:
+
+- **No FHS binary downloaded and executed** — the Nix-provided Python is
+  used directly
+- **No `/lib64/ld-linux-x86-64.so.2` needed** — the binary has a Nix store
+  ELF interpreter
+- **No patchelf needed** — nothing to patch
+- **Build succeeds**: `bazelisk build @local_python_3_12//:python_runtimes`
+  completes with no errors
+
+The `@local_python_3_12_toolchains` repo generates six toolchain targets
+(version-aware and version-unaware variants for runtime, exec tools, and
+cc toolchain):
+
+```
+@local_python_3_12_toolchains//:0000_toolchain
+@local_python_3_12_toolchains//:0000_py_cc_toolchain
+@local_python_3_12_toolchains//:0000_py_exec_tools_toolchain
+@local_python_3_12_toolchains//:0001_default_toolchain
+@local_python_3_12_toolchains//:0001_default_py_cc_toolchain
+@local_python_3_12_toolchains//:0001_default_py_exec_tools_toolchain
+```
+
+### 9.7 Files Changed Summary
+
+| File | Lines (patched) | Change |
+|------|-----------------|--------|
+| `python/private/python.bzl:21-22` | 2 lines added | Import `local_runtime_repo` and `local_runtime_toolchains_repo` |
+| `python/private/python.bzl:507-525` | 19 lines added | Processing loop for `local_toolchain` tags in `_python_impl()` |
+| `python/private/python.bzl:960` | 1 line changed | Add `"PATH"` to `environ` list |
+| `python/private/python.bzl:1107-1153` | 47 lines added | `_local_toolchain` tag class definition |
+| `python/private/python.bzl:1421` | 1 line added | Register `"local_toolchain"` in `tag_classes` dict |
+| **Total** | **70 lines** | One file changed, zero new files |
+
+No other files in rules_python are modified. The patch exclusively wires
+existing, tested code (`local_runtime_repo`, `local_runtime_toolchains_repo`)
+into the module extension system.
 
 ---
 

@@ -1,6 +1,6 @@
 {
   mkShell,
-  bazel_8,
+  bazelisk,
   python312,
   jdk_headless,
   autoconf,
@@ -15,7 +15,7 @@
 
 mkShell {
   packages = [
-    bazel_8
+    bazelisk
     python312
     jdk_headless
     autoconf
@@ -29,7 +29,8 @@ mkShell {
   ];
 
   shellHook = ''
-    # Make Bazelisk (if used) pick the same version as our bazel_8
-    export USE_BAZEL_VERSION=${bazel_8.version}
+    # Bazelisk reads .bazelversion to pick the right Bazel version.
+    # Alias so that "bazel" invokes bazelisk.
+    alias bazel=bazelisk
   '';
 }
