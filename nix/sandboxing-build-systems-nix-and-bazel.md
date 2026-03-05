@@ -39,8 +39,10 @@ useful to contributors and users of both ecosystems.
   - [5.4 Design Philosophy Comparison](#54-design-philosophy-comparison)
 - [6. The Composition Problem](#6-the-composition-problem)
   - [6.1 What Happens When Bazel Runs Inside Nix](#61-what-happens-when-bazel-runs-inside-nix)
-  - [6.2 The ELF Interpreter Problem](#62-the-elf-interpreter-problem)
-  - [6.3 Repository Rules: The Hardest Case](#63-repository-rules-the-hardest-case)
+  - [6.2 What Happens When Nix Runs Inside Bazel](#62-what-happens-when-nix-runs-inside-bazel)
+  - [6.3 The ELF Interpreter Problem](#63-the-elf-interpreter-problem)
+  - [6.4 Repository Rules: The Hardest Case](#64-repository-rules-the-hardest-case)
+  - [6.5 Why "Just Mount /nix/store" Isn't Enough](#65-why-just-mount-nixstore-isnt-enough)
 - [7. Potential Changes to Improve Interoperability](#7-potential-changes-to-improve-interoperability)
   - [7.1 Changes on the Bazel Side](#71-changes-on-the-bazel-side)
   - [7.2 Changes on the Nix Side](#72-changes-on-the-nix-side)
@@ -643,7 +645,67 @@ filesystem."** In non-hermetic mode, Bazel assumes the parent filesystem is a
 normal Linux system with FHS layout. Inside a Nix sandbox, that assumption
 fails.
 
-### 6.2 The ELF Interpreter Problem
+### 6.2 What Happens When Nix Runs Inside Bazel
+
+The reverse composition — running Nix build commands from within a Bazel build
+action — fails for different but equally fundamental reasons.
+
+```
+Host kernel (standard FHS Linux, or NixOS)
+  └─ Bazel linux-sandbox (mount namespace)
+       │  - / is parent FS (non-hermetic) or empty (hermetic)
+       │  - Most paths are read-only
+       │  - No network access
+       │  - No /nix/var/nix/db (Nix database)
+       │  - No Nix daemon socket (/nix/var/nix/daemon-socket)
+       │
+       └─ nix-build or nix-store
+            ✗ Cannot contact Nix daemon (socket not mounted, or read-only)
+            ✗ Cannot write to /nix/store (read-only in sandbox)
+            ✗ Cannot create mount namespaces (nested CLONE_NEWNS may fail)
+            ✗ No network for fetching sources
+```
+
+The problems are:
+
+1. **No Nix daemon access.** Nix builds are coordinated by the Nix daemon
+   (`nix-daemon`), which listens on a Unix socket at
+   `/nix/var/nix/daemon-socket/socket`. Bazel's sandbox does not mount this
+   socket, and even if it did, the daemon runs outside the sandbox and cannot
+   see the sandbox's mount namespace.
+
+2. **`/nix/store` is read-only.** Nix needs write access to `/nix/store` to
+   create build outputs. In Bazel's non-hermetic mode, `/nix/store` is
+   remounted read-only by
+   [`MakeFilesystemMostlyReadOnly()`](https://github.com/bazelbuild/bazel/blob/master/src/main/tools/linux-sandbox-pid1.cc#L362-L433).
+   You could add `--sandbox_writable_path=/nix/store` to fix this, but that
+   alone doesn't solve the daemon problem.
+
+3. **No network.** Bazel build actions don't have network access (unless
+   explicitly configured). Nix derivations that need to fetch sources would
+   fail.
+
+4. **Nested namespaces may fail.** Nix's sandbox creates its own mount, PID,
+   and user namespaces via `clone()`. Depending on kernel configuration
+   (`/proc/sys/user/max_user_namespaces`) and the capabilities available inside
+   Bazel's sandbox, this `clone()` call may fail with `EPERM`.
+
+5. **Nix database is inaccessible.** Nix tracks all store paths in a SQLite
+   database at `/nix/var/nix/db/`. Without access to this database, Nix cannot
+   determine what's already built or register new outputs.
+
+In short: while running Bazel inside Nix fails at the **binary format** level
+(FHS ELF interpreters), running Nix inside Bazel fails at the **infrastructure**
+level (daemon, database, store write access, network). The Nix daemon is a
+system service that expects to be the outermost authority over `/nix/store`, not
+a guest inside another sandbox.
+
+The viable alternative for this direction is
+[`rules_nixpkgs`](https://github.com/tweag/rules_nixpkgs), which runs Nix
+*before* Bazel (in the host environment) to provision toolchains, then passes
+the resulting Nix store paths into Bazel as repository rule outputs.
+
+### 6.3 The ELF Interpreter Problem
 
 Bazel's toolchain rules (`rules_python`, `rules_rust`, `rules_go`,
 `toolchains_llvm`) download pre-built ELF binaries for the host platform. These
@@ -670,7 +732,7 @@ $ readelf -l /nix/store/...-python3-3.12.11/bin/python3 | grep interpreter
 This is the core incompatibility: Bazel downloads FHS binaries into a non-FHS
 environment.
 
-### 6.3 Repository Rules: The Hardest Case
+### 6.4 Repository Rules: The Hardest Case
 
 Repository rules are the most problematic because:
 
@@ -691,6 +753,81 @@ Repository rules are the most problematic because:
 4. **Patching is fragile.** Using `patchelf` to fix the ELF interpreter works
    for already-extracted binaries, but Bazel re-creates repository rule outputs
    from cached archives on subsequent runs, wiping any patches.
+
+### 6.5 Why "Just Mount /nix/store" Isn't Enough
+
+A natural first reaction: "If the problem is that Bazel's sandbox can't see
+Nix paths, why not add `/nix/store` to the sandbox with
+`--sandbox_add_mount_pair=/nix/store`?"
+
+This is a good instinct, but it only partially addresses the problem. To
+understand why, we need to consider three different Bazel execution contexts
+and what each one needs:
+
+#### Build actions (sandboxed)
+
+Bazel's linux-sandbox creates a mount namespace for each build action. In
+**non-hermetic mode** (the default), the entire parent filesystem is already
+visible — including `/nix/store` if it exists. The
+[`MakeFilesystemMostlyReadOnly()`](https://github.com/bazelbuild/bazel/blob/master/src/main/tools/linux-sandbox-pid1.cc#L362-L433)
+pass remounts it read-only, but it remains visible. No extra flags needed.
+
+In **hermetic mode**, yes, you would need `--sandbox_add_mount_pair=/nix/store`
+to make it visible.
+
+But visibility of `/nix/store` doesn't help downloaded FHS binaries. Those
+binaries have `/lib64/ld-linux-x86-64.so.2` hardcoded as their ELF interpreter.
+What you'd actually need is:
+
+```
+--sandbox_add_mount_pair=/nix/store/...-glibc-2.42/lib:/lib64
+```
+
+This would mount Nix's glibc at the FHS path `/lib64`, making the dynamic
+linker available where downloaded binaries expect it. This **does work** for
+build actions. The
+[`ShouldBeWritable()`](https://github.com/bazelbuild/bazel/blob/master/src/main/tools/linux-sandbox-pid1.cc#L336-L358)
+function only controls write access — read-only visibility is the default for
+all mounts.
+
+The writable set in non-hermetic mode consists of exactly:
+- The working directory (`-W`)
+- Paths marked with `--sandbox_writable_path` (`-w`)
+- Paths marked with `--sandbox_tmpfs_path` (`-e`)
+- `/dev/pts` (if PTY mode is enabled)
+
+`/nix/store` doesn't need to be writable — read-only is correct.
+
+#### Build actions with `--spawn_strategy=local`
+
+When `--spawn_strategy=local` is set (as in the
+[Redpanda Nix build](https://github.com/redpanda-data/redpanda)), Bazel skips
+the linux-sandbox entirely. Build actions run directly in the parent process's
+mount namespace — which, inside a Nix derivation, is Nix's sandbox. No
+`--sandbox_add_mount_pair` applies because there is no Bazel sandbox to
+configure.
+
+#### Repository rules (never sandboxed)
+
+This is where the approach breaks down completely. Repository rules **never**
+use the linux-sandbox.
+[`--sandbox_add_mount_pair`](https://github.com/bazelbuild/bazel/blob/master/src/main/java/com/google/devtools/build/lib/sandbox/SandboxOptions.java)
+has no effect on them. Repository rules run via
+[`ProcessWrapper`](https://github.com/bazelbuild/bazel/blob/master/src/main/tools/process-wrapper.cc),
+which is just a thin timeout wrapper with no mount namespace.
+
+When Bazel is inside a Nix sandbox, repo rules see Nix's sparse chroot
+directly. There is no Bazel-level mount table to add `/nix/store` or `/lib64`
+to. The only way to get `/lib64` into the environment is to either:
+
+1. Add it to Nix's sandbox (via `sandbox-paths` in `nix.conf` or derivation
+   inputs)
+2. Use `patchelf` to rewrite the binary's interpreter to a Nix store path
+3. Intercept execution in Bazel before `execvp()` is called
+
+This is why targeted changes to either Bazel's repo rule execution path or
+Nix's sandbox configuration are needed — sandbox mount flags alone cannot
+solve the problem.
 
 ---
 
