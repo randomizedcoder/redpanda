@@ -174,65 +174,18 @@ clang version 20.1.8
 
 ## Recommended Approach: Use system-clang Config
 
-Redpanda's `.bazelrc` (lines 27–37) already has a `system-clang`
-configuration that bypasses `toolchains_llvm` entirely and uses Bazel's
-built-in CC auto-detection:
-
-```bazelrc
-build:system-clang --extra_toolchains=@local_config_cc_toolchains//:all
-build:system-clang --action_env=BAZEL_COMPILER=clang
-build:system-clang --cxxopt=-std=c++23 --host_cxxopt=-std=c++23
-build:system-clang --linkopt -fuse-ld=lld
-```
-
-This works with Nix-provided clang because:
-
-1. `@local_config_cc_toolchains` auto-detects `CC` from the environment
-2. The Nix clang wrapper handles all include paths, library paths, and
-   sysroot resolution internally
-3. `-fuse-ld=lld` tells clang to use `ld.lld` from PATH (provided by
-   `llvmPackages_20.lld`)
-4. The wrapper scripts are bash, not ELF — no FHS dependency
-
-### Dev shell changes
-
-Add the LLVM tools to `nix/shell.nix`:
-
-```nix
-{
-  mkShell,
-  bazelisk,
-  llvmPackages_20,
-  python312,
-  ...
-}:
-
-mkShell {
-  packages = [
-    bazelisk
-    llvmPackages_20.clang     # clang, clang++ wrapper scripts
-    llvmPackages_20.lld       # ld.lld
-    llvmPackages_20.llvm      # llvm-ar, llvm-objcopy, etc.
-    llvmPackages_20.libcxx    # libc++ runtime library
-    python312
-    ...
-  ];
-
-  shellHook = ''
-    export CC=clang
-    export CXX=clang++
-  '';
-}
-```
+Redpanda's `.bazelrc` already has a `system-clang` configuration that
+bypasses `toolchains_llvm` entirely and uses Bazel's built-in CC
+auto-detection.
 
 ### Build command
 
 ```bash
-nix develop --command bazelisk build --config=system-clang --action_env=PATH //src/v/redpanda:redpanda
+nix develop --command bazelisk build --config=system-clang //src/v/redpanda:redpanda
 ```
 
-No `toolchains_llvm` download needed. No patches to any rule set. Bazel
-auto-detects the Nix-wrapped clang from PATH.
+No `toolchains_llvm` download needed. No patches to `toolchains_llvm`.
+Bazel auto-detects the Nix-wrapped clang from PATH.
 
 ## Alternative: toolchain_root for Full toolchains_llvm Integration
 
@@ -244,7 +197,7 @@ split Nix packages into a single tree, and careful sysroot handling.
 
 This is more work and less necessary given that `system-clang` already
 exists and the Nix wrapper handles include/library path resolution
-automatically
+automatically.
 
 ## Comparison with rules_python
 
@@ -253,44 +206,24 @@ automatically
 | System toolchain support in MODULE.bazel | **Not available** (was WORKSPACE-only) | **Already available** (`toolchain_root`) |
 | Patch needed | Yes — new `local_toolchain` tag class | **No** — mechanism exists |
 | Nix complication | Single binary (`python3`) | Split across multiple store paths |
-| Solution | PATH lookup resolves to Nix store | `symlinkJoin` to create combined tree |
-| Sysroot handling | Not applicable | Needs separate handling (Redpanda uses custom sysroots) |
-
-## Key Finding
-
-**No patch to toolchains_llvm is required.** The `llvm.toolchain_root()`
-tag class already does what we need. The work is:
-
-1. Create a Nix derivation (`symlinkJoin`) that combines LLVM packages into
-   a single directory tree matching the expected layout
-2. Wire that path into MODULE.bazel (via `toolchain_root` with the Nix store
-   path)
-3. Handle sysroots — Redpanda uses custom Ubuntu 22.04 sysroots downloaded
-   from GitHub; for Nix builds these would need to be replaced with
-   Nix-provided system headers and libraries
+| Solution | PATH lookup resolves to Nix store | Nix clang wrapper handles everything |
+| Sysroot handling | Not applicable | Nix clang wrapper handles it |
 
 ---
 
 ## Implementation Log
 
-### What we did
-
-#### 1. Added LLVM packages to `nix/shell.nix`
-
-Added `llvmPackages_20.clang`, `.lld`, `.llvm`, `.libcxx` and set
-`CC=clang CXX=clang++` in the shellHook. Verified all tools resolve:
-
-```
-$ nix develop --command bash -c 'which clang && clang --version | head -1'
-/nix/store/3pmk0q90sb2qrbf4zj8cfhrzbf0jh022-clang-wrapper-20.1.8/bin/clang
-clang version 20.1.8
-```
-
-#### 2. Registered `local_config_cc_toolchains` in MODULE.bazel
+### Issue 1: `@local_config_cc_toolchains` not visible in Bzlmod
 
 The `system-clang` config references `@local_config_cc_toolchains//:all`,
-but this repo was not visible from the main module. It is created by
-`rules_cc`'s `cc_configure_extension` but scoped to `rules_cc` only.
+but this repo was not visible from the main module under Bzlmod. It is
+created by `rules_cc`'s `cc_configure_extension` module extension, but
+only `rules_cc` itself called `use_repo` on it.
+
+**Error:**
+```
+No repository visible as '@local_config_cc_toolchains' from main repository
+```
 
 **Fix:** Added to `MODULE.bazel` after the `rules_cc` dep:
 
@@ -299,117 +232,412 @@ cc_configure = use_extension("@rules_cc//cc:extensions.bzl", "cc_configure_exten
 use_repo(cc_configure, "local_config_cc_toolchains")
 ```
 
-This made the toolchain repo visible and the `system-clang` config analyzable.
+**File:** `rules_cc/cc/extensions.bzl` — the extension creates both
+`local_config_cc` and `local_config_cc_toolchains` repos via
+`cc_autoconf_toolchains()` and `cc_autoconf()`.
 
-#### 3. Fixed `expand_with_stamp_vars.bzl` for local Python runtime
+### Issue 2: `py3_runtime.interpreter` is `None` for local Python
 
-The `expand_with_stamp_vars` rule accessed `toolchain.py3_runtime.interpreter`
-which is `None` for local/system Python toolchains (they use
-`interpreter_path` instead — a string, not a File). The rule already had
-a conditional handling `None` in its `tools` list.
+The `expand_with_stamp_vars` rule accessed
+`toolchain.py3_runtime.interpreter` directly in its `tools` list. For
+local/system Python toolchains (like our rules_python patch), the
+`interpreter` attribute is `None` — they use `interpreter_path` (a string)
+instead.
 
-#### 4. Fixed rules_python `#!/bin/bash` shebang for NixOS
+**Error:**
+```
+expected value of type 'File' for a member of parameter 'tools' but got NoneType
+```
 
-The rules_python `stage1_bootstrap_template.sh` uses `#!/bin/bash` as its
-shebang. NixOS does not have `/bin/bash` — only `/usr/bin/env` and `/bin/sh`
-exist as FHS compatibility paths.
+**Fix in `src/v/version/expand_with_stamp_vars.bzl`:**
+```python
+interpreter = toolchain.py3_runtime.interpreter
+tools = [ctx.executable._tool] + ([interpreter] if interpreter else [])
+```
+
+Also changed `executable = ctx.executable._tool.path` to
+`executable = ctx.executable._tool` (File object instead of path string)
+for proper sandbox handling.
+
+### Issue 3: NixOS has no `/bin/bash`
+
+Bazel genrules use `/bin/bash` as the shell. NixOS does not have
+`/bin/bash` — only `/usr/bin/env` and `/bin/sh` exist as FHS
+compatibility paths. The Bazel sandbox (`processwrapper-sandbox`) also
+doesn't mount `/bin/bash`.
+
+**Error:**
+```
+src/main/tools/process-wrapper-legacy.cc:80: "execvp(/bin/bash, ...)": No such file or directory
+```
+
+**Fix:** The `nix/shell.nix` shellHook generates `.bazelrc.nix` with:
+```
+build --shell_executable=/nix/store/...-bash-5.3p9/bin/bash
+```
+
+This tells Bazel to use the Nix-provided bash for genrules instead of
+`/bin/bash`.
+
+### Issue 4: `#!/bin/bash` in rules_python bootstrap script
+
+The rules_python `stage1_bootstrap_template.sh` uses `#!/bin/bash` as
+its shebang. Even with `--shell_executable`, this doesn't help because
+the shebang is baked into the generated wrapper script, not controlled by
+Bazel's shell setting.
+
+**Error:**
+```
+env: 'bash': No such file or directory
+```
 
 **Fix:** Changed `#!/bin/bash` to `#!/usr/bin/env bash` in
 `rules_python/python/private/stage1_bootstrap_template.sh`.
 
-#### 5. Fixed `use_default_shell_env` for py_binary in Bazel actions
+### Issue 5: Sandbox PATH doesn't include Nix store paths
+
+Even with `--shell_executable` pointing at Nix bash, scripts inside
+actions couldn't find tools because Bazel's sandbox PATH doesn't include
+Nix store paths. The rules_python bootstrap script uses `env bash` (via
+`#!/usr/bin/env bash`) which requires `bash` on PATH.
+
+**Error:**
+```
+env: 'bash': No such file or directory
+```
+
+**Fix:** Propagate the Nix PATH into actions via `.bazelrc.nix`:
+```
+build --action_env=PATH=<nix-store-paths...>
+build --host_action_env=PATH=<nix-store-paths...>
+```
+
+**Trade-off:** This breaks build hermeticity — actions can see all tools
+on the host PATH. Acceptable for dev shell, not for CI.
+
+### Issue 6: `use_default_shell_env = False` blocks py_binary execution
 
 The `expand_with_stamp_vars` rule had `use_default_shell_env = False`,
-which gave an empty PATH to actions. The rules_python bootstrap script
-needs `env` and `bash` on PATH to execute. Changed to
-`use_default_shell_env = True`.
+giving an empty environment to actions. The rules_python bootstrap
+needs a functional PATH.
 
-Even with `use_default_shell_env = True`, Bazel's default PATH does not
-include Nix store paths. The solution is `--action_env=PATH` which
-propagates the host PATH into build actions.
+**Fix:** Changed to `use_default_shell_env = True` in
+`src/v/version/expand_with_stamp_vars.bzl`.
 
-### Current status: nearly working
+### Issue 7: `ld.lld: error: unable to find library -lc++`
 
-**Build result with `--config=system-clang --action_env=PATH`:**
+The `.bazelrc` has `--linkopt -stdlib=libc++` globally, which tells clang
+to link against libc++. The Nix clang wrapper (default variant) injects
+library paths via `NIX_LDFLAGS` which are consumed by the Nix `ld`
+wrapper. But `-fuse-ld=lld` (from `system-clang` config) calls lld
+directly, bypassing the Nix ld wrapper. So `-L/nix/store/.../libcxx/lib`
+never reaches lld.
 
-- 8,579 of 8,581 actions completed successfully (C++ compilation works)
-- **One failure:** `rules_foreign_cc` CMake build of `base64` fails at link
-  time:
-
+**Error (from `rules_foreign_cc` CMake build of c-ares):**
 ```
 ld.lld: error: unable to find library -lc++
 ```
 
-### Remaining issue: libc++ not found by linker
+**Fix:** Pass all `NIX_*` environment variables through to actions, so
+the Nix clang wrapper can inject the correct flags:
+```
+build --action_env=NIX_LDFLAGS
+build --action_env=NIX_CC
+build --action_env=NIX_BINTOOLS
+...
+```
 
-The Nix `clang` wrapper (default, non-libc++ variant) does not add
-`-L/nix/store/.../libcxx-20.1.8/lib` to the linker search path. While
-`llvmPackages_20.libcxx` is in the shell, it only makes the library
-available on the filesystem — it doesn't tell clang where to find it.
+Also set `LIBRARY_PATH` explicitly as a fallback:
+```
+build --action_env=LIBRARY_PATH=/nix/store/.../libcxx-20.1.8/lib
+```
 
-The `.bazelrc` has `--linkopt -stdlib=libc++` globally (line 7), which
-tells clang to link against libc++ instead of libstdc++. But the default
-Nix clang wrapper only knows about libstdc++ (from GCC). The linker
-cannot find `-lc++`.
+**Result:** libc++ linking works — the c-ares and base64 CMake builds
+pass.
 
-**Possible solutions:**
+### Issue 8: `krb5` configure: `cannot compute sizeof (time_t)`
 
-1. **Use `llvmPackages_20.libcxxClang`** instead of `llvmPackages_20.clang`
-   in shell.nix. This is a clang wrapper that automatically injects
-   `-stdlib=libc++` and the correct `-L` path for libc++. Package exists at
-   `/nix/store/...-clang-wrapper-20.1.8` (different derivation from the
-   default clang wrapper).
+The krb5 `rules_foreign_cc` build runs autoconf's `AC_CHECK_SIZEOF`
+which compiles AND executes a test program. The test program links
+against OpenSSL (`-lcrypto`) which was built by another `rules_foreign_cc`
+target. At runtime, the test binary can't find `libcrypto.so.3` because
+`LD_LIBRARY_PATH` doesn't include the Bazel sandbox path where OpenSSL's
+`.so` was placed.
 
-2. **Add `-L` flag explicitly** in `.bazelrc` pointing to the Nix store
-   path for libc++. This is fragile (hardcoded Nix store hash).
+**Error (from krb5 config.log):**
+```
+./conftest: error while loading shared libraries: libcrypto.so.3: cannot open shared object file
+```
 
-3. **Use `LIBRARY_PATH` env var** — set
-   `LIBRARY_PATH=/nix/store/.../libcxx-20.1.8/lib` in the shellHook, and
-   propagate it with `--action_env=LIBRARY_PATH`. The linker checks
-   `LIBRARY_PATH` for library search paths.
+**Root cause:** `rules_foreign_cc` stages dependencies in
+`krb5.ext_build_deps/openssl_foreign_cc/lib/`. The configure script
+passes `-L<that-path>` to the compiler, so linking works. But the test
+binary's RPATH doesn't include that path, so the dynamic linker can't
+find `libcrypto.so.3` at runtime.
 
-**Option 1 (libcxxClang) is the most correct** — it is the Nix-idiomatic
-way to use clang with libc++.
+**Fix in `bazel/thirdparty/krb5.BUILD`:** Added `LD_LIBRARY_PATH` to the
+`env` dict using `$$EXT_BUILD_DEPS` (a `rules_foreign_cc` variable that
+expands to the dependency staging directory):
+
+```python
+env = {
+    ...
+    "LD_LIBRARY_PATH": "$$EXT_BUILD_DEPS/openssl_foreign_cc/lib",
+},
+```
+
+**Result:** krb5 configure passes, krb5 builds successfully (41s).
+
+### Issue 9: `libxml2` autogen: missing `pkg.m4`
+
+After krb5 was fixed, the `libxml2` `rules_foreign_cc` build failed
+during `autoreconf` because it couldn't find `pkg.m4` from `pkg-config`.
+
+**Error:**
+```
+Couldn't find pkg.m4 from pkg-config. Install the appropriate package for
+your distribution or set ACLOCAL_PATH to the directory containing pkg.m4.
+```
+
+**Root cause:** Nix sets `ACLOCAL_PATH` in the shell environment (pointing
+to `automake`, `libtool`, `bison`, and `pkg-config` aclocal directories),
+but this wasn't propagated into Bazel actions.
+
+**Fix:** Added to `.bazelrc.nix` generation in `nix/shell.nix`:
+```
+build --action_env=ACLOCAL_PATH=<nix-aclocal-paths>
+```
+
+**Result:** libxml2 autoreconf and build pass.
+
+### Issue 10: `protoc_minimal: error while loading shared libraries: libstdc++.so.6`
+
+The `protoc_minimal` binary (built for the exec configuration) links
+against `libstdc++.so.6` from GCC. The exec-config CC toolchain uses
+libstdc++ (not libc++) because the global `-stdlib=libc++` flag only
+applies to the target configuration. At runtime, the dynamic linker
+can't find `libstdc++.so.6` because it's in the Nix store, not a
+standard system path.
+
+**Error:**
+```
+protoc_minimal: error while loading shared libraries: libstdc++.so.6:
+cannot open shared object file: No such file or directory
+```
+
+**Fix:** Added GCC's lib directory to `LD_LIBRARY_PATH` alongside libc++:
+```nix
+gccLib = stdenv.cc.cc.lib;
+# in .bazelrc.nix:
+build --action_env=LD_LIBRARY_PATH=<libcxx-path>:<gcc-lib-path>
+```
+
+**Result:** protoc_minimal and all proto generation steps work.
+
+### Issue 11: Seastar `future.hh` compilation error — wrong stdlib headers
+
+After all toolchain/environment issues were resolved, the build
+progressed to **2,751 sandbox processes** (3,297 total actions) before
+hitting a C++ compilation error in Seastar's `future.hh`:
+
+```
+error: cannot initialize object parameter of type
+'const seastar::future_state_base' with an expression of type
+'future_state' (aka 'future_state<std::variant<...>>')
+```
+
+**Root cause:** The compilation was using **libstdc++ headers** (from
+GCC) instead of **libc++ headers**. Two things were wrong:
+
+1. **Nix clang wrapper**: `llvmPackages_20.clang` (the default) uses
+   libstdc++ as its standard library. Its `-cxx-isystem` points at
+   `gcc-15.2.0/include/c++/15.2.0` (libstdc++). Redpanda's code
+   expects libc++ — the `toolchains_llvm` config uses `builtin-libc++`
+   which passes `-stdlib=libc++` at compile time.
+
+2. **`system-clang` config**: Missing `-stdlib=libc++` as a compile
+   flag. The `.bazelrc` only had `-stdlib=libc++` as a **link flag**
+   (line 7: `--linkopt -stdlib=libc++`). The `toolchains_llvm` CC
+   toolchain injects `-stdlib=libc++` as a **compile flag**
+   (`cc_toolchain_config.bzl` line 265), but the `system-clang` config
+   relied on auto-detection, which doesn't add it.
+
+**Evidence (comparing `clang++ -v` output):**
+
+| Wrapper | C++ include path | Defines `__GLIBCXX__`? |
+|---------|-----------------|----------------------|
+| `llvmPackages_20.clang` | `gcc-15.2.0/include/c++/15.2.0` (libstdc++) | Yes |
+| `llvmPackages_20.libcxxClang` | `libcxx-20.1.8-dev/include/c++/v1` (libc++) | No |
+
+Seastar's `future.hh` has `#ifdef __GLIBCXX__` conditional code paths
+(lines 447, 454) that take different optimization shortcuts for
+libstdc++ vs libc++. Compiling with the wrong stdlib headers causes
+template instantiation failures because the Seastar code and the
+standard library implementation make incompatible assumptions.
+
+**Seastar `future.hh` details (important for future reference):**
+
+Seastar's `future.hh` contains `#ifdef __GLIBCXX__` conditional code
+in `future_state_base::any`:
+
+- **`take_exception()` (line 447):** With libstdc++, skips explicit
+  `~exception_ptr()` destructor call on moved-from values (known no-op
+  in libstdc++). With libc++, calls it explicitly.
+
+- **`move_it()` (line 454):** With libstdc++, uses `memmove` +
+  invalidate (relies on libstdc++'s `exception_ptr` being a plain
+  pointer). With libc++, uses proper typed move via `take_exception()`.
+
+These optimizations rely on internal knowledge of the stdlib
+implementation. Compiling with the wrong stdlib's headers produces
+code that makes invalid assumptions about type layouts and causes
+template instantiation failures.
+
+**Fix:**
+
+`nix/shell.nix`: Switched from `llvmPackages_20.clang` to
+`llvmPackages_20.libcxxClang` — the Nix clang wrapper variant that
+uses libc++ headers and injects `-cxx-isystem` pointing to
+`libcxx-20.1.8-dev/include/c++/v1`.
+
+**Why not also add `--cxxopt=-stdlib=libc++`?** Initially tried adding
+`build:system-clang --cxxopt=-stdlib=libc++ --host_cxxopt=-stdlib=libc++`
+to `.bazelrc`, but the Nix `libcxxClang` wrapper already injects libc++
+include paths via `-cxx-isystem`. When Bazel also passes `-stdlib=libc++`
+explicitly, clang considers it "unused during compilation" (the includes
+are already handled by the wrapper). Combined with Redpanda's `-Werror`
+(from `bazel/internal.bzl`), this becomes a fatal error:
+```
+clang: error: argument unused during compilation: '-stdlib=libc++' [-Werror,-Wunused-command-line-argument]
+```
+The `libcxxClang` wrapper alone is sufficient — it handles compile-time
+headers, and the existing global `--linkopt -stdlib=libc++` handles
+link-time.
+
+### Issue 12: Exec-config tools can't find `libc++.so.1` at runtime
+
+After fixing the Seastar compilation, exec-config binaries like
+`protoc-gen-upb_stage0` and `protoc` linked against libc++ dynamically
+(via `--host_linkopt -stdlib=libc++`) but couldn't find `libc++.so.1`
+at runtime in the Bazel sandbox.
+
+**Error:**
+```
+protoc: error while loading shared libraries: libc++.so.1: cannot open shared object file
+```
+
+**Root cause:** The global `--linkopt -stdlib=libc++` only applies to
+target-config linking. Exec-config tools need `--host_linkopt`. Initially
+tried `--host_linkopt -stdlib=libc++` which dynamically links libc++.
+But the Bazel sandbox doesn't propagate `LD_LIBRARY_PATH` to all action
+types (the `ProtocAuthenticityCheck` action couldn't find `libc++.so.1`
+or even `grep`).
+
+The `toolchains_llvm` CC toolchain avoids this by **statically** linking
+libc++ (`-l:libc++.a -l:libc++abi.a`) for all configurations.
+
+**Fix:** Changed to static libc++ linking for exec config:
+```bazelrc
+build:system-clang --host_linkopt -l:libc++.a --host_linkopt -l:libc++abi.a
+build:system-clang --host_linkopt --unwindlib=libgcc
+build:system-clang --linkopt -fuse-ld=lld --host_linkopt -fuse-ld=lld
+```
+
+---
+
+## Summary of all changes made
+
+| File | Change | Purpose |
+|------|--------|---------|
+| `nix/shell.nix` | LLVM packages (using `libcxxClang` for libc++ headers) + `stdenv`, shellHook generates `.bazelrc.nix` with `--shell_executable`, `--action_env=PATH`, `NIX_*` vars, `LIBRARY_PATH`, `LD_LIBRARY_PATH`, `ACLOCAL_PATH` | Nix dev environment for Bazel builds |
+| `MODULE.bazel` | Added `cc_configure_extension` + `use_repo(cc_configure, "local_config_cc_toolchains")` | Make `@local_config_cc_toolchains` visible for `system-clang` config |
+| `.bazelrc` | Added `try-import %workspace%/.bazelrc.nix`; `system-clang` config: added `--host_linkopt -fuse-ld=lld`, `--host_linkopt --unwindlib=libgcc`, `--host_linkopt -l:libc++.a -l:libc++abi.a` | Load Nix-specific settings; static libc++ for exec-config tools |
+| `.gitignore` | Added `.bazelrc.nix` | Don't track generated file |
+| `src/v/version/expand_with_stamp_vars.bzl` | Handle `None` interpreter, `use_default_shell_env = True`, use File object for executable | Fix for local Python toolchain + NixOS |
+| `rules_python/.../stage1_bootstrap_template.sh` | `#!/bin/bash` -> `#!/usr/bin/env bash` | NixOS compat (no `/bin/bash`) |
+| `bazel/thirdparty/krb5.BUILD` | Added `LD_LIBRARY_PATH=$$EXT_BUILD_DEPS/openssl_foreign_cc/lib` to env | Fix configure runtime tests finding libcrypto.so |
+
+## Build results
+
+**Progression:**
+1. Attempt 1: `@local_config_cc_toolchains` not found → fixed
+2. Attempt 2: `py3_runtime.interpreter` is None → fixed
+3. Attempt 3: `execvp(/bin/bash)` fails → fixed with `--shell_executable`
+4. Attempt 5: `env: 'bash': No such file or directory` → fixed with `--action_env=PATH`
+5. Attempt 6: `ld.lld: unable to find library -lc++` → fixed with `NIX_*` env vars
+6. Attempt 8: `krb5` configure fails (libcrypto.so.3 not found) → fixed with `LD_LIBRARY_PATH` in krb5.BUILD
+7. Attempt 9: `libxml2` autogen fails (pkg.m4 not found) → fixed with `ACLOCAL_PATH`
+8. Attempt 10: `protoc_minimal` can't find libstdc++.so.6 → fixed with GCC lib in `LD_LIBRARY_PATH`
+9. Attempt 11: Seastar `future.hh` template error → fixed with `libcxxClang`
+10. Attempt 11b: `-stdlib=libc++` cxxopt "unused during compilation" with `-Werror` → removed cxxopt, Nix wrapper handles it
+11. Attempt 12a: exec-config `protoc-gen-upb_stage0` link fails (undefined libc++ symbols) → added `--host_linkopt` flags
+12. Attempt 12b: exec-config `protoc` can't find `libc++.so.1` at runtime → switched to static `libc++.a` linking
+13. **Attempt 13 (2026-03-05, in progress): Build running with static libc++ for exec config**
 
 ## Open Questions
 
-1. **Sysroot**: With `system-clang`, the Nix clang wrapper handles sysroot
-   resolution automatically (glibc headers, dynamic linker, etc.). The
-   custom Ubuntu 22.04 sysroots that Redpanda downloads are not needed.
-   However, if there are Ubuntu-specific headers or libraries the build
-   depends on, they would need to be provided via Nix packages.
+1. **`--action_env=PATH` hermeticity**: Propagating the full host PATH
+   into build actions breaks build hermeticity. Acceptable for dev shell
+   but not for CI. A minimal PATH could be constructed instead.
 
-2. **~~libc++ vs libstdc++~~**: RESOLVED — need `libcxxClang` or equivalent.
-   See "Remaining issue" above.
+2. **`#!/bin/bash` in rules_python**: Should be upstreamed — NixOS and
+   Guix don't have `/bin/bash`.
 
-3. **Compiler-rt**: Redpanda disables compiler-rt in `.bazelrc`
-   (`--@toolchains_llvm//toolchain/config:compiler-rt=False`) and uses
-   `--linkopt --unwindlib=libgcc`. The system-clang config doesn't pass
-   these flags, so they may need to be added to a `system-clang-nix` config
-   variant.
+3. **Cross-compilation**: The Nix approach provides native-architecture
+   LLVM only. Cross-compilation would need additional work.
 
-4. **Cross-compilation**: The Nix approach provides native-architecture
-   LLVM only. Redpanda's current config supports both x86_64 and aarch64.
-   Cross-compilation from Nix would need additional work.
+4. **Version match**: nixpkgs has LLVM 20.1.8, matching Redpanda's
+   "current" compiler exactly.
 
-5. **Version match**: nixpkgs has LLVM 20.1.8, which exactly matches
-   Redpanda's "current" compiler. The "next" compiler (21.1.6) is not yet
-   in nixpkgs (it has up to 21.x but the minor version may differ).
+## Key Technical Details
 
-6. **`--action_env=PATH` hermeticity**: Propagating the full host PATH
-   into build actions breaks build hermeticity. This is acceptable for a
-   dev shell but not for reproducible CI builds. A more hermetic approach
-   would construct a minimal PATH containing only the needed tools.
+### Nix LLVM clang wrapper variants
 
-7. **`#!/bin/bash` in rules_python**: The shebang fix in
-   `stage1_bootstrap_template.sh` is a patch to rules_python. This should
-   be upstreamed — NixOS (and Guix) don't have `/bin/bash`.
+nixpkgs provides multiple clang wrapper variants per LLVM version:
+
+| Package | C++ stdlib | Include path |
+|---------|-----------|--------------|
+| `llvmPackages_20.clang` | libstdc++ (GCC) | `gcc-15.2.0/include/c++/15.2.0` |
+| `llvmPackages_20.libcxxClang` | libc++ | `libcxx-20.1.8-dev/include/c++/v1` |
+| `llvmPackages_20.clangUseLLVM` | libc++ + compiler-rt + libunwind | (full LLVM runtime) |
+
+Both wrappers use the same underlying `clang-20.1.8` binary. The
+difference is in the `nix-support/add-flags.sh` which sets
+`NIX_CXXSTDLIB_COMPILE` to inject the appropriate headers via
+`-cxx-isystem`.
+
+**Important:** Both Nix wrappers inject
+`-D _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE` (a
+nixpkgs default), but with the regular `clang` wrapper this define is
+meaningless because libstdc++ ignores it.
+
+### Why `-stdlib=libc++` as cxxopt doesn't work with Nix wrappers
+
+The Nix clang wrapper injects libc++ include paths via `-cxx-isystem`
+and `-isystem` flags. When Bazel also passes `-stdlib=libc++` as an
+explicit compiler flag, clang considers it "unused during compilation"
+because the include search paths are already set. With Redpanda's
+`-Werror` (from `bazel/internal.bzl` `redpanda_copts()`), this
+warning becomes a fatal error. The `toolchains_llvm` CC toolchain
+doesn't have this problem because it uses a non-Nix clang binary
+where `-stdlib=libc++` is the primary mechanism for finding headers.
+
+### toolchains_llvm vs system-clang flag comparison
+
+| Flag | `toolchains_llvm` | `system-clang` |
+|------|------------------|----------------|
+| `-stdlib=libc++` (compile) | Yes (from `builtin-libc++` default) | No (Nix wrapper handles it) |
+| `-stdlib=libc++` (link) | Yes (static: `-l:libc++.a -l:libc++abi.a`) | Yes (`--linkopt -stdlib=libc++`) |
+| `-std=c++23` | Yes (`cxx_standard`) | Yes (`--cxxopt`) |
+| `--target=x86_64-unknown-linux-gnu` | Yes | No (compiler default) |
+| `-fuse-ld=lld` | Yes | Yes (`--linkopt`) |
+| `-Xclang -fno-cxx-modules` | Yes (LLVM 14+) | No |
+| `-no-canonical-prefixes` | Yes | No |
+| `-Wno-builtin-macro-redefined` | Yes | No |
+| `__DATE__/__TIME__` redaction | Yes | No |
 
 ## Next Steps
 
-1. Try `llvmPackages_20.libcxxClang` in shell.nix instead of the default
-   `llvmPackages_20.clang`
-2. Verify the `base64` foreign_cc build links successfully with libc++
-3. If that works, attempt a full `//src/v/redpanda:redpanda` build
-4. Consider creating a `system-clang-nix` config in `.bazelrc` that includes
-   `--action_env=PATH` to avoid passing it manually
+1. Wait for current build to complete — already past 6,000+ actions
+2. Achieve a full clean build of `//src/v/redpanda:redpanda`
+3. Consider upstreaming the `#!/usr/bin/env bash` fix to rules_python
