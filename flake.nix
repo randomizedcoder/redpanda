@@ -25,17 +25,22 @@
             config.allowUnfree = true;
           };
 
-          redpanda = pkgs.callPackage ./nix/redpanda.nix {
-            nixpkgsSrc = nixpkgs.outPath;
-          };
+          redpanda = pkgs.callPackage ./nix/redpanda.nix { };
 
           rpk = pkgs.callPackage ./nix/rpk.nix { };
+
+          bench = import ./nix/bench.nix {
+            inherit pkgs flake-utils;
+            redpandaDrv = redpanda;
+          };
         in
         {
           packages = {
             inherit redpanda rpk;
             default = redpanda;
           };
+
+          apps = bench;
 
           devShells.default = pkgs.callPackage ./nix/shell.nix { };
 

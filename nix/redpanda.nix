@@ -2,20 +2,20 @@
   lib,
   stdenv,
   callPackage,
-  fetchFromGitHub,
   runCommand,
+  writeShellApplication,
   bazel_8,
+  llvmPackages_20,
+  python312,
   jdk_headless,
-  python313,
-  cargo-bazel,
-  rustc,
-  cargo,
   autoconf,
   automake,
   libtool,
   bison,
   pkg-config,
   elfutils,
+  xfsprogs,
+  valgrind,
   patchelf,
   file,
   findutils,
@@ -25,37 +25,49 @@
   coreutils,
   bash,
   gnused,
-  bubblewrap,
   glibc,
   gcc-unwrapped,
   zlib,
   openssl,
   curl,
-  buildEnv,
   lndir,
-  nixpkgsSrc,
 }:
 
 let
   version = "0.0.0-dev";
-  rev = "ae5f867664a0160428d904a6c9ee835d4f979bd1";
 
-  rawSrc = fetchFromGitHub {
-    owner = "redpanda-data";
-    repo = "redpanda";
-    inherit rev;
-    hash = "sha256-lt0z25GBSq6aqiuE4Cedjpe3rxSa7wmve5tFv1gnzHo=";
+  gccLib = stdenv.cc.cc.lib;
+
+  # Local source with filter to exclude build artifacts
+  localSrc = lib.cleanSourceWith {
+    src = ./..;
+    filter = path: type:
+      !(builtins.elem (baseNameOf path) [
+        ".git" "bazel-bin" "bazel-out" "bazel-redpanda"
+        "bazel-testlogs" "result" "result-rpk"
+      ]);
   };
 
-  # Patch the source for Nix sandbox compatibility:
-  # - Remove tools/bazel (Bazelisk wrapper with /usr/bin/env shebang)
-  # - Remove .bazelversion (nixpkgs bazel_8 may be a newer patch version)
-  # - Add exec_os = "linux" to toolchains_llvm config to skip /etc/os-release
-  #   detection which doesn't exist in the Nix sandbox
+  # Fetch the patched rules_python (nix-local-toolchain branch) and
+  # embed it in the source tree so local_path_override works in the sandbox.
+  rulesPythonSrc = builtins.fetchGit {
+    url = "/home/das/Downloads/rules_python";
+    ref = "nix-local-toolchain";
+    rev = "b65ba9d68a489456fa45a924a1726c86fec08e88";
+  };
+
   src = runCommand "redpanda-src-patched" { } ''
-    cp -r --no-preserve=mode ${rawSrc} $out
+    cp -r --no-preserve=mode ${localSrc} $out
     rm -f $out/tools/bazel
     rm -f $out/.bazelversion
+
+    # Embed rules_python in tree
+    mkdir -p $out/third_party
+    cp -r --no-preserve=mode ${rulesPythonSrc} $out/third_party/rules_python
+
+    # Rewrite local_path_override to in-tree copy
+    sed -i 's|path = "/home/das/Downloads/rules_python"|path = "third_party/rules_python"|' $out/MODULE.bazel
+
     # Add exec_os to skip /etc/os-release detection in the Nix sandbox
     sed -i 's/llvm.toolchain(/llvm.toolchain(\n            exec_os = "linux",/' $out/MODULE.bazel
   '';
@@ -66,17 +78,20 @@ let
   targets = [ "//src/v/redpanda:redpanda" ];
 
   nativeBuildInputsDeps = [
+    llvmPackages_20.libcxxClang
+    llvmPackages_20.lld
+    llvmPackages_20.llvm
+    llvmPackages_20.libcxx
+    python312
     jdk_headless
-    python313
-    cargo-bazel
-    rustc
-    cargo
     autoconf
     automake
     libtool
     bison
     pkg-config
     elfutils
+    xfsprogs
+    valgrind
     patchelf
     file
     findutils
@@ -86,105 +101,172 @@ let
     coreutils
     bash
     gnused
-    bubblewrap
   ];
 
-  nixPath = lib.makeBinPath (nativeBuildInputsDeps ++ [ stdenv.cc stdenv.cc.bintools ]);
+  nixPath = lib.makeBinPath (nativeBuildInputsDeps ++ [ bazel stdenv.cc stdenv.cc.bintools ]);
 
-  commonArgs = [
-    "--config=release"
-    # Tell Bazel where bash is (process wrapper, shell actions, genrules)
-    "--shell_executable=${bash}/bin/bash"
-    # Override .bazelrc's --incompatible_strict_action_env for repo rules
-    "--action_env=PATH=${nixPath}:/usr/bin:/bin"
-    "--repo_env=PATH=${nixPath}:/usr/bin:/bin"
-    "--repo_env=BAZEL_SH=${bash}/bin/bash"
-    "--action_env=BAZEL_SH=${bash}/bin/bash"
-    # Provide SSL certs for cargo/curl used by repo rules
-    "--repo_env=SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
-    "--action_env=SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
-    # Use Nix-provided cargo-bazel instead of downloading a pre-built binary
-    "--repo_env=CARGO_BAZEL_GENERATOR_URL=file://${cargo-bazel}/bin/cargo-bazel"
-    # Provide Nix cargo/rustc for cargo-bazel to use (the downloaded Rust
-    # toolchain binaries are pre-built ELFs that can't run in the sandbox)
-    "--repo_env=CARGO=${cargo}/bin/cargo"
-    "--repo_env=RUSTC=${rustc}/bin/rustc"
-    "--action_env=CARGO=${cargo}/bin/cargo"
-    "--action_env=RUSTC=${rustc}/bin/rustc"
-    # Disable Bazel's linux-sandbox: it creates a nested mount namespace
-    # that doesn't inherit bwrap's /lib64 mount, preventing pre-built
-    # ELF binaries from executing. We already have bwrap for isolation.
-    "--spawn_strategy=local"
-    "--sandbox_debug"
+  # Nix store paths for patchelf
+  nixInterp = "${glibc}/lib/ld-linux-x86-64.so.2";
+  nixRpath = lib.concatStringsSep ":" [
+    "${glibc}/lib"
+    "${gcc-unwrapped.lib}/lib"
+    "${zlib}/lib"
+    "${openssl.out}/lib"
+    "${curl.out}/lib"
   ];
 
-  # Merged library directory providing glibc, zlib, libstdc++, etc. for
-  # pre-built ELF binaries that Bazel downloads (Python, Rust, Go toolchains).
-  # After patchelf sets their interpreter to /lib64/ld-linux-x86-64.so.2 and
-  # adds /lib64 to RPATH, these libraries become available.
-  fhsLibs = buildEnv {
-    name = "redpanda-fhs-libs";
-    paths = [
-      "${glibc}/lib"
-      "${gcc-unwrapped.lib}/lib"
-      "${zlib}/lib"
-      "${openssl.out}/lib"
-      "${curl.out}/lib"
-    ];
-    pathsToLink = [ "/lib" ];
+  # shellcheck-validated script for patching Bazel-downloaded binaries.
+  # Fixes two problems in the Nix sandbox:
+  #   1. ELF binaries have /lib64/ld-linux-x86-64.so.2 interpreter (doesn't exist)
+  #   2. Shell scripts have #!/bin/bash shebang (doesn't exist)
+  bazelPatcher = writeShellApplication {
+    name = "bazel-sandbox-patcher";
+    runtimeInputs = [ patchelf file findutils coreutils gnused ];
+    text = ''
+      NIX_INTERP="${nixInterp}"
+      NIX_RPATH="${nixRpath}"
+      NIX_BASH="${bash}/bin/bash"
+
+      patch_one_elf() {
+        local f="$1"
+        local desc
+        desc=$(file -b "$f" 2>/dev/null) || return 0
+        case "$desc" in
+          ELF*dynamically\ linked*) ;;
+          *) return 0 ;;
+        esac
+        local interp
+        interp=$(patchelf --print-interpreter "$f" 2>/dev/null) || return 0
+        case "$interp" in
+          /nix/store/*) return 0 ;;
+        esac
+        echo "  patchelf: $f (was: $interp)"
+        chmod u+w "$f" 2>/dev/null || true
+        patchelf --set-interpreter "$NIX_INTERP" "$f" 2>/dev/null || true
+        local old_rpath
+        old_rpath=$(patchelf --print-rpath "$f" 2>/dev/null) || old_rpath=""
+        patchelf --set-rpath "$NIX_RPATH:$old_rpath" "$f" 2>/dev/null || true
+      }
+
+      patch_elfs() {
+        local dir="$1"
+        echo "Scanning $dir for ELF binaries to patch..."
+        while IFS= read -r -d "" f; do
+          patch_one_elf "$f"
+        done < <(find -L "$dir" -type f \
+          \( -executable -o -name "*.so" -o -name "*.so.*" \) \
+          -print0 2>/dev/null)
+      }
+
+      fix_bash_shebangs() {
+        local dir="$1"
+        echo "Fixing #!/bin/bash shebangs in $dir..."
+        while IFS= read -r -d "" f; do
+          local first
+          first=$(head -c 11 "$f" 2>/dev/null) || continue
+          case "$first" in
+            '#!/bin/bash')
+              chmod u+w "$f" 2>/dev/null || true
+              sed -i "1s|#!/bin/bash|#!$NIX_BASH|" "$f"
+              echo "  fixed shebang: $f"
+              ;;
+          esac
+        done < <(find "$dir" -type f \
+          \( -name "*.sh" -o -executable \) \
+          -print0 2>/dev/null)
+      }
+
+      command="''${1:-}"
+      shift || true
+
+      case "$command" in
+        patch-all)
+          for dir in "$@"; do
+            if [ -d "$dir" ]; then
+              patch_elfs "$dir"
+              fix_bash_shebangs "$dir"
+            fi
+          done
+          ;;
+        patch-elfs)
+          for dir in "$@"; do
+            [ -d "$dir" ] && patch_elfs "$dir"
+          done
+          ;;
+        fix-shebangs)
+          for dir in "$@"; do
+            [ -d "$dir" ] && fix_bash_shebangs "$dir"
+          done
+          ;;
+        *)
+          echo "Usage: bazel-sandbox-patcher {patch-all|patch-elfs|fix-shebangs} DIR..."
+          exit 1
+          ;;
+      esac
+    '';
   };
 
-  # Merged /bin with bash + sh + python + coreutils, and /usr/bin with env
-  fhsBin = runCommand "redpanda-fhs-bin" { } ''
-    mkdir -p $out/bin $out/usr/bin
-    ln -s ${bash}/bin/bash $out/bin/bash
-    ln -s ${bash}/bin/bash $out/bin/sh
-    ln -s ${coreutils}/bin/env $out/usr/bin/env
-    # Provide common coreutils in /bin for scripts and tests
-    for cmd in ls cat cp mv rm mkdir readlink stat uname; do
-      ln -s ${coreutils}/bin/$cmd $out/bin/$cmd
-    done
-    ln -s ${python313}/bin/python3 $out/bin/python3
-    ln -s ${python313}/bin/python3 $out/bin/python
+  # Generate .bazelrc.nix content (same settings as shell.nix shellHook)
+  bazelrcNix = ''
+    build --config=system-clang
+    build --shell_executable=${bash}/bin/bash
+    build --action_env=PATH=${nixPath}
+    build --host_action_env=PATH=${nixPath}
+    build --action_env=NIX_LDFLAGS
+    build --host_action_env=NIX_LDFLAGS
+    build --action_env=NIX_CFLAGS_COMPILE
+    build --host_action_env=NIX_CFLAGS_COMPILE
+    build --action_env=NIX_CC
+    build --host_action_env=NIX_CC
+    build --action_env=NIX_BINTOOLS
+    build --host_action_env=NIX_BINTOOLS
+    build --action_env=NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu
+    build --host_action_env=NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu
+    build --action_env=NIX_BINTOOLS_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu
+    build --host_action_env=NIX_BINTOOLS_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu
+    build --action_env=NIX_HARDENING_ENABLE
+    build --host_action_env=NIX_HARDENING_ENABLE
+    build --action_env=NIX_ENFORCE_NO_NATIVE
+    build --host_action_env=NIX_ENFORCE_NO_NATIVE
+    build --action_env=ACLOCAL_PATH=${lib.concatStringsSep ":" [
+      "${automake}/share/aclocal"
+      "${libtool}/share/aclocal"
+      "${pkg-config}/share/aclocal"
+    ]}
+    build --host_action_env=ACLOCAL_PATH=${lib.concatStringsSep ":" [
+      "${automake}/share/aclocal"
+      "${libtool}/share/aclocal"
+      "${pkg-config}/share/aclocal"
+    ]}
+    build --action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+    build --host_action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+    build --action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+    build --linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
+    build --linkopt=-Wl,-rpath,${gccLib}/lib
+    build --host_linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
+    build --host_linkopt=-Wl,-rpath,${gccLib}/lib
+    build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
   '';
 
-  # Minimal /etc for the bwrap namespace (static parts only)
-  fhsEtc = runCommand "redpanda-fhs-etc" { } ''
-    mkdir -p $out/ssl/certs
-    echo "nixbld:x:$(id -u):$(id -g):nixbld:/build:/bin/bash" > $out/passwd
-    echo "nixbld:x:$(id -g):" > $out/group
-    echo "hosts: files dns" > $out/nsswitch.conf
-    echo "127.0.0.1 localhost" > $out/hosts
-    # SSL certificates
-    ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt $out/ssl/certs/ca-certificates.crt
-    ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt $out/ssl/certs/ca-bundle.crt
-  '';
-
-  # Construct a bwrap invocation that creates a new root with FHS layout.
-  # The Nix sandbox has a read-only root without /lib64 or /usr, so we
-  # build a new root from scratch instead of using --dev-bind / /.
-  # Without --dev-bind, bwrap creates a tmpfs root and can mkdir freely.
-  bwrapBazel = builtins.concatStringsSep " " [
-    "${bubblewrap}/bin/bwrap"
-    "--ro-bind /nix /nix"
-    "--bind /build /build"
-    "--bind /tmp /tmp"
-    "--dev /dev"
-    "--proc /proc"
-    "--ro-bind ${fhsLibs}/lib /lib64"
-    "--ro-bind ${fhsBin}/bin /bin"
-    "--ro-bind ${fhsBin}/usr/bin /usr/bin"
-    # Mount our static /etc; resolv.conf is added at build time via
-    # a pre-bwrap step that merges fhsEtc + sandbox's resolv.conf
-    "--ro-bind $BWRAP_ETC /etc"
-    "--tmpfs /run"
-    "--tmpfs /var"
-    "--setenv USER nixbld"
-    "--chdir $PWD"
-    "--die-with-parent"
-    "--"
-    "${bazel}/bin/bazel --batch"
+  commonArgs = [
+    "--registry=file://${registry}"
+    "--shell_executable=${bash}/bin/bash"
+    "--action_env=PATH=${nixPath}"
+    "--repo_env=PATH=${nixPath}"
+    "--repo_env=BAZEL_SH=${bash}/bin/bash"
+    "--action_env=BAZEL_SH=${bash}/bin/bash"
+    "--repo_env=SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+    "--action_env=SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+    "--spawn_strategy=local"
   ];
+
+  # Patch all Bazel external dirs in the output base
+  patchBazelDirs = ''
+    ${bazelPatcher}/bin/bazel-sandbox-patcher patch-all \
+      "$HOME"/.cache/bazel/_bazel_*/*/external \
+      "$HOME"/.cache/bazel/_bazel_*/*/modextwd
+  '';
 
   # Phase 1: FOD that fetches all Bazel dependencies into a repo cache
   bazelRepoCache = stdenv.mkDerivation {
@@ -192,12 +274,9 @@ let
 
     inherit src;
     sourceRoot = "redpanda-src-patched";
-    nativeBuildInputs = nativeBuildInputsDeps;
+    nativeBuildInputs = nativeBuildInputsDeps ++ [ bazel bazelPatcher ];
 
-    outputHash = {
-      x86_64-linux = lib.fakeHash;
-      aarch64-linux = lib.fakeHash;
-    }.${stdenv.hostPlatform.system};
+    outputHash = lib.fakeHash;
     outputHashAlgo = "sha256";
     outputHashMode = "recursive";
 
@@ -207,156 +286,32 @@ let
       export HOME=$(mktemp -d)
       mkdir repo_cache
 
-      # Merge static /etc with sandbox's resolv.conf for DNS inside bwrap
-      export BWRAP_ETC=$(mktemp -d)
-      cp -r ${fhsEtc}/* $BWRAP_ETC/
-      [ -f /etc/resolv.conf ] && cp /etc/resolv.conf $BWRAP_ETC/resolv.conf
+      # Write .bazelrc.nix for the fetch phase
+      cat > .bazelrc.nix <<'BAZELRC'
+      ${bazelrcNix}
+      BAZELRC
 
-      # Nix store paths for patchelf: set interpreter and RPATH to point at
-      # actual Nix store libraries instead of /lib64 (bwrap mounts don't work)
-      NIX_INTERP="${glibc}/lib/ld-linux-x86-64.so.2"
-      NIX_RPATH="${glibc}/lib:${gcc-unwrapped.lib}/lib:${zlib}/lib:${openssl.out}/lib:${curl.out}/lib"
+      export CC=clang
+      export CXX=clang++
 
-      # Helper: patch a single ELF binary to use Nix store interpreter.
-      patch_one_elf() {
-        local f="$1"
-        local desc
-        desc=$(${file}/bin/file -b "$f" 2>/dev/null) || return 0
-        case "$desc" in
-          ELF*dynamically\ linked*) ;;
-          *) return 0 ;;
-        esac
-        local interp
-        interp=$(${patchelf}/bin/patchelf --print-interpreter "$f" 2>/dev/null) || return 0
-        case "$interp" in
-          /nix/store/*) return 0 ;;
-        esac
-        echo "  patchelf: $f (was: $interp)"
-        chmod u+w "$f" 2>/dev/null || true
-        ${patchelf}/bin/patchelf --set-interpreter "$NIX_INTERP" "$f" 2>/dev/null || true
-        # Use --set-rpath to prepend Nix paths before the original RPATH
-        local old_rpath
-        old_rpath=$(${patchelf}/bin/patchelf --print-rpath "$f" 2>/dev/null) || old_rpath=""
-        ${patchelf}/bin/patchelf --set-rpath "$NIX_RPATH:$old_rpath" "$f" 2>/dev/null || true
-      }
-
-      # Helper: patch all pre-built ELF binaries under a directory tree.
-      patch_elfs() {
-        local dir="$1"
-        echo "Scanning $dir for ELF binaries to patch..."
-        local f
-        while IFS= read -r -d "" f; do
-          patch_one_elf "$f"
-        done < <(${findutils}/bin/find -L "$dir" -type f \
-          \( -executable -o -name "*.so" -o -name "*.so.*" \) \
-          -print0 2>/dev/null)
-      }
-
-      # Test: verify /lib64 mount works inside bwrap
-      echo "=== Testing bwrap /lib64 mount ==="
-      ${bubblewrap}/bin/bwrap \
-        --ro-bind /nix /nix \
-        --bind /build /build \
-        --bind /tmp /tmp \
-        --dev /dev \
-        --proc /proc \
-        --ro-bind ${fhsLibs}/lib /lib64 \
-        --ro-bind ${fhsBin}/bin /bin \
-        --ro-bind ${fhsBin}/usr/bin /usr/bin \
-        --ro-bind $BWRAP_ETC /etc \
-        --tmpfs /run \
-        --tmpfs /var \
-        --setenv USER nixbld \
-        --die-with-parent \
-        -- ${coreutils}/bin/ls -la /lib64/ld-linux-x86-64.so.2 || echo "FAILED: /lib64/ld-linux-x86-64.so.2 not found in bwrap!"
-
-      # First fetch: downloads and extracts all toolchains. Will fail
-      # because downloaded ELF binaries can't execute yet.
-      ${bwrapBazel} \
+      # First fetch: downloads and extracts toolchains. Will fail because
+      # downloaded ELF binaries (Rust, Go, etc.) can't execute yet.
+      echo "=== Fetch attempt 1 ==="
+      ${bazel}/bin/bazel --batch \
         fetch \
-        --registry=file://${registry} \
         --repository_cache=repo_cache \
         ${lib.escapeShellArgs commonArgs} \
         ${lib.escapeShellArgs targets} || true
 
-      # Debug: list what repos exist after first fetch
-      echo "=== Listing downloaded repos ==="
-      for bazel_base in $HOME/.cache/bazel/_bazel_*/*/external; do
-        if [ -d "$bazel_base" ]; then
-          echo "Repos in $bazel_base:"
-          ls -d "$bazel_base"/rules_python* "$bazel_base"/rules_rust* 2>/dev/null | head -20
-          echo "---"
-          # Check if the python platform repo has a binary
-          for pyrepo in "$bazel_base"/rules_python++python+python_3_12_*; do
-            if [ -d "$pyrepo" ]; then
-              echo "Python repo: $pyrepo"
-              ls -la "$pyrepo/bin/" 2>/dev/null | head -10
-              ls -la "$pyrepo/python" 2>/dev/null
-              ${file}/bin/file "$pyrepo/bin/python3" 2>/dev/null || true
-              ${file}/bin/file "$pyrepo/bin/python3.12" 2>/dev/null || true
-              ${patchelf}/bin/patchelf --print-interpreter "$pyrepo/bin/python3.12" 2>/dev/null && echo "(has interpreter)" || echo "(no interpreter / not ELF)"
-            fi
-          done
-          # Check rust repos
-          for rustrepo in "$bazel_base"/rules_rust++rust_host_tools*; do
-            if [ -d "$rustrepo" ]; then
-              echo "Rust host tools: $rustrepo"
-              ls -la "$rustrepo/bin/" 2>/dev/null | head -10
-              ${file}/bin/file "$rustrepo/bin/cargo" 2>/dev/null || true
-              ${patchelf}/bin/patchelf --print-interpreter "$rustrepo/bin/cargo" 2>/dev/null && echo "(has interpreter)" || echo "(no interpreter / not ELF)"
-            fi
-          done
-          for rustrepo in "$bazel_base"/rules_rust++rust+rust_linux*; do
-            if [ -d "$rustrepo" ]; then
-              echo "Rust platform tools: $rustrepo"
-              ls -la "$rustrepo/bin/" 2>/dev/null | head -10
-              ${file}/bin/file "$rustrepo/bin/cargo" 2>/dev/null || true
-            fi
-          done
-        fi
-      done
-
-      # Patch ALL downloaded pre-built ELF binaries so they can execute
-      # inside our bwrap namespace. This fixes Python, Rust, Go, etc.
       echo "=== Patching downloaded toolchain binaries ==="
-      for bazel_cache in $HOME/.cache/bazel/_bazel_*/*/external; do
-        if [ -d "$bazel_cache" ]; then
-          patch_elfs "$bazel_cache"
-        fi
-      done
-      # Also patch module extension working directory binaries (cargo-bazel)
-      for modext in $HOME/.cache/bazel/_bazel_*/*/modextwd; do
-        if [ -d "$modext" ]; then
-          patch_elfs "$modext"
-        fi
-      done
+      ${patchBazelDirs}
 
-      # Verify patchelf worked on key binaries
-      echo "=== Verifying patched binaries ==="
-      for cargo_bin in $HOME/.cache/bazel/_bazel_*/*/external/rules_rust++rust_host_tools+rust_host_tools/bin/cargo; do
-        if [ -f "$cargo_bin" ]; then
-          echo "cargo interpreter: $(${patchelf}/bin/patchelf --print-interpreter "$cargo_bin" 2>/dev/null)"
-          echo "cargo rpath: $(${patchelf}/bin/patchelf --print-rpath "$cargo_bin" 2>/dev/null)"
-          echo "cargo test: $("$cargo_bin" --version 2>&1)" || true
-        fi
-      done
-      for py_bin in $HOME/.cache/bazel/_bazel_*/*/external/rules_python++python+python_3_12_x86_64-*/bin/python3.12; do
-        if [ -f "$py_bin" ]; then
-          echo "python interpreter: $(${patchelf}/bin/patchelf --print-interpreter "$py_bin" 2>/dev/null)"
-          echo "python rpath: $(${patchelf}/bin/patchelf --print-rpath "$py_bin" 2>/dev/null)"
-          echo "python test: $("$py_bin" --version 2>&1)" || true
-        fi
-      done
-
-      # Re-run fetch with patched binaries. May need multiple rounds
-      # because Bazel re-creates repo rules (which re-copy binaries from
-      # cached archives, losing our patches). Each round patches any newly
-      # created unpatched binaries.
+      # Re-fetch with patched binaries. Multiple rounds because Bazel
+      # re-creates repo rules (re-extracting from cache, losing patches).
       for attempt in 2 3 4; do
         echo "=== Fetch attempt $attempt ==="
-        if ${bwrapBazel} \
+        if ${bazel}/bin/bazel --batch \
           fetch \
-          --registry=file://${registry} \
           --repository_cache=repo_cache \
           ${lib.escapeShellArgs commonArgs} \
           ${lib.escapeShellArgs targets}; then
@@ -364,12 +319,7 @@ let
           break
         fi
         echo "=== Fetch failed, patching again ==="
-        for bazel_cache in $HOME/.cache/bazel/_bazel_*/*/external; do
-          [ -d "$bazel_cache" ] && patch_elfs "$bazel_cache"
-        done
-        for modext in $HOME/.cache/bazel/_bazel_*/*/modextwd; do
-          [ -d "$modext" ] && patch_elfs "$modext"
-        done
+        ${patchBazelDirs}
       done
 
       runHook postBuild
@@ -389,9 +339,13 @@ stdenv.mkDerivation {
   inherit src version;
   sourceRoot = "redpanda-src-patched";
 
-  nativeBuildInputs = nativeBuildInputsDeps;
+  nativeBuildInputs = nativeBuildInputsDeps ++ [ bazel bazelPatcher lndir ];
 
   requiredSystemFeatures = [ "big-parallel" ];
+
+  passthru = {
+    bazelRepoCachePath = builtins.unsafeDiscardStringContext (toString bazelRepoCache);
+  };
 
   preBuildPhases = [ "preBuildPhase" ];
   preBuildPhase = ''
@@ -404,14 +358,19 @@ stdenv.mkDerivation {
 
     export HOME=$(mktemp -d)
 
-    # Merge static /etc with sandbox's resolv.conf for DNS inside bwrap
-    export BWRAP_ETC=$(mktemp -d)
-    cp -r ${fhsEtc}/* $BWRAP_ETC/
-    [ -f /etc/resolv.conf ] && cp /etc/resolv.conf $BWRAP_ETC/resolv.conf
+    # Write .bazelrc.nix
+    cat > .bazelrc.nix <<'BAZELRC'
+    ${bazelrcNix}
+    BAZELRC
 
-    ${bwrapBazel} \
+    export CC=clang
+    export CXX=clang++
+
+    echo "=== Pre-build patching ==="
+    ${patchBazelDirs}
+
+    ${bazel}/bin/bazel --batch \
       build \
-      --registry=file://${registry} \
       --repository_cache=repo_cache \
       ${lib.escapeShellArgs commonArgs} \
       ${lib.escapeShellArgs targets}
