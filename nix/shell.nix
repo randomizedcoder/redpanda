@@ -21,6 +21,9 @@ let
   # GCC runtime lib (libstdc++.so.6) — needed by exec-config binaries
   # like protoc_minimal that are built with the auto-detected CC toolchain.
   gccLib = stdenv.cc.cc.lib;
+  pythonEnv = python312.withPackages (ps: [
+    ps.kafka-python-ng
+  ]);
 in
 
 mkShell {
@@ -30,7 +33,7 @@ mkShell {
     llvmPackages_20.lld
     llvmPackages_20.llvm
     llvmPackages_20.libcxx
-    python312
+    pythonEnv
     jdk_headless
     autoconf
     automake

@@ -912,3 +912,132 @@ headers.
 6. **CI integration**: For CI use, consider a `nix build` derivation
    (in `nix/redpanda.nix`) that uses `buildBazelPackage` or similar,
    providing full Nix sandboxing rather than the dev-shell approach.
+
+---
+
+## End-to-End Verification (2026-03-05)
+
+After the successful build, we verified the binary runs correctly and
+serves Kafka protocol traffic.
+
+### Binary verification
+
+```
+$ file bazel-bin/src/v/redpanda/redpanda
+ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked,
+interpreter /nix/store/...-glibc-2.42-51/lib/ld-linux-x86-64.so.2,
+for GNU/Linux 3.10.0, not stripped
+
+$ nix develop --command bazel-bin/src/v/redpanda/redpanda --version
+v0.0.0-dev - 0000000000000000000000000000000000000000
+```
+
+The binary is 237MB, dynamically linked against the Nix glibc, and
+reports `v0.0.0-dev` (expected for a dev build without stamp vars).
+The `--help` flag lists all Redpanda and Seastar options.
+
+### Single-node cluster startup
+
+Started a single-node cluster using a minimal config:
+
+```bash
+nix develop --command bazel-bin/src/v/redpanda/redpanda \
+  --redpanda-cfg /tmp/redpanda-test/redpanda.yaml \
+  --smp 1 --memory 512M --reserve-memory 0
+```
+
+Config: `developer_mode: true`, Kafka on `127.0.0.1:9092`, admin on
+`127.0.0.1:9644`, data in `/tmp/redpanda-test/data`.
+
+Startup completed successfully with key log lines:
+
+```
+cluster - controller.cc - Cluster UUID created <uuid>
+feature_manager.cc - Activating features after upgrade...
+admin_api_server - Started HTTP admin service listening at 127.0.0.1:9644
+main - Started Kafka API server listening at 127.0.0.1:9092
+main - Successfully started Redpanda!
+```
+
+### Admin API health check
+
+```
+$ curl -s http://127.0.0.1:9644/v1/cluster/health_overview | python3 -m json.tool
+{
+    "is_healthy": true,
+    "unhealthy_reasons": [],
+    "controller_id": 0,
+    "all_nodes": [0],
+    "nodes_down": [],
+    "leaderless_count": 0,
+    "under_replicated_count": 0
+}
+```
+
+```
+$ curl -s http://127.0.0.1:9644/v1/brokers | python3 -m json.tool
+[
+    {
+        "node_id": 0,
+        "num_cores": 1,
+        "membership_status": "active",
+        "is_alive": true,
+        "version": "v0.0.0-dev - ...",
+        "disk_space": [{"path": "/tmp/redpanda-test/data", ...}]
+    }
+]
+```
+
+### Kafka protocol test (produce & consume)
+
+Used `kafka-python-ng` (added to `nix/shell.nix` as a Python package
+dependency for dev/test convenience):
+
+```python
+from kafka import KafkaProducer, KafkaConsumer
+from kafka.admin import KafkaAdminClient, NewTopic
+
+admin = KafkaAdminClient(bootstrap_servers='127.0.0.1:9092')
+admin.create_topics([NewTopic('test-nix-build', num_partitions=1, replication_factor=1)])
+
+producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
+for i in range(5):
+    producer.send('test-nix-build', value=f'hello from nix build #{i}'.encode())
+producer.flush()
+
+consumer = KafkaConsumer('test-nix-build', bootstrap_servers='127.0.0.1:9092',
+                         auto_offset_reset='earliest', consumer_timeout_ms=5000)
+for msg in consumer:
+    print(f'Consumed: {msg.value.decode()}')
+```
+
+**Output:**
+
+```
+Topic created: test-nix-build
+Produced 5 messages
+  Consumed: hello from nix build #0
+  Consumed: hello from nix build #1
+  Consumed: hello from nix build #2
+  Consumed: hello from nix build #3
+  Consumed: hello from nix build #4
+Total consumed: 5 messages
+```
+
+### Test summary
+
+| Test | Result |
+|------|--------|
+| Binary exists and is valid ELF | Pass |
+| `--version` reports dev version | Pass |
+| `--help` shows all options | Pass |
+| Single-node cluster starts | Pass |
+| Admin API `/v1/cluster/health_overview` | Pass (`is_healthy: true`) |
+| Admin API `/v1/brokers` | Pass (1 broker, active, alive) |
+| Kafka topic creation | Pass |
+| Kafka produce (5 messages) | Pass |
+| Kafka consume (5 messages) | Pass |
+
+All tests passed. The Nix+Bazel-built Redpanda binary is fully
+functional — it starts a cluster, serves the admin API, and handles
+Kafka protocol produce/consume correctly.
