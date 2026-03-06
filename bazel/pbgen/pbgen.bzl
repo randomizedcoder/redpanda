@@ -145,6 +145,7 @@ def _redpanda_protogen_impl(ctx):
         arguments = [args],
         progress_message = "Generating Redpanda protobuf stubs",
         mnemonic = "RedpandaProtoGen",
+        use_default_shell_env = True,
     )
     return [
         DefaultInfo(files = depset(cc_hdrs + cc_srcs)),
