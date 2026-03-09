@@ -1,292 +1,275 @@
-# Design: Nix-Managed Bazel Repository Cache
+# Design: Nix-Managed Bazel Module Precacher (v2)
 
 ## Context
 
 Building Redpanda via `nix build` requires running Bazel inside Nix's sandbox, where
-there is no network access. Currently a Fixed-Output Derivation (FOD) runs `bazel fetch`
-with network access to download ~470 archives, then a multi-pass patchelf loop fixes
-ELF binaries. This approach is fragile: the FOD hash is all-or-nothing (any MODULE.bazel
-change invalidates everything), and scripts with `#!/bin/bash` shebangs (like rules_cc's
-`generate_system_module_map.sh`) can't be fixed because Bazel re-extracts from cache.
+there is no network access. The previous approach used a Fixed-Output Derivation (FOD)
+to run `bazel fetch` with network access, downloading ~470 archives. This was fragile:
+the FOD hash is all-or-nothing (any MODULE.bazel change invalidates everything).
 
-The new approach pre-populates Bazel's repository cache using individual Nix `fetchurl`
-derivations, giving us per-archive caching, deterministic downloads, and the ability to
-apply patches via Bazel's native `single_version_override` mechanism.
+This document describes the **implemented** replacement: per-archive Nix `fetchurl`
+derivations assembled into a linkFarm that serves as Bazel's repository cache.
 
-## How Bazel's Repository Cache Works
+## The Core Problem
 
-(Source: `~/Downloads/bazel/src/main/java/.../repository/cache/DownloadCache.java`)
+Bazel modules need three things to work in Nix's sandbox:
+1. **Downloaded** — no network in sandbox
+2. **Nixified** — ELF binaries need patched interpreters/rpath, scripts need
+   Nix-compatible shebangs, some modules need custom patches
+3. **Provided to Bazel** — in a format Bazel recognizes
 
-```
-<repo-cache>/content_addressable/sha256/<64-hex-chars>/file
-```
+The challenge: Bazel's repository cache is **content-addressed by sha256**. Modifying
+an archive changes its hash, so Bazel can't find it. Nixification MUST happen after
+Bazel extracts the archives, not before.
 
-- Lookup is by **content hash only** - Bazel computes sha256 of the desired file
-  and checks `content_addressable/sha256/<hex>/file`
-- **Canonical ID markers** (`id-<hash>` files) add an extra check, but can be
-  disabled with `--repo_env=BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0`
-  (used by Bazel's own bootstrap: `scripts/bootstrap/bootstrap.sh`)
-- Bazel's own `distdir.bzl` uses this exact pattern to create offline bootstrap
-  tarballs - downloading each archive and placing it at
-  `content_addressable/sha256/<sha256>/file`
-
-Download priority in `DownloadManager.downloadInExecutor()`:
-1. File already at destination with correct hash
-2. Repository cache (`--repository_cache`)
-3. Distdir (`--distdir`)
-4. Network download
-5. Store result in repository cache
-
-## Architecture
+## Two-Derivation Architecture
 
 ```
-                     ┌─────────────────────────────────┐
-                     │   MODULE.bazel.lock (JSON)       │
-                     │   MODULE.bazel (archive_override) │
-                     │   BCR source.json files           │
-                     └──────────┬──────────────────────┘
-                                │
-                     ┌──────────▼──────────────────────┐
-                     │  nix/gen-bazel-deps.py           │
-                     │  Parses lockfile + BCR + MODULE  │
-                     │  Outputs nix/bazel-deps.nix      │
-                     └──────────┬──────────────────────┘
-                                │  (run manually when deps change)
-                     ┌──────────▼──────────────────────┐
-                     │  nix/bazel-deps.nix              │
-                     │  [ { url, sha256, name } ... ]   │
-                     │  ~240 archives                   │
-                     └──────────┬──────────────────────┘
-                                │
-                     ┌──────────▼──────────────────────┐
-                     │  nix/bazel-repo-cache.nix        │
-                     │  mkBazelRepoCache function       │
-                     │                                  │
-                     │  For each archive:               │
-                     │    fetchurl { url; sha256; }     │
-                     │  Assemble via linkFarm:           │
-                     │    content_addressable/           │
-                     │      sha256/<hex>/file → /nix/.. │
-                     └──────────┬──────────────────────┘
-                                │
-                     ┌──────────▼──────────────────────┐
-                     │  nix/redpanda.nix                │
-                     │  bazel build                     │
-                     │    --repository_cache=<cache>    │
-                     │    --repo_env=BAZEL_HTTP_RULES.. │
-                     │    --repository_disable_download │
-                     │    --registry=file://<bcr>       │
-                     └─────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────┐
+  │  Inputs: MODULE.bazel.lock, BCR source.json, MODULE.bazel│
+  └───────────────────────┬─────────────────────────────────┘
+                          │
+                ┌─────────▼─────────┐
+                │ gen-bazel-deps.py  │  (run manually when deps change)
+                │ Parses all sources │
+                │ Outputs bazel-deps.nix
+                └─────────┬─────────┘
+                          │
+  ════════════════════════╪════════════════════════════════════
+  Derivation 1: Download  │  (linkFarm — instant rebuild, per-archive caching)
+  ════════════════════════╪════════════════════════════════════
+                          │
+                ┌─────────▼──────────────────┐
+                │  bazel-repo-cache.nix       │
+                │                            │
+                │  For each { url, sha256 }: │
+                │    fetchurl { ... }         │
+                │                            │
+                │  linkFarm layout:           │
+                │    content_addressable/     │
+                │      sha256/<hex>/file →    │
+                │        /nix/store/<hash>    │
+                └─────────┬──────────────────┘
+                          │
+  ════════════════════════╪════════════════════════════════════
+  Derivation 2: Build     │  (single derivation, NO network, NO FOD)
+  ════════════════════════╪════════════════════════════════════
+                          │
+                ┌─────────▼──────────────────────────────────┐
+                │  redpanda.nix                              │
+                │                                            │
+                │  Step A: bazel fetch                       │
+                │    --repository_cache=<linkFarm>            │
+                │    --repository_disable_download            │
+                │    (extracts archives, runs repo rules)     │
+                │    (may fail — ELF binaries can't execute)  │
+                │                                            │
+                │  Step B: NIXIFY PIPELINE                   │
+                │    Apply configurable fixups to             │
+                │    extracted repos in output_base/external/ │
+                │    - patchelf (ELF interpreter + rpath)     │
+                │    - fix-shebangs (#!/bin/bash → nix bash)  │
+                │    - per-module patches (if needed)         │
+                │                                            │
+                │  Step C: bazel fetch (retry)               │
+                │    Now succeeds — patched binaries work     │
+                │    (repeat B+C if needed)                  │
+                │                                            │
+                │  Step D: bazel build                       │
+                │    Uses nixified extracted repos            │
+                └────────────────────────────────────────────┘
 ```
 
-## What Needs Caching
+## Why Only 2 Derivations (Not 3)?
 
-From analyzing MODULE.bazel.lock:
+It's tempting to separate "Extract + Nixify" into its own derivation for caching.
+But Bazel's `output_base/external/` directory is **not portable**:
+- The output_base path is derived from MD5(workspace_root_path)
+- Marker files (`.marker`) encode internal state
+- Transplanting extracted repos between output_bases is unsupported
 
-| Category | Count | Source of URL+hash |
-|----------|-------|--------------------|
-| BCR registry files (MODULE.bazel, source.json) | ~280 | `registryFileHashes` in lockfile |
-| BCR module archives (tarballs) | ~51 | `source.json` in local BCR snapshot |
-| Extension-generated downloads | ~189 | `moduleExtensions.*.generatedRepoSpecs` |
-| archive_override modules | ~2 | `MODULE.bazel` directly |
-| **Total unique sha256** | **~468** | |
+So extract + nixify + build must happen in the same derivation. This is fine —
+the expensive part is the C++ compilation, not the fetch+nixify (~minutes).
 
-**Note:** BCR registry files (~280) may not need caching when using
-`--registry=file://<local-bcr>` since Bazel reads them directly from the filesystem.
-Testing will confirm whether the ~51 module archives + ~189 extension downloads are
-sufficient, or if registry files also need cache entries.
+## Why `fetchurl` (Not `fetchFromGitHub`) for Repo Cache
+
+Bazel's repo cache is content-addressed: it computes sha256 of the raw archive
+bytes and looks up `content_addressable/sha256/<hex>/file`. The hash in the
+lockfile matches the raw tarball download.
+
+`fetchFromGitHub` (which uses `fetchzip` internally) produces an **unpacked,
+normalized** source tree with a completely different NAR hash. The raw tarball
+bytes are discarded. So `fetchFromGitHub` output cannot be placed in the repo
+cache — Bazel would never find it.
+
+**Where we DO use `fetchFromGitHub`:**
+- BCR snapshot (`nix/bcr.nix`) — Bazel reads via `--registry=file://`
+- `rules_python` fork — provided via `local_path_override` in MODULE.bazel
+
+**Where we MUST use `fetchurl`:**
+- All repo cache entries (254 archives) — Bazel needs exact tarball bytes
+
+## Nixify Pipeline Design
+
+The pipeline is a configurable list of fixup rules applied to extracted repos
+after `bazel fetch`. Defined in `nix/nixify-rules.nix`:
+
+```nix
+nixifyRules = [
+  {
+    type = "patchelf";
+    interpreter = "${glibc}/lib/ld-linux-x86-64.so.2";
+    rpath = "${glibc}/lib:${gcc-unwrapped.lib}/lib:...";
+  }
+  {
+    type = "fix-shebangs";
+    from = "/bin/bash";
+    to = "${bash}/bin/bash";
+  }
+  # Per-module patches can be added:
+  # { type = "patch"; module = "rules_cc"; patches = [ ... ]; }
+  # { type = "substitute"; module = "..."; file = "..."; from = "..."; to = "..."; }
+];
+```
+
+The `bazel-sandbox-patcher` script processes these rules:
+- `patchelf` — walks all files, finds ELF binaries, patches interpreter+rpath
+- `fix-shebangs` — finds scripts with matching shebangs, rewrites them
+
+These rules live in a dedicated file, separate from the build logic. This makes
+it easy to add/review fixups without touching build configuration.
+
+## Generator Script (`gen-bazel-deps.py`)
+
+Parses three sources to build the complete archive list:
+
+1. **BCR `source.json` files** — for each source.json URL in the lockfile's
+   `registryFileHashes`, read the corresponding file from the local BCR.
+   Extract `url` + `integrity` (SRI format → convert to hex).
+
+2. **`moduleExtensions.*.generatedRepoSpecs`** in lockfile — for repos with
+   `url`/`urls` AND `sha256`/`integrity` attributes.
+   Handles dict-valued urls/sha256 (toolchains_llvm per-platform entries).
+
+3. **`archive_override` and top-level `http_file`/`http_archive` entries**
+   in `MODULE.bazel` — extract URL + integrity directly from Starlark source.
+
+**Does NOT cache:**
+- BCR registry files (~280 MODULE.bazel/source.json) — served by local BCR
+  via `--registry=file://`, no download needed
+- Repos without URLs (local_repository, configure rules, etc.)
+- OCI image pulls (different download mechanism)
 
 ## Key Design Decisions
 
 ### 1. Use `--repository_cache` (not `--distdir`)
-
-- `--distdir` matches by **filename** then verifies hash - fragile (many files named `v1.2.3.tar.gz`)
-- `--repository_cache` is pure **content-addressable** lookup by hash - exact, no ambiguity
-- This is what Bazel's own bootstrap uses (`distdir.bzl` → `content_addressable/sha256/<hash>/file`)
+- `--distdir` matches by filename then verifies hash — fragile
+- `--repository_cache` is pure content-addressed lookup by hash
 
 ### 2. Disable canonical IDs
+`BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0` — makes the cache purely
+content-addressed, matching Bazel's own bootstrap approach.
 
-Set `--repo_env=BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0`.
+### 3. Use `linkFarm` for independent per-archive caching
+Each archive is a separate `fetchurl` derivation. Adding/removing one doesn't
+invalidate others. The linkFarm creates symlinks — trivial rebuild.
 
-Without this, Bazel requires `id-<hash_of_urls>` marker files alongside each `file` entry.
-Creating these is possible but adds complexity. Disabling it makes the cache purely
-content-addressed. Bazel's own bootstrap does exactly this.
+### 4. Hash format: hex sha256
+Everything normalized to hex for cache paths. SRI from BCR converted via
+`base64.b64decode().hex()`.
 
-### 3. Use `linkFarm` (not a single derivation)
+## Resolved Questions
 
-Each archive is an independent `fetchurl` derivation. Adding/removing one module doesn't
-invalidate any others. The `linkFarm` just creates a directory of symlinks to Nix store
-paths - trivial to rebuild. Bazel reads (copies) from the cache, so symlinks work fine.
+**Q: Registry files — cache them?**
+A: No. With `--registry=file://<local-bcr>`, Bazel reads registry files
+directly from the filesystem. Only module archives need caching.
 
-### 4. Patch via Bazel's native mechanisms (not in the cache)
+**Q: Can patchelf happen in the download phase?**
+A: No. Modifying archives changes their hash, breaking content-addressed lookup.
 
-Patching an archive changes its hash, breaking content-addressing. Instead:
-- Store **original** archives in the cache (correct hashes, Bazel finds them)
-- Apply patches **after extraction** using `single_version_override(patches=[...])` in MODULE.bazel
-- This is how Bazel is designed to work - patches are a native concept
+**Q: Why not a separate "nixify" derivation?**
+A: Bazel's output_base is not portable between workspace paths.
 
-### 5. Hash format: always hex sha256
+**Q: Does `--repository_disable_download` prevent all network access?**
+A: It disables `repository_ctx.download()`. Combined with Nix's sandbox,
+this is belt-and-suspenders.
 
-- Lockfile `registryFileHashes` uses hex sha256 directly
-- Extension repos use hex sha256 in `attributes.sha256`
-- SRI integrity (`sha256-<base64>`) from BCR `source.json` needs conversion to hex
-- The generator script normalizes everything to hex for both the cache path and `fetchurl`
+## Files
 
-## Implementation Plan
-
-### Step 1: Create `nix/bazel-repo-cache.nix`
-
-Generic function that takes a list of `{ url, sha256, name }` and produces
-a repository cache directory:
-
-```nix
-{ lib, fetchurl, linkFarm }:
-
-archives:
-
-let
-  entries = map (a: {
-    name = "content_addressable/sha256/${a.sha256}/file";
-    path = fetchurl {
-      url = a.url;
-      sha256 = a.sha256;
-      name = a.name or "source";
-    };
-  }) archives;
-in linkFarm "bazel-repo-cache" entries
-```
-
-### Step 2: Create `nix/gen-bazel-deps.py`
-
-Python script that generates `nix/bazel-deps.nix` by parsing:
-
-1. **`MODULE.bazel.lock`** → `registryFileHashes` (url → sha256 pairs for registry files)
-2. **Local BCR `source.json` files** → URL + integrity (SRI) for module archives
-   - Convert SRI `sha256-<base64>` → hex via `base64.b64decode` + `.hex()`
-   - Also collect patch/overlay URLs from source.json
-3. **`MODULE.bazel.lock`** → `moduleExtensions.*.generatedRepoSpecs.*.attributes`
-   - Extract `sha256` (hex) and `url`/`urls[0]`
-   - Only for rules with `ruleClassName` ending in `http_archive`, `http_file`, `http_jar`
-4. **`MODULE.bazel`** → `archive_override` entries (URL + integrity)
-
-Output format:
-```nix
-# Auto-generated by nix/gen-bazel-deps.py — do not edit manually
-# Run: python3 nix/gen-bazel-deps.py > nix/bazel-deps.nix
-[
-  { url = "https://github.com/abseil/...tar.gz"; sha256 = "abc123..."; name = "abseil-cpp"; }
-  { url = "https://..."; sha256 = "def456..."; name = "rules_cc"; }
-  # ...
-]
-```
-
-### Step 3: Create shebang patch for rules_cc
-
-Create `bazel/thirdparty/rules_cc-nix-shebang.patch`:
-```diff
---- a/cc/private/toolchain/generate_system_module_map.sh
-+++ b/cc/private/toolchain/generate_system_module_map.sh
-@@ -1,4 +1,4 @@
--#!/bin/bash
-+#!/usr/bin/env bash
-```
-
-Add to MODULE.bazel (via the source-patching step in `redpanda.nix`):
-```starlark
-single_version_override(
-    module_name = "rules_cc",
-    patches = ["//bazel/thirdparty:rules_cc-nix-shebang.patch"],
-)
-```
-
-### Step 4: Modify `nix/redpanda.nix`
-
-Replace the current FOD-based approach:
-
-**Before:** Single FOD runs `bazel fetch` with network → patchelf loop → copies repo_cache
-**After:**
-
-```
-bazelRepoCache = import ./bazel-repo-cache.nix { inherit lib fetchurl linkFarm; }
-                   (import ./bazel-deps.nix);
-```
-
-Add to `commonArgs`:
-```nix
-"--repository_cache=${bazelRepoCache}"
-"--repo_env=BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0"
-"--repository_disable_download"
-```
-
-**For ELF binary patching (Go SDK, Rust toolchain):**
-Keep a slim FOD that:
-- Uses `--repository_cache=${bazelRepoCache}` (no downloads needed!)
-- Runs `bazel fetch` (extraction + repo rule execution only)
-- Applies patchelf to extracted ELF binaries
-- Outputs the patched external repos
-
-OR: Apply patchelf inline in the build phase (between fetch and build),
-avoiding the FOD entirely. The `--repository_disable_download` flag proves
-completeness (build fails immediately if any archive is missing from cache).
-
-### Step 5: Generate initial `bazel-deps.nix`
-
-```bash
-python3 nix/gen-bazel-deps.py \
-  --lockfile MODULE.bazel.lock \
-  --bcr /nix/store/...-bazel-central-registry \
-  --module-bazel MODULE.bazel \
-  > nix/bazel-deps.nix
-```
-
-### Step 6: Test and iterate
-
-1. `nix build .#redpanda` — should fail with `--repository_disable_download`
-   if any archive is missing from the cache
-2. Add missing archives to `bazel-deps.nix` (or fix the generator)
-3. Verify the `rules_cc` shebang patch resolves the `/bin/bash` blocker
-4. Verify ELF patching still works for Go/Rust toolchain binaries
-
-## Files to Create/Modify
-
-| File | Action | Purpose |
-|------|--------|---------|
-| `nix/bazel-repo-cache.nix` | **Create** | Generic `mkBazelRepoCache` function |
-| `nix/gen-bazel-deps.py` | **Create** | Script to generate deps list from lockfile |
-| `nix/bazel-deps.nix` | **Create** (generated) | List of `{ url, sha256, name }` records |
-| `nix/redpanda.nix` | **Modify** | Use linkFarm cache instead of FOD download |
-| `bazel/thirdparty/rules_cc-nix-shebang.patch` | **Create** | Fix `#!/bin/bash` in rules_cc |
-
-## Advantages Over Current Approach
-
-1. **Incremental caching**: Each archive is a separate Nix `fetchurl` — adding/removing
-   one doesn't invalidate ~470 others
-2. **No FOD hash management**: No more `lib.fakeHash` → build → get hash → update cycle
-   for the download phase
-3. **Deterministic**: Content-addressable, reproducible, auditable
-4. **Solves the `/bin/bash` problem**: `single_version_override` patches are applied
-   after extraction, so the cache stores the original (correct-hash) archive
-5. **Generic**: The same `mkBazelRepoCache` pattern works for any Bazel project in Nix
-6. **Provably complete**: `--repository_disable_download` fails fast if any dep is missing
-
-## Resolved Decisions
-
-- **ELF patching**: Inline in the build phase. No FOD at all for downloading.
-  The main derivation runs `bazel fetch` (from cache, no network), then patchelf,
-  then `bazel build`. `--repository_disable_download` proves cache completeness.
-
-- **Integrity vs sha256**: `fetchurl` supports `hash = "sha256-<base64>"` natively.
-  The generator script will normalize to hex for cache paths but can use SRI for fetchurl.
-
-## Open Questions
-
-1. **Registry files**: Do we need to cache the ~280 BCR registry files when using
-   `--registry=file://<local-bcr>`? Or does the local registry bypass the cache entirely?
-   → Test empirically with `--repository_disable_download`
+| File | Type | Purpose |
+|------|------|---------|
+| `nix/bazel-repo-cache.nix` | Function | `fetchurl` → linkFarm repo cache |
+| `nix/gen-bazel-deps.py` | Script | Lockfile parser → bazel-deps.nix |
+| `nix/bazel-deps.nix` | Generated | Archive list (254 entries) |
+| `nix/nixify-rules.nix` | Config | Extensible fixup pipeline rules |
+| `nix/redpanda.nix` | Derivation | Uses linkFarm + nixify pipeline |
 
 ## Verification
 
-1. Build with `--repository_disable_download` — proves cache completeness
-2. `nix build .#redpanda` produces a working binary
-3. Test binary with `rpk topic produce`/`consume` (existing test from bench-log.md)
-4. Compare build output with dev-shell Bazel build to verify identical binary
+1. `--repository_disable_download` proves cache completeness (fails fast if missing)
+2. `nix build .#redpanda` produces working binary
+3. Test binary with rpk topic produce/consume
+4. Compare with dev-shell build output
+
+## MODULE.bazel Patches (Applied by src Derivation)
+
+The Nix build patches MODULE.bazel to work in the sandbox:
+
+1. **`go_sdk.host()`** replaces `go_sdk.download(version = "1.25.7")` —
+   `go_sdk.download()` first fetches a JSON version list from go.dev (dynamic,
+   no content hash, uncacheable). `go_sdk.host()` uses Go from PATH instead.
+
+2. **`single_version_override` for rules_cc** — Fixes `#!/usr/bin/env bash`
+   shebangs to `#!/bin/sh` via `patch_cmds`. The Nix sandbox only provides
+   `/bin/sh` (which is bash); `/bin/bash` and `/usr/bin/env` don't exist.
+   Must handle BOTH `#!/usr/bin/env bash` and `#!/bin/bash` patterns.
+
+3. **`single_version_override` for rules_buf** — Stubs out buf toolchain
+   downloads (not needed for C++ build).
+
+4. **`go_sdk_with_systemcrypto` removed** — FIPS variant not needed in Nix.
+
+5. **`local_path_override` for rules_python** — Uses embedded fork.
+
+6. **`exec_os = "linux"` for toolchains_llvm** — Skips `/etc/os-release` detection.
+
+**IMPORTANT**: Every MODULE.bazel change requires lockfile regeneration:
+```bash
+# Apply all patches to MODULE.bazel locally
+bazel fetch --lockfile_mode=update //src/v/redpanda:redpanda
+cp MODULE.bazel.lock nix/MODULE.bazel.lock.nix
+# Restore original MODULE.bazel
+```
+
+## Environment Variables for Sandbox
+
+- `BAZEL_SH=${bash}/bin/bash` — MUST be exported as a real env var (not just
+  `--repo_env`). `patch_cmds` runs during module resolution phase, which reads
+  the process environment, not `--repo_env`.
+- `USE_BAZEL_VERSION` — Points to Nix bazel_8 platform binary for bazelisk.
+- `BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0` — Pure content-addressing.
+
+## Known Gap: Dev Dependency Extensions
+
+Extensions marked `dev_dependency = True` (go_sdk, rust, crate internals) are
+NOT stored in `MODULE.bazel.lock`. This means `gen-bazel-deps.py` cannot capture
+their archives from the lockfile. Current status:
+
+- **Go SDK**: Solved — `go_sdk.host()` avoids all downloads
+- **Rust toolchain**: TODO — archives from `static.rust-lang.org` not in cache
+- **Rust internal crates**: TODO — `tinyjson`, `semver`, etc. from `static.crates.io`
+- **cargo-bazel binary**: TODO — from GitHub releases, needed by crate_universe
+- **Python pip packages**: TODO — from `pypi.org`, needed by rules_python pip ext
+
+These ~500 archives need to be added to `bazel-deps.nix` via:
+(a) Expanding `gen-bazel-deps.py` to extract from Bazel's repo cache, or
+(b) Manual export + `nix-prefetch-url`
+
+## Advantages Over Previous FOD Approach
+
+1. **Incremental caching** — per-archive, not all-or-nothing
+2. **No FOD hash management** — no `lib.fakeHash` → build → update cycle
+3. **Deterministic** — content-addressed, reproducible, auditable
+4. **Solves `/bin/bash`** — nixify pipeline handles shebangs post-extraction
+5. **Generic** — same pattern works for any Bazel project in Nix
+6. **Provably complete** — `--repository_disable_download` fails fast
