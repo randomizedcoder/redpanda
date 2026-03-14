@@ -1,0 +1,55 @@
+diff --git a/foreign_cc/private/framework/toolchains/linux_commands.bzl b/foreign_cc/private/framework/toolchains/linux_commands.bzl
+index 1234567..abcdef0 100644
+--- a/foreign_cc/private/framework/toolchains/linux_commands.bzl
++++ b/foreign_cc/private/framework/toolchains/linux_commands.bzl
+@@ -3,7 +3,7 @@
+ load(":commands.bzl", "FunctionAndCallInfo")
+
+ def shebang():
+-    return "#!/usr/bin/env bash"
++    return "#!/bin/sh\nif [ -z \"${_RFC_BASH_FOUND:-}\" ]; then for _b in \"${BAZEL_SH:-}\" /bin/bash /usr/bin/bash; do [ -x \"$_b\" ] && _RFC_BASH_FOUND=1 exec \"$_b\" \"$0\" \"$@\"; done; echo bash not found >&2; exit 1; fi"
+
+ def script_extension():
+     return ".sh"
+diff --git a/foreign_cc/private/framework/toolchains/macos_commands.bzl b/foreign_cc/private/framework/toolchains/macos_commands.bzl
+index 1234567..abcdef0 100644
+--- a/foreign_cc/private/framework/toolchains/macos_commands.bzl
++++ b/foreign_cc/private/framework/toolchains/macos_commands.bzl
+@@ -3,7 +3,7 @@
+ load(":commands.bzl", "FunctionAndCallInfo")
+
+ def shebang():
+-    return "#!/usr/bin/env bash"
++    return "#!/bin/sh\nif [ -z \"${_RFC_BASH_FOUND:-}\" ]; then for _b in \"${BAZEL_SH:-}\" /bin/bash /usr/bin/bash; do [ -x \"$_b\" ] && _RFC_BASH_FOUND=1 exec \"$_b\" \"$0\" \"$@\"; done; echo bash not found >&2; exit 1; fi"
+
+ def script_extension():
+     return ".sh"
+diff --git a/foreign_cc/private/framework/toolchains/freebsd_commands.bzl b/foreign_cc/private/framework/toolchains/freebsd_commands.bzl
+index 1234567..abcdef0 100644
+--- a/foreign_cc/private/framework/toolchains/freebsd_commands.bzl
++++ b/foreign_cc/private/framework/toolchains/freebsd_commands.bzl
+@@ -12,7 +12,7 @@
+ load(":commands.bzl", "FunctionAndCallInfo")
+
+ def shebang():
+-    return "#!/usr/bin/env bash"
++    return "#!/bin/sh\nif [ -z \"${_RFC_BASH_FOUND:-}\" ]; then for _b in \"${BAZEL_SH:-}\" /bin/bash /usr/bin/bash; do [ -x \"$_b\" ] && _RFC_BASH_FOUND=1 exec \"$_b\" \"$0\" \"$@\"; done; echo bash not found >&2; exit 1; fi"
+
+ def script_extension():
+     return ".sh"
+diff --git a/foreign_cc/private/runnable_binary_wrapper.sh b/foreign_cc/private/runnable_binary_wrapper.sh
+index 1234567..abcdef0 100644
+--- a/foreign_cc/private/runnable_binary_wrapper.sh
++++ b/foreign_cc/private/runnable_binary_wrapper.sh
+@@ -1,4 +1,9 @@
+-#!/usr/bin/env bash
++#!/bin/sh
++# POSIX-compatible bash discovery for Nix sandbox.
++# $BAZEL_SH is set by the Nix build to the real bash path.
++if [ -z "${_RFC_BASH_FOUND:-}" ]; then
++  for _b in "${BAZEL_SH:-}" /bin/bash /usr/bin/bash; do [ -x "$_b" ] && _RFC_BASH_FOUND=1 exec "$_b" "$0" "$@"; done
++  echo "ERROR: bash not found. Set BAZEL_SH." >&2; exit 1
++fi
+
+ # --- begin runfiles.bash initialization v3 ---
+ # Copy-pasted from the Bazel Bash runfiles library v3.

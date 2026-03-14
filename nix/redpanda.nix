@@ -4,6 +4,7 @@
   callPackage,
   runCommand,
   writeShellApplication,
+  fetchurl,
   bazel_8,
   bazelisk,
   llvmPackages_20,
@@ -27,6 +28,9 @@
   coreutils,
   bash,
   gnused,
+  gnumake,
+  gnugrep,
+  gawk,
   glibc,
   gcc-unwrapped,
   zlib,
@@ -37,6 +41,13 @@
 
 let
   version = "0.0.0-dev";
+
+  # Python with build-time code generation dependencies (jinja2, jsonschema).
+  # Replaces the pip extension — nixpkgs provides the packages directly.
+  pythonWithDeps = python312.withPackages (ps: [
+    ps.jinja2
+    ps.jsonschema
+  ]);
 
   gccLib = stdenv.cc.cc.lib;
 
@@ -55,7 +66,7 @@ let
   rulesPythonSrc = builtins.fetchGit {
     url = "/home/das/Downloads/rules_python";
     ref = "nix-local-toolchain";
-    rev = "b65ba9d68a489456fa45a924a1726c86fec08e88";
+    rev = "a9b9c43c62e1fbc14dc162153dc8a5e623f83f3d";
   };
 
   src = runCommand "redpanda-src-patched" { } ''
@@ -68,49 +79,38 @@ let
     # Rewrite local_path_override to in-tree copy
     sed -i 's|path = "/home/das/Downloads/rules_python"|path = "third_party/rules_python"|' $out/MODULE.bazel
 
-    # Add exec_os to skip /etc/os-release detection in the Nix sandbox
-    sed -i 's/llvm.toolchain(/llvm.toolchain(\n            exec_os = "linux",/' $out/MODULE.bazel
+    # Create stub @python_deps extension (nixpkgs provides the real packages)
+    cat > $out/bazel/python_deps.bzl <<'PYEXT'
+"""Stub @python_deps repo for Nix builds.
 
-    # Patch rules_buf to not download buf binaries (transitive dep, not used
-    # by Redpanda). Without this, the buf repo rule downloads sha256.txt at
-    # fetch time without a content hash, which can't be served from the repo
-    # cache and fails in the sandbox.
-    cat >> $out/MODULE.bazel <<'BUFPATCH'
+Creates empty py_library targets for each Python package.
+The real packages (jinja2, jsonschema, etc.) are provided by nixpkgs'
+python312.withPackages and are on sys.path automatically.
+"""
 
-# Nix: stub out buf toolchain downloads (not needed for the build)
-single_version_override(
-    module_name = "rules_buf",
-    patch_strip = 1,
-    patches = ["//bazel/thirdparty:rules_buf-nix-no-download.patch"],
-)
-BUFPATCH
+def _python_deps_impl(rctx):
+    packages = [
+        "jinja2", "jsonschema", "markupsafe",
+        "aioboto3", "boto3", "psutil", "pyyaml", "s3transfer",
+    ]
+    rctx.file("BUILD.bazel", "")
+    for pkg in packages:
+        rctx.file("{}/BUILD.bazel".format(pkg), 'py_library(name = "{}", visibility = ["//visibility:public"])'.format(pkg))
 
-    # Use host Go SDK instead of downloading from go.dev.
-    # go_sdk.download() first fetches a JSON version list from go.dev which
-    # can't be served from the repo cache (no content hash). go_sdk.host()
-    # uses Go from PATH (provided by nativeBuildInputs) instead.
-    sed -i '/^go_sdk = use_extension/,/^$/c\
-go_sdk = use_extension("@rules_go\/\/go:extensions.bzl", "go_sdk", dev_dependency = True)\
-go_sdk.host()\
-' $out/MODULE.bazel
-    # Remove the go_sdk_with_systemcrypto block (not needed for Nix build)
-    sed -i '/^# The microsoft compiler versions/,/^)$/d' $out/MODULE.bazel
+_python_deps_repo = repository_rule(implementation = _python_deps_impl)
 
-    # Fix rules_cc shebangs: #!/bin/bash → #!/bin/sh
-    # /bin/bash doesn't exist in the Nix sandbox; /bin/sh does (it's bash).
-    # Uses patch_cmds so Bazel applies these during extraction, persisting
-    # even when Bazel re-validates/re-extracts repos.
-    cat >> $out/MODULE.bazel <<'CCPATCH'
+def _python_deps_ext_impl(ctx):
+    _python_deps_repo(name = "python_deps")
 
-# Nix: fix shebangs in rules_cc toolchain scripts
-# Handles both #!/bin/bash and #!/usr/bin/env bash variants.
-single_version_override(
-    module_name = "rules_cc",
-    patch_cmds = [
-        "sed -i '1s|#!/usr/bin/env bash|#!/bin/sh|; 1s|#!/bin/bash|#!/bin/sh|' cc/private/toolchain/generate_system_module_map.sh cc/private/toolchain/grep-includes.sh cc/private/toolchain/link_dynamic_library.sh",
-    ],
-)
-CCPATCH
+python_deps_ext = module_extension(implementation = _python_deps_ext_impl)
+PYEXT
+
+    # Apply MODULE.bazel patches for Nix sandbox:
+    # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
+    # - Replace go_sdk.download() with go_sdk.host()
+    # - Replace pip extension with nixpkgs stub
+    # - Add rules_buf and rules_cc overrides (fix shebangs, stub downloads)
+    ${pythonWithDeps}/bin/python3 ${./patch-module-bazel.py} $out/MODULE.bazel
 
     # Export the patch file so Bazel can resolve the label
     echo 'exports_files(["rules_buf-nix-no-download.patch"])' >> $out/bazel/thirdparty/BUILD
@@ -119,6 +119,16 @@ CCPATCH
     # a list flag — CLI values append rather than replace, so we must patch
     # the .bazelrc source to remove the remote URL)
     sed -i 's|common --registry=https://bcr.bazel.build|common --registry=file://${registry}|' $out/.bazelrc
+
+    # Remove .bazelrc lines that reference removed modules
+    # (toolchains_llvm, current/next_llvm_toolchain, rules_go, go_sdk)
+    sed -i '/^common --@toolchains_llvm/d' $out/.bazelrc
+    sed -i '/^common --extra_toolchains=@current_llvm_toolchain/d' $out/.bazelrc
+    sed -i '/^common:clang-21 --extra_toolchains=@next_llvm_toolchain/d' $out/.bazelrc
+    sed -i '/^build --@rules_go/d' $out/.bazelrc
+    sed -i '/^build:gofips/d' $out/.bazelrc
+    sed -i '/^build:lto --@rules_rust/d' $out/.bazelrc
+    sed -i '/^test:lldb --run_under=.*llvm_toolchain/d' $out/.bazelrc
 
     # Use pre-generated lockfile that matches the patched MODULE.bazel.
     # Generated by running: bazelisk mod deps --lockfile_mode=update
@@ -152,6 +162,41 @@ CCPATCH
 
   shebangsRule = lib.findFirst (r: r.type == "fix-shebangs") null nixifyRules;
 
+  # ── Pre-built cargo-bazel for crate_universe extension ──
+  # module_ctx.download() does NOT use --repository_cache, so we must
+  # provide the binary locally via CARGO_BAZEL_GENERATOR_URL.
+  cargoBazel = runCommand "cargo-bazel-patched" {
+    nativeBuildInputs = [ patchelf ];
+  } ''
+    mkdir -p $out/bin
+    cp ${fetchurl {
+      url = "https://github.com/bazelbuild/rules_rust/releases/download/0.60.0/cargo-bazel-x86_64-unknown-linux-gnu";
+      sha256 = "e4f70e4fccedb95cab5efd95ac54953d0e693c05c0552376d542c44df6df6977";
+    }} $out/bin/cargo-bazel
+    chmod u+wx $out/bin/cargo-bazel
+    patchelf --set-interpreter ${nixInterp} --set-rpath ${nixRpath} $out/bin/cargo-bazel
+  '';
+
+  # ── Go module proxy cache ──
+  # gazelle's go_repository uses fetch_repo which downloads from GOPROXY
+  # (proxy.golang.org). This doesn't go through Bazel's --repository_cache.
+  # We pre-download the needed Go modules and serve them via GOPROXY=file://.
+  # pbgen (Go protobuf code gen) only needs google.golang.org/protobuf and
+  # github.com/golang/protobuf.
+  goProxyCache = runCommand "go-proxy-cache" { } ''
+    mkdir -p $out/google.golang.org/protobuf/@v
+    ln -s ${fetchurl { url = "https://proxy.golang.org/google.golang.org/protobuf/@v/v1.36.11.info"; sha256 = "2156715d128777c2a6fae6107d12a0ab60c2b1deed4fba5a2b2481c68911082a"; }} $out/google.golang.org/protobuf/@v/v1.36.11.info
+    ln -s ${fetchurl { url = "https://proxy.golang.org/google.golang.org/protobuf/@v/v1.36.11.mod"; sha256 = "a75c105a852fbd8da8d8cfac09c2eab9a206cfd27ed37c973737e23f632ca96e"; }} $out/google.golang.org/protobuf/@v/v1.36.11.mod
+    ln -s ${fetchurl { url = "https://proxy.golang.org/google.golang.org/protobuf/@v/v1.36.11.zip"; sha256 = "14983d36c56a814ed91b6d652f2b8f895baba1b84eb43b28a0b132c8637cd274"; }} $out/google.golang.org/protobuf/@v/v1.36.11.zip
+    echo '{"Version":"v1.36.11"}' > $out/google.golang.org/protobuf/@v/list
+
+    mkdir -p $out/github.com/golang/protobuf/@v
+    ln -s ${fetchurl { url = "https://proxy.golang.org/github.com/golang/protobuf/@v/v1.5.4.info"; sha256 = "840270c813a1c9b8cfe1b66d534336c71dad9da2e1c57c9df3743aaa5eaca219"; }} $out/github.com/golang/protobuf/@v/v1.5.4.info
+    ln -s ${fetchurl { url = "https://proxy.golang.org/github.com/golang/protobuf/@v/v1.5.4.mod"; sha256 = "c5f873c621cfaaf563f8b66a0501a5be14390cb0859e5187ce616d0312a6c8f8"; }} $out/github.com/golang/protobuf/@v/v1.5.4.mod
+    ln -s ${fetchurl { url = "https://proxy.golang.org/github.com/golang/protobuf/@v/v1.5.4.zip"; sha256 = "9a2f43d3eac8ceda506ebbeb4f229254b87235ce90346692a0e233614182190b"; }} $out/github.com/golang/protobuf/@v/v1.5.4.zip
+    echo '{"Version":"v1.5.4"}' > $out/github.com/golang/protobuf/@v/list
+  '';
+
   # ── Per-archive repo cache (linkFarm) ──
   # Each archive is fetched independently via fetchurl, then assembled
   # into a content_addressable/sha256/<hex>/file layout that Bazel
@@ -167,7 +212,7 @@ CCPATCH
     llvmPackages_20.lld
     llvmPackages_20.llvm
     llvmPackages_20.libcxx
-    python312
+    pythonWithDeps
     go
     jdk_headless
     autoconf
@@ -187,6 +232,9 @@ CCPATCH
     coreutils
     bash
     gnused
+    gnumake
+    gnugrep
+    gawk
   ];
 
   nixPath = lib.makeBinPath (nativeBuildInputsDeps ++ [ bazel stdenv.cc stdenv.cc.bintools ]);
@@ -321,8 +369,8 @@ CCPATCH
     ]}
     build --action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
     build --host_action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-    build --action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+    build --action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib:${zlib}/lib
     build --linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
     build --linkopt=-Wl,-rpath,${gccLib}/lib
     build --host_linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
@@ -339,6 +387,10 @@ CCPATCH
     "--action_env=BAZEL_SH=${bash}/bin/bash"
     "--repo_env=SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
     "--action_env=SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+    "--repo_env=GOPROXY=file://${goProxyCache},off"
+    "--repo_env=GONOSUMCHECK=*"
+    "--repo_env=GONOSUMDB=*"
+    "--repo_env=GOFLAGS=-modcacherw"
     "--spawn_strategy=local"
   ];
 
@@ -386,8 +438,28 @@ stdenv.mkDerivation {
     # patch_cmds (module resolution phase) reads the process environment.
     export BAZEL_SH=${bash}/bin/bash
 
+    # Provide cargo-bazel binary for crate_universe extension evaluation.
+    # module_ctx.download() doesn't use --repository_cache, so we provide
+    # a pre-built, patchelf'd binary via env var (file:// URL).
+    # The path must match what's recorded in the lockfile to prevent
+    # extension re-evaluation (which would need cargo + crate index).
+    cp ${cargoBazel}/bin/cargo-bazel /tmp/cargo-bazel
+    chmod +x /tmp/cargo-bazel
+    export CARGO_BAZEL_GENERATOR_URL=file:///tmp/cargo-bazel
+
     # Disable canonical ID so Bazel uses pure content-addressing
     export BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0
+
+    # Tell cargo not to access the network (crate sources are in repo cache,
+    # cargo-bazel splice only needs the lockfile metadata).
+    export CARGO_NET_OFFLINE=true
+
+    # Go module proxy cache for gazelle's go_repository rules.
+    # fetch_repo uses GOPROXY, not Bazel's --repository_cache.
+    export GOPROXY=file://${goProxyCache},off
+    export GONOSUMCHECK='*'
+    export GONOSUMDB='*'
+    export GOFLAGS=-modcacherw
 
     # Create a writable copy of the repo cache. The linkFarm is in the
     # read-only Nix store, but Bazel needs to write to the cache dir
@@ -447,6 +519,7 @@ stdenv.mkDerivation {
     # ── Phase D: Build ──
     bazelisk \
       build \
+      --verbose_failures \
       ${lib.escapeShellArgs commonArgs} \
       ${lib.escapeShellArgs targets}
 
