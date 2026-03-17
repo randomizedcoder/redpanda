@@ -31,6 +31,8 @@
   gnumake,
   gnugrep,
   gawk,
+  perl,
+  m4,
   glibc,
   gcc-unwrapped,
   zlib,
@@ -114,6 +116,23 @@ PYEXT
 
     # Export the patch file so Bazel can resolve the label
     echo 'exports_files(["rules_buf-nix-no-download.patch"])' >> $out/bazel/thirdparty/BUILD
+
+    # Fix openssl Configure shebang: #!/usr/bin/env perl doesn't work in Nix sandbox.
+    # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
+    # patch_cmds runs during extraction — Bazel executes the command in bash,
+    # so $(command -v perl) resolves to the Nix perl path at build time.
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'FIXEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+fix = """        patch_cmds = ["sed -i '1s|#! */usr/bin/env perl|#!'$(command -v perl)'|' Configure"],"""
+for url in ["openssl-3.5.5.tar.gz", "openssl-3.1.2.tar.gz"]:
+    marker = 'url = "https://vectorized-public.s3.amazonaws.com/dependencies/' + url + '",'
+    text = text.replace(marker, marker + "\n" + fix)
+with open(path, "w") as f:
+    f.write(text)
+FIXEOF
 
     # Replace default BCR registry with local copy (the --registry flag is
     # a list flag — CLI values append rather than replace, so we must patch
@@ -235,6 +254,8 @@ PYEXT
     gnumake
     gnugrep
     gawk
+    perl
+    m4
   ];
 
   nixPath = lib.makeBinPath (nativeBuildInputsDeps ++ [ bazel stdenv.cc stdenv.cc.bintools ]);
@@ -284,24 +305,40 @@ PYEXT
 
       fix_bash_shebangs() {
         local dir="$1"
-        echo "Fixing bash shebangs in $dir..."
+        echo "Fixing shebangs in $dir..."
         while IFS= read -r -d "" f; do
-          local first
-          first=$(head -c 19 "$f" 2>/dev/null) || continue
-          case "$first" in
-            '#!/usr/bin/env bash'*)
+          # Skip binary files (head on binaries produces null bytes)
+          # -L follows symlinks (Bazel external/ uses symlinks extensively)
+          [[ "$(file -bL --mime-type "$f" 2>/dev/null)" == text/* ]] || continue
+          local firstline
+          firstline=$(head -n1 "$f" 2>/dev/null) || continue
+          case "$firstline" in
+            '#!/usr/bin/env '*|'#! /usr/bin/env '*)
+              # Generic #!/usr/bin/env X handler — resolve X via PATH
+              # Handles both "#!/usr/bin/env X" and "#! /usr/bin/env X" (space after #!)
+              local prog
+              prog="''${firstline#*'/usr/bin/env '}"
+              prog="''${prog%% *}"
+              local real_path
+              real_path=$(command -v "$prog" 2>/dev/null) || continue
+              chmod u+w "$(dirname "$f")" 2>/dev/null || true
               chmod u+w "$f" 2>/dev/null || true
-              sed -i "1s|#!/usr/bin/env bash|#!$NIX_BASH|" "$f"
-              echo "  fixed shebang: $f"
+              sed -i "1s|#!.*/usr/bin/env  *$prog|#!$real_path|" "$f" 2>/dev/null || true
+              echo "  fixed shebang: $f (env $prog -> $real_path)"
               ;;
             '#!${shebangsRule.from}'*)
+              chmod u+w "$(dirname "$f")" 2>/dev/null || true
               chmod u+w "$f" 2>/dev/null || true
-              sed -i "1s|#!${shebangsRule.from}|#!$NIX_BASH|" "$f"
+              sed -i "1s|#!${shebangsRule.from}|#!$NIX_BASH|" "$f" 2>/dev/null || true
               echo "  fixed shebang: $f"
               ;;
           esac
-        done < <(find "$dir" -type f \
-          \( -name "*.sh" -o -executable \) \
+        done < <(find -L "$dir" \
+          -path "*/bazel_tools/*" -prune -o \
+          -path "*go_sdk+main___host*" -prune -o \
+          -type f \
+          \( -name "*.sh" -o -name "*.pl" -o -name "*.py" \
+             -o -name "Configure" -o -name "configure" -o -executable \) \
           -print0 2>/dev/null)
       }
 

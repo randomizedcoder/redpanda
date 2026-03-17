@@ -278,6 +278,24 @@ single_version_override(
             flags=re.DOTALL,
         )
 
+    # Fix liburing: with --spawn_strategy=local, the generate_headers genrule
+    # runs ./configure in the source tree, creating config-host.h there. The
+    # cc_library then sees both the genrule output AND the source-tree copy.
+    # Bazel flags the source-tree copy as "undeclared inclusion". Fix by
+    # cleaning up the source-tree copies after the genrule copies to output.
+    if 'module_name = "liburing"' not in text:
+        text += '''
+# Nix: fix liburing undeclared inclusion of config-host.h.
+# With --spawn_strategy=local, ./configure creates files in source tree.
+# Clean them up after copying to Bazel output to avoid include validation errors.
+single_version_override(
+    module_name = "liburing",
+    patch_cmds = [
+        "sed -i '/^            done$/a\\\\            pushd $$(dirname $(location configure))\\\\n              rm -f config-host.h config-host.mak src/include/liburing/compat.h src/include/liburing/io_uring_version.h\\\\n            popd' BUILD.bazel",
+    ],
+)
+'''
+
     with open(path, 'w') as f:
         f.write(text)
 
