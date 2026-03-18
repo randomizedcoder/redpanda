@@ -248,6 +248,87 @@ cp MODULE.bazel.lock nix/MODULE.bazel.lock.nix
   the process environment, not `--repo_env`.
 - `USE_BAZEL_VERSION` — Points to Nix bazel_8 platform binary for bazelisk.
 - `BAZEL_HTTP_RULES_URLS_AS_DEFAULT_CANONICAL_ID=0` — Pure content-addressing.
+- `NIX_CFLAGS_COMPILE` and `NIX_LDFLAGS` — Sanitized at build time to strip
+  derivation-hash-dependent values (see below).
+
+## Cache Persistence Across Nix Re-Derivations
+
+### Problem
+
+With a persistent `--output_base` at `/var/cache/bazel-nix/`, we expected warm
+builds to hit the action cache for nearly all 7,662 actions. Instead, only 4,928
+actions hit the cache — 2,709 C/C++ compilation actions always re-executed,
+achieving only a 64% hit rate and saving ~4 minutes of a ~35 minute build.
+
+### Root Cause
+
+Nix's stdenv injects derivation-hash-dependent values into environment variables
+that Bazel uses as action cache keys:
+
+- **`NIX_CFLAGS_COMPILE`** contains `-frandom-seed=<10-char output hash prefix>`.
+  This value changes every time the derivation hash changes (e.g. when
+  `nix/entropy` is touched), even though the source code is identical.
+- **`NIX_LDFLAGS`** contains `-rpath /nix/store/<output-hash>-redpanda-0.0.0-dev/lib`.
+  Same problem — the output store path changes with the derivation hash.
+
+Since both are passed to Bazel via `--action_env`, they become part of every
+C/C++ action's cache key. When the derivation hash changes, ALL compilation
+actions get new cache keys → 100% cache miss for compilation.
+
+### Fix
+
+Strip the unstable values in `buildPhase` before Bazel runs:
+
+```bash
+export NIX_CFLAGS_COMPILE="$(echo "$NIX_CFLAGS_COMPILE" | sed 's/-frandom-seed=[^[:space:]]*//')"
+export NIX_LDFLAGS="$(echo "$NIX_LDFLAGS" | sed 's|-rpath /nix/store/[^[:space:]]*/lib[[:space:]]*||')"
+```
+
+### Why This Is Safe
+
+- **`-frandom-seed`**: Bazel already sets its own per-object `-frandom-seed` in
+  the command arguments for each compilation action. The Nix-injected value is
+  redundant and only serves to poison cache keys.
+- **`$out/lib` rpath**: The output store path doesn't exist during the build.
+  The real rpaths for Nix dependencies (libc++, gcc, zlib) are set via
+  `--linkopt=-Wl,-rpath,...` in `.bazelrc.nix`. The final binary gets its
+  correct rpath from `patchelf` in `installPhase`.
+
+### Experiments Tried
+
+1. **`--disk_cache`** — Writes cached artifacts to a second location on disk.
+   Did not help: the action cache key includes the env vars, so the disk cache
+   suffers the same key mismatch as the internal action cache.
+2. **`--execution_log_json_file`** — 4.5 GB JSON log of every action. Diffing
+   two builds revealed that `NIX_CFLAGS_COMPILE` and `NIX_LDFLAGS` were the
+   only differences in compilation action keys. This identified the root cause.
+3. **Stable `$HOME=/tmp/bazel-home`** — Good practice (prevents `$HOME`-dependent
+   paths from leaking into actions) but was not the main cache-busting issue.
+
+### Measured Results
+
+| Metric | Before fix (warm) | After fix (warm) |
+|---|---|---|
+| Bazel elapsed time | ~31 min | **3.9 seconds** |
+| Action cache hits | 4,928 (64%) | **7,703 (100%)** |
+| Local recompiles | 2,709 | **0** |
+| Total wall time (incl. fetch/nixify/install) | ~35 min | **5 min 36 sec** |
+
+Cold build remains ~32 min (7,662 actions, 3,103 local compiles).
+
+### How to Reproduce
+
+1. Apply the env var sanitization in `nix/redpanda.nix` `buildPhase`:
+   ```bash
+   export NIX_CFLAGS_COMPILE="$(echo "$NIX_CFLAGS_COMPILE" | sed 's/-frandom-seed=[^[:space:]]*//')"
+   export NIX_LDFLAGS="$(echo "$NIX_LDFLAGS" | sed 's|-rpath /nix/store/[^[:space:]]*/lib[[:space:]]*||')"
+   ```
+2. Ensure persistent `--output_base` is configured (via `bazelCacheDir`).
+3. Clear old cache: `sudo rm -rf /var/cache/bazel-nix/*`
+4. Cold build: `time nix build .#redpanda-cached --print-build-logs`
+5. Invalidate derivation: `date > nix/entropy`
+6. Warm build: `time nix build .#redpanda-cached --print-build-logs`
+7. Verify: Bazel should report ~7,700 action cache hits, ~0 local actions.
 
 ## Known Gap: Dev Dependency Extensions
 

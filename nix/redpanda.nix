@@ -39,6 +39,7 @@
   openssl,
   curl,
   lndir,
+  bazelCacheDir ? "",
 }:
 
 let
@@ -117,16 +118,15 @@ PYEXT
     # Export the patch file so Bazel can resolve the label
     echo 'exports_files(["rules_buf-nix-no-download.patch"])' >> $out/bazel/thirdparty/BUILD
 
-    # Fix openssl Configure shebang: #!/usr/bin/env perl doesn't work in Nix sandbox.
+    # Fix openssl Configure shebang: #! /usr/bin/env perl doesn't work in Nix sandbox.
     # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
-    # patch_cmds runs during extraction — Bazel executes the command in bash,
-    # so $(command -v perl) resolves to the Nix perl path at build time.
+    # Uses ^#!.* to match ANY shebang variant (resilient to spaces, path differences).
     ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'FIXEOF'
 import sys
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
-fix = """        patch_cmds = ["sed -i '1s|#! */usr/bin/env perl|#!'$(command -v perl)'|' Configure"],"""
+fix = """        patch_cmds = ["sed -i '1s|^#!.*|#!'$(command -v perl)'|' Configure"],"""
 for url in ["openssl-3.5.5.tar.gz", "openssl-3.1.2.tar.gz"]:
     marker = 'url = "https://vectorized-public.s3.amazonaws.com/dependencies/' + url + '",'
     text = text.replace(marker, marker + "\n" + fix)
@@ -171,7 +171,8 @@ FIXEOF
   # ── Nixify pipeline configuration ──
   # Imported from nixify-rules.nix — centralizes all fixup config.
   nixifyRules = import ./nixify-rules.nix {
-    inherit lib bash glibc gcc-unwrapped zlib openssl curl;
+    inherit lib bash perl glibc gcc-unwrapped zlib openssl curl;
+    python3 = pythonWithDeps;
   };
 
   # Extract patchelf and shebang config from nixify rules
@@ -180,6 +181,27 @@ FIXEOF
   nixRpath = patchelfRule.rpath;
 
   shebangsRule = lib.findFirst (r: r.type == "fix-shebangs") null nixifyRules;
+  interpreterMap = shebangsRule.interpreters;
+
+  # Build a sed expression that handles ALL known interpreters in one pass.
+  # For each interpreter X with Nix path P, generates a sed branch:
+  #   /^#!.*X/{ s|^#!.*|#!P|; }
+  # The match is deliberately simple: if line 1 starts with #! and contains
+  # the interpreter name ANYWHERE, replace the entire line. No fussy path
+  # or spacing patterns — just look for the word. This handles every shebang
+  # variant we're ever likely to see:
+  #   #!/usr/bin/env perl, #! /bin/perl, #!/usr/local/bin/perl, etc.
+  #
+  # python3 is checked before python to avoid premature match.
+  interpreterSedScript = let
+    # Order matters: longer names first so "python3" matches before "python"
+    orderedNames = lib.sort (a: b: builtins.stringLength a > builtins.stringLength b)
+      (lib.attrNames interpreterMap);
+  in lib.concatStringsSep "\n" (
+    map (name:
+      "/^#!.*${name}/{s|^#!.*|#!${interpreterMap.${name}}|;}"
+    ) orderedNames
+  );
 
   # ── Pre-built cargo-bazel for crate_universe extension ──
   # module_ctx.download() does NOT use --repository_cache, so we must
@@ -260,17 +282,29 @@ FIXEOF
 
   nixPath = lib.makeBinPath (nativeBuildInputsDeps ++ [ bazel stdenv.cc stdenv.cc.bintools ]);
 
-  # shellcheck-validated script for patching Bazel-downloaded binaries.
+  # Table-driven script for patching Bazel-downloaded binaries.
   # Fixes two problems in the Nix sandbox:
   #   1. ELF binaries have /lib64/ld-linux-x86-64.so.2 interpreter (doesn't exist)
-  #   2. Shell scripts have #!/bin/bash shebang (doesn't exist)
+  #   2. Scripts have shebangs pointing to paths that don't exist in sandbox
+  #
+  # Shebang handling uses the interpreter map from nixify-rules.nix.
+  # A single sed script handles ALL known interpreters in one pass,
+  # matching any shebang variant: #!/usr/bin/env X, #! /bin/X,
+  # #!/usr/local/bin/X, etc. — resilient to spaces and path differences.
   bazelPatcher = writeShellApplication {
     name = "bazel-sandbox-patcher";
     runtimeInputs = [ patchelf file findutils coreutils gnused ];
     text = ''
       NIX_INTERP="${nixInterp}"
       NIX_RPATH="${nixRpath}"
-      NIX_BASH="${shebangsRule.to}"
+
+      # Generated from nixify-rules.nix interpreter map.
+      # Each line matches shebangs containing the interpreter name
+      # (after a / or space) and replaces the entire shebang line.
+      SHEBANG_SED_SCRIPT=$(cat <<'SEDEOF'
+      ${interpreterSedScript}
+      SEDEOF
+      )
 
       patch_one_elf() {
         local f="$1"
@@ -303,36 +337,33 @@ FIXEOF
           -print0 2>/dev/null)
       }
 
-      fix_bash_shebangs() {
+      fix_shebangs() {
         local dir="$1"
         echo "Fixing shebangs in $dir..."
         while IFS= read -r -d "" f; do
-          # Skip binary files (head on binaries produces null bytes)
-          # -L follows symlinks (Bazel external/ uses symlinks extensively)
+          # Skip binary files
           [[ "$(file -bL --mime-type "$f" 2>/dev/null)" == text/* ]] || continue
           local firstline
           firstline=$(head -n1 "$f" 2>/dev/null) || continue
+          # Only process files that have a shebang
           case "$firstline" in
-            '#!/usr/bin/env '*|'#! /usr/bin/env '*)
-              # Generic #!/usr/bin/env X handler — resolve X via PATH
-              # Handles both "#!/usr/bin/env X" and "#! /usr/bin/env X" (space after #!)
-              local prog
-              prog="''${firstline#*'/usr/bin/env '}"
-              prog="''${prog%% *}"
-              local real_path
-              real_path=$(command -v "$prog" 2>/dev/null) || continue
-              chmod u+w "$(dirname "$f")" 2>/dev/null || true
-              chmod u+w "$f" 2>/dev/null || true
-              sed -i "1s|#!.*/usr/bin/env  *$prog|#!$real_path|" "$f" 2>/dev/null || true
-              echo "  fixed shebang: $f (env $prog -> $real_path)"
-              ;;
-            '#!${shebangsRule.from}'*)
-              chmod u+w "$(dirname "$f")" 2>/dev/null || true
-              chmod u+w "$f" 2>/dev/null || true
-              sed -i "1s|#!${shebangsRule.from}|#!$NIX_BASH|" "$f" 2>/dev/null || true
-              echo "  fixed shebang: $f"
-              ;;
+            '#!'*) ;;
+            *) continue ;;
           esac
+          # Skip files already pointing to /nix/store
+          case "$firstline" in
+            '#!/nix/store/'*) continue ;;
+          esac
+          # Apply the table-driven sed script (matches any known interpreter)
+          chmod u+w "$(dirname "$f")" 2>/dev/null || true
+          chmod u+w "$f" 2>/dev/null || true
+          local old="$firstline"
+          sed -i "1{$SHEBANG_SED_SCRIPT}" "$f" 2>/dev/null || true
+          local new
+          new=$(head -n1 "$f" 2>/dev/null) || continue
+          if [[ "$old" != "$new" ]]; then
+            echo "  fixed shebang: $f ($old -> $new)"
+          fi
         done < <(find -L "$dir" \
           -path "*/bazel_tools/*" -prune -o \
           -path "*go_sdk+main___host*" -prune -o \
@@ -350,7 +381,7 @@ FIXEOF
           for dir in "$@"; do
             if [ -d "$dir" ]; then
               patch_elfs "$dir"
-              fix_bash_shebangs "$dir"
+              fix_shebangs "$dir"
             fi
           done
           ;;
@@ -361,7 +392,7 @@ FIXEOF
           ;;
         fix-shebangs)
           for dir in "$@"; do
-            [ -d "$dir" ] && fix_bash_shebangs "$dir"
+            [ -d "$dir" ] && fix_shebangs "$dir"
           done
           ;;
         *)
@@ -431,12 +462,28 @@ FIXEOF
     "--spawn_strategy=local"
   ];
 
+  # Startup flags (before the subcommand) — forces Bazel to use the
+  # persistent cache directory instead of computing one from MD5(workspace_path).
+  bazelStartupArgs = lib.optionals (bazelCacheDir != "") [
+    "--output_base=${bazelCacheDir}/output_base"
+  ];
+
   # Patch all Bazel external dirs in the output base
-  patchBazelDirs = ''
+  patchBazelDirs = if bazelCacheDir != "" then ''
+    ${bazelPatcher}/bin/bazel-sandbox-patcher patch-all \
+      "${bazelCacheDir}/output_base/external" \
+      "${bazelCacheDir}/output_base/modextwd"
+  '' else ''
     ${bazelPatcher}/bin/bazel-sandbox-patcher patch-all \
       "$HOME"/.cache/bazel/_bazel_*/*/external \
       "$HOME"/.cache/bazel/_bazel_*/*/modextwd
   '';
+
+  # Glob pattern for diagnostics — explicit path when cached, wildcard otherwise
+  diagExternalGlob = if bazelCacheDir != "" then
+    "${bazelCacheDir}/output_base/external"
+  else
+    ''"$HOME"/.cache/bazel/_bazel_*/*/external'';
 
 in
 stdenv.mkDerivation {
@@ -455,7 +502,21 @@ stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
 
-    export HOME=$(mktemp -d)
+    export HOME=/tmp/bazel-home
+    mkdir -p $HOME
+
+    # ── Sanitize Nix stdenv env vars for Bazel cache stability ──
+    # Nix injects derivation-hash-dependent values into these env vars:
+    #   NIX_CFLAGS_COMPILE: -frandom-seed=<output-hash-prefix>
+    #   NIX_LDFLAGS: -rpath <output-store-path>/lib
+    # Since these are passed to Bazel via --action_env, they become part of
+    # every action's cache key. When the derivation hash changes (e.g. touching
+    # nix/entropy), ALL compilation actions get new cache keys → 100% miss.
+    # Stripping these is safe:
+    #   - Bazel sets its own per-object -frandom-seed in command args
+    #   - The $out rpath is meaningless inside Bazel (patchelf fixes it later)
+    export NIX_CFLAGS_COMPILE="$(echo "$NIX_CFLAGS_COMPILE" | sed 's/-frandom-seed=[^[:space:]]*//')"
+    export NIX_LDFLAGS="$(echo "$NIX_LDFLAGS" | sed 's|-rpath /nix/store/[^[:space:]]*/lib[[:space:]]*||')"
 
     # Write .bazelrc.nix
     cat > .bazelrc.nix <<'BAZELRC'
@@ -511,6 +572,7 @@ stdenv.mkDerivation {
     # can't execute in the Nix sandbox without patching.
     echo "=== Fetch attempt 1 ==="
     bazelisk \
+      ${lib.escapeShellArgs bazelStartupArgs} \
       fetch \
       --keep_going \
       ${lib.escapeShellArgs commonArgs} \
@@ -518,7 +580,7 @@ stdenv.mkDerivation {
 
     # Diagnostics: check if patch_cmds worked on rules_cc
     echo "=== Diagnostics: rules_cc shebang check ==="
-    for f in "$HOME"/.cache/bazel/_bazel_*/*/external/rules_cc+/cc/private/toolchain/generate_system_module_map.sh; do
+    for f in ${diagExternalGlob}/rules_cc+/cc/private/toolchain/generate_system_module_map.sh; do
       if [ -f "$f" ]; then
         echo "  Found: $f"
         echo "  Shebang: $(head -1 "$f")"
@@ -540,6 +602,7 @@ stdenv.mkDerivation {
 
       echo "=== Fetch attempt $attempt ==="
       if bazelisk \
+        ${lib.escapeShellArgs bazelStartupArgs} \
         fetch \
         --keep_going \
         ${lib.escapeShellArgs commonArgs} \
@@ -555,13 +618,14 @@ stdenv.mkDerivation {
 
     # ── Phase D: Build ──
     bazelisk \
+      ${lib.escapeShellArgs bazelStartupArgs} \
       build \
       --verbose_failures \
       ${lib.escapeShellArgs commonArgs} \
       ${lib.escapeShellArgs targets}
 
     # Shut down the persistent server
-    bazelisk shutdown || true
+    bazelisk ${lib.escapeShellArgs bazelStartupArgs} shutdown || true
 
     runHook postBuild
   '';
