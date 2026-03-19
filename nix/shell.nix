@@ -22,6 +22,8 @@ let
   # like protoc_minimal that are built with the auto-detected CC toolchain.
   gccLib = stdenv.cc.cc.lib;
   pythonEnv = python312.withPackages (ps: [
+    ps.jinja2
+    ps.jsonschema
     ps.kafka-python-ng
   ]);
 in

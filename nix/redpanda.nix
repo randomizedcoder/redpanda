@@ -479,12 +479,6 @@ FIXEOF
       "$HOME"/.cache/bazel/_bazel_*/*/modextwd
   '';
 
-  # Glob pattern for diagnostics — explicit path when cached, wildcard otherwise
-  diagExternalGlob = if bazelCacheDir != "" then
-    "${bazelCacheDir}/output_base/external"
-  else
-    ''"$HOME"/.cache/bazel/_bazel_*/*/external'';
-
 in
 stdenv.mkDerivation {
   name = "redpanda-${version}";
@@ -577,20 +571,6 @@ stdenv.mkDerivation {
       --keep_going \
       ${lib.escapeShellArgs commonArgs} \
       ${lib.escapeShellArgs targets} || true
-
-    # Diagnostics: check if patch_cmds worked on rules_cc
-    echo "=== Diagnostics: rules_cc shebang check ==="
-    for f in ${diagExternalGlob}/rules_cc+/cc/private/toolchain/generate_system_module_map.sh; do
-      if [ -f "$f" ]; then
-        echo "  Found: $f"
-        echo "  Shebang: $(head -1 "$f")"
-      else
-        echo "  NOT FOUND: $f"
-      fi
-    done
-    echo "  BAZEL_SH=$BAZEL_SH"
-    echo "  /bin/sh exists: $(test -x /bin/sh && echo YES || echo NO)"
-    echo "  bash on PATH: $(which bash 2>/dev/null || echo NOT FOUND)"
 
     # ── Phase B+C: Nixify + re-fetch loop ──
     # Patch extracted binaries, then re-fetch. Multiple rounds because

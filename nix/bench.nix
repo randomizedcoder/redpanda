@@ -3,8 +3,7 @@
 let
   lib = pkgs.lib;
 
-  # The FOD store path — used by clear-bazel to know what to delete
-  fodPath = redpandaDrv.passthru.bazelRepoCachePath;
+  bazelCacheDir = "/var/cache/bazel-nix";
 
   mkClear = { clearNix ? false, clearBazel ? false }: lib.concatStrings [
     (lib.optionalString clearNix ''
@@ -12,12 +11,12 @@ let
       echo "[bench] Wrote entropy file (Nix cache invalidated)"
     '')
     (lib.optionalString clearBazel ''
-      nix store delete ${fodPath} 2>/dev/null || true
-      echo "[bench] Deleted FOD store path (Bazel cache invalidated)"
+      sudo rm -rf ${bazelCacheDir}/*
+      echo "[bench] Cleared persistent Bazel cache at ${bazelCacheDir}"
     '')
   ];
 
-  mkBench = { name, clearNix ? false, clearBazel ? false, repeat ? 1 }:
+  mkBench = { name, target ? "redpanda-cached", clearNix ? false, clearBazel ? false, repeat ? 1 }:
     flake-utils.lib.mkApp {
       drv = pkgs.writeShellApplication {
         name = "redpanda-bench-${name}";
@@ -27,7 +26,7 @@ let
             echo "=== Run $i/${toString repeat}: ${name} ==="
             ${mkClear { inherit clearNix clearBazel; }}
             echo "[bench] Building..."
-            time nix build .#redpanda --print-build-logs
+            time nix build .#${target} --print-build-logs
             echo "[bench] Done"
             echo ""
           done
@@ -63,46 +62,40 @@ in
     clearBazel = true;
   };
 
-  # Single-run benchmarks
-  bench-no-nix = mkBench {
-    name = "no-nix";
+  # Single-run benchmarks (use redpanda-cached for persistent Bazel cache)
+  bench-warm = mkBench {
+    name = "warm";
+  };
+
+  bench-cold-nix = mkBench {
+    name = "cold-nix";
     clearNix = true;
   };
 
-  bench-no-bazel = mkBench {
-    name = "no-bazel";
+  bench-cold-bazel = mkBench {
+    name = "cold-bazel";
     clearBazel = true;
   };
 
-  bench-no-cache = mkBench {
-    name = "no-cache";
+  bench-cold-all = mkBench {
+    name = "cold-all";
     clearNix = true;
     clearBazel = true;
-  };
-
-  bench-cached = mkBench {
-    name = "cached";
   };
 
   # 3x repeated benchmarks
-  bench-3x-cached = mkBench {
-    name = "3x-cached";
+  bench-3x-warm = mkBench {
+    name = "3x-warm";
     repeat = 3;
   };
 
-  bench-3x-nix-only = mkBench {
-    name = "3x-nix-only";
+  bench-3x-cold-nix = mkBench {
+    name = "3x-cold-nix";
     clearNix = true;
     repeat = 3;
   };
 
-  bench-3x-bazel-only = mkBench {
-    name = "3x-bazel-only";
-    clearBazel = true;
-    repeat = 3;
-  };
-
-  # Matrix: runs 3x-cached + 3x-nix-only + 3x-bazel-only sequentially
+  # Full matrix: warm + cold-nix + cold-all
   bench-matrix = flake-utils.lib.mkApp {
     drv = pkgs.writeShellApplication {
       name = "redpanda-bench-matrix";
@@ -113,34 +106,27 @@ in
         echo "========================================="
         echo ""
 
-        echo "--- Phase 1: 3x fully cached ---"
+        echo "--- Phase 1: 3x warm (both caches present) ---"
         for i in 1 2 3; do
-          echo "=== Cached run $i/3 ==="
-          echo "[bench] Building..."
-          time nix build .#redpanda --print-build-logs
-          echo "[bench] Done"
+          echo "=== Warm run $i/3 ==="
+          time nix build .#redpanda-cached --print-build-logs
           echo ""
         done
 
-        echo "--- Phase 2: 3x Nix cleared, Bazel cached ---"
+        echo "--- Phase 2: 3x cold-nix (Bazel cache present) ---"
         for i in 1 2 3; do
-          echo "=== Nix-cleared run $i/3 ==="
+          echo "=== Cold-nix run $i/3 ==="
           date -u +%Y-%m-%dT%H:%M:%S.%NZ > nix/entropy
-          echo "[bench] Wrote entropy file (Nix cache invalidated)"
-          echo "[bench] Building..."
-          time nix build .#redpanda --print-build-logs
-          echo "[bench] Done"
+          time nix build .#redpanda-cached --print-build-logs
           echo ""
         done
 
-        echo "--- Phase 3: 3x Bazel cleared, Nix cached ---"
+        echo "--- Phase 3: 3x cold-all (no caches) ---"
         for i in 1 2 3; do
-          echo "=== Bazel-cleared run $i/3 ==="
-          nix store delete ${fodPath} 2>/dev/null || true
-          echo "[bench] Deleted FOD store path (Bazel cache invalidated)"
-          echo "[bench] Building..."
-          time nix build .#redpanda --print-build-logs
-          echo "[bench] Done"
+          echo "=== Cold-all run $i/3 ==="
+          date -u +%Y-%m-%dT%H:%M:%S.%NZ > nix/entropy
+          sudo rm -rf ${bazelCacheDir}/*
+          time nix build .#redpanda-cached --print-build-logs
           echo ""
         done
 
