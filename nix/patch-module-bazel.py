@@ -238,44 +238,55 @@ python_deps = use_extension("//bazel:python_deps.bzl", "python_deps_ext")
 use_repo(python_deps, "python_deps")
 '''
 
-    # Fix rules_foreign_cc shebangs: /usr/bin/env doesn't exist in Nix sandbox.
-    # Replace #!/usr/bin/env bash with #!$BAZEL_SH (the Nix bash path).
-    # Bazel runs wrapper scripts via explicit bash, so the shebang is just a
-    # comment — but some scripts may be exec'd directly, so use the real path.
-    if 'module_name = "rules_foreign_cc"' not in text:
-        text += '''
-# Nix: fix shebangs in rules_foreign_cc.
-# /usr/bin/env doesn't exist in Nix sandbox. Use $BAZEL_SH (Nix bash path).
+    # ── Table-driven module shebang fixes ──
+    # Each entry: (module_name, files, search_name, replacement)
+    # search_name is the interpreter to match (e.g. "bash", "perl")
+    # The sed pattern `s|#!.*<search_name>|#!<replacement>|g` replaces
+    # #!...<search_name> with #!<replacement> wherever it appears.
+    # Works for line-1 shebangs AND embedded shebangs in .bzl templates
+    # (e.g. `return "#!/usr/bin/env bash"`).
+    #
+    # To add a new module, just add an entry to this table.
+    MODULE_SHEBANG_FIXES = [
+        # (module, files_to_fix, search_name, replacement)
+        # search_name: the interpreter name to look for in shebangs (e.g. "bash")
+        # replacement: what to put after #! (e.g. "$BAZEL_SH" which Nix sets)
+        ("rules_foreign_cc", [
+            "foreign_cc/private/framework/toolchains/linux_commands.bzl",
+            "foreign_cc/private/framework/toolchains/macos_commands.bzl",
+            "foreign_cc/private/framework/toolchains/freebsd_commands.bzl",
+            "foreign_cc/private/runnable_binary_wrapper.sh",
+        ], "bash", "$BAZEL_SH"),
+        ("rules_cc", [
+            "cc/private/toolchain/generate_system_module_map.sh",
+            "cc/private/toolchain/grep-includes.sh",
+            "cc/private/toolchain/link_dynamic_library.sh",
+        ], "bash", "$BAZEL_SH"),
+    ]
+
+    for module, files, search_name, replacement in MODULE_SHEBANG_FIXES:
+        if f'module_name = "{module}"' not in text:
+            files_str = ' '.join(files)
+            text += f'''
+# Nix: fix shebangs in {module}.
+# Replace #!...{search_name} with #!{replacement} (handles embedded shebangs in .bzl too).
 single_version_override(
-    module_name = "rules_foreign_cc",
+    module_name = "{module}",
     patch_cmds = [
-        "sed -i \\"s|#!/usr/bin/env bash|#!$BAZEL_SH|g\\" foreign_cc/private/framework/toolchains/linux_commands.bzl foreign_cc/private/framework/toolchains/macos_commands.bzl foreign_cc/private/framework/toolchains/freebsd_commands.bzl foreign_cc/private/runnable_binary_wrapper.sh",
+        "sed -i \\"s|#!.*{search_name}|#!{replacement}|g\\" {files_str}",
     ],
 )
 '''
 
-    # Fix rules_cc shebangs: ensure $BAZEL_SH is used (not /bin/sh)
-    rules_cc_override = '''
-# Nix: fix shebangs in rules_cc toolchain scripts.
-# In Nix sandbox, /bin/sh is NOT bash (it's dash/busybox), but these scripts
-# use bash-specific features ([[ ]], $OSTYPE, etc.). Replace all shell shebangs
-# with $BAZEL_SH which points to the real Nix bash.
-single_version_override(
-    module_name = "rules_cc",
-    patch_cmds = [
-        "sed -i \\"1s|^#!.*|#!$BAZEL_SH|\\" cc/private/toolchain/generate_system_module_map.sh cc/private/toolchain/grep-includes.sh cc/private/toolchain/link_dynamic_library.sh",
-    ],
-)
-'''
-    if 'module_name = "rules_cc"' not in text:
-        text += rules_cc_override
-    elif '#!/bin/sh' in text and 'module_name = "rules_cc"' in text:
-        # Replace old /bin/sh version with $BAZEL_SH version
-        text = re.sub(
-            r'# Nix:.*?rules_cc.*?\nsingle_version_override\(\s*\n\s*module_name = "rules_cc".*?\n.*?\n\s*\]\s*,\s*\n\s*\)',
-            rules_cc_override.strip(),
-            text,
-            flags=re.DOTALL,
+    # ── Pre-built protoc toolchain ──
+    # Register nix_protoc toolchain FIRST so it has highest priority.
+    # This uses nixpkgs protoc instead of compiling it from source (~240 actions saved).
+    # Must go right after the module() block.
+    if 'nix_protoc' not in text:
+        text = text.replace(
+            'module(\n    name = "redpanda",\n    repo_name = "com_github_redpanda_data_redpanda",\n)',
+            'module(\n    name = "redpanda",\n    repo_name = "com_github_redpanda_data_redpanda",\n)\n\nregister_toolchains("//nix_protoc:nix_protoc_toolchain")',
+            1,
         )
 
     # Fix liburing: with --spawn_strategy=local, the generate_headers genrule

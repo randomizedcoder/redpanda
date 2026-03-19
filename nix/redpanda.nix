@@ -39,6 +39,7 @@
   openssl,
   curl,
   lndir,
+  protobuf,
   bazelCacheDir ? "",
 }:
 
@@ -107,6 +108,19 @@ def _python_deps_ext_impl(ctx):
 
 python_deps_ext = module_extension(implementation = _python_deps_ext_impl)
 PYEXT
+
+    # Create nix_protoc/ — pre-built protoc toolchain from nixpkgs.
+    # Avoids compiling protoc + abseil + zlib from source (~240 actions).
+    mkdir -p $out/nix_protoc/bin
+    ln -s ${protobuf}/bin/protoc $out/nix_protoc/bin/protoc
+    cat > $out/nix_protoc/BUILD.bazel <<'PROTOC_BUILD'
+load("@protobuf//bazel/toolchains:proto_toolchain.bzl", "proto_toolchain")
+exports_files(["bin/protoc"])
+proto_toolchain(
+    name = "nix_protoc",
+    proto_compiler = "bin/protoc",
+)
+PROTOC_BUILD
 
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
