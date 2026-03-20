@@ -38,6 +38,7 @@
   zlib,
   openssl,
   c-ares,
+  hwloc,
   krb5,
   libxml2,
   curl,
@@ -57,6 +58,7 @@ let
   ]);
 
   c-aresStatic = callPackage ./c-ares-static.nix { };
+  hwlocStatic = callPackage ./hwloc-static.nix { };
   libxml2Static = callPackage ./libxml2-static.nix { };
 
   gccLib = stdenv.cc.cc.lib;
@@ -196,6 +198,42 @@ cc_library(
 )
 LIBXML2_BUILD
 
+    # Create nix_hwloc/ — pre-built hwloc from nixpkgs.
+    # Avoids running configure_make build (~72s wall time).
+    # Includes static lib, headers, and the two binaries used by packaging.
+    mkdir -p $out/nix_hwloc/{include,lib,bin}
+    for item in ${hwlocStatic.dev}/include/*; do
+      ln -s "$item" $out/nix_hwloc/include/
+    done
+    ln -s ${hwlocStatic.lib}/lib/libhwloc.a $out/nix_hwloc/lib/
+    ln -s ${hwlocStatic}/bin/hwloc-calc $out/nix_hwloc/bin/
+    ln -s ${hwlocStatic}/bin/hwloc-distrib $out/nix_hwloc/bin/
+
+    cat > $out/bazel/thirdparty/hwloc-prebuilt.BUILD <<'HWLOC_BUILD'
+cc_import(
+    name = "hwloc_lib",
+    static_library = "lib/libhwloc.a",
+)
+cc_library(
+    name = "hwloc",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":hwloc_lib"],
+    visibility = ["//visibility:public"],
+)
+exports_files(["bin/hwloc-calc", "bin/hwloc-distrib"])
+filegroup(
+    name = "hwloc_calc",
+    srcs = ["bin/hwloc-calc"],
+    visibility = ["//visibility:public"],
+)
+filegroup(
+    name = "hwloc_distrib",
+    srcs = ["bin/hwloc-distrib"],
+    visibility = ["//visibility:public"],
+)
+HWLOC_BUILD
+
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
     # - Replace go_sdk.download() with go_sdk.host()
@@ -208,6 +246,7 @@ LIBXML2_BUILD
     echo 'exports_files(["c-ares-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
     echo 'exports_files(["krb5-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
     echo 'exports_files(["libxml2-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
+    echo 'exports_files(["hwloc-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
 
     # Fix openssl Configure shebang: #! /usr/bin/env perl doesn't work in Nix sandbox.
     # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
@@ -293,6 +332,26 @@ text = text.replace(old, new)
 with open(path, 'w') as f:
     f.write(text)
 LIBXML2_PATCH
+
+    # Replace hwloc http_archive with new_local_repository pointing to
+    # the pre-built nix_hwloc/ directory. Saves ~72s of configure_make build time.
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'HWLOC_PATCH'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+old = re.search(r'    http_archive\(\s*name = "hwloc".*?\)', text, re.DOTALL).group(0)
+new = """    new_local_repository(
+        name = "hwloc",
+        path = "nix_hwloc",
+        build_file = "//bazel/thirdparty:hwloc-prebuilt.BUILD",
+    )"""
+text = text.replace(old, new)
+
+with open(path, 'w') as f:
+    f.write(text)
+HWLOC_PATCH
 
     # Replace default BCR registry with local copy (the --registry flag is
     # a list flag — CLI values append rather than replace, so we must patch
