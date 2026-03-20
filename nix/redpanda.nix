@@ -37,6 +37,8 @@
   gcc-unwrapped,
   zlib,
   openssl,
+  c-ares,
+  krb5,
   curl,
   lndir,
   protobuf,
@@ -52,6 +54,8 @@ let
     ps.jinja2
     ps.jsonschema
   ]);
+
+  c-aresStatic = callPackage ./c-ares-static.nix { };
 
   gccLib = stdenv.cc.cc.lib;
 
@@ -122,6 +126,54 @@ proto_toolchain(
 )
 PROTOC_BUILD
 
+    # Create nix_cares/ — pre-built c-ares from nixpkgs.
+    # Avoids running cmake build (~51s wall time).
+    mkdir -p $out/nix_cares/{include,lib}
+    for h in ${c-aresStatic.dev}/include/ares*.h; do
+      ln -s "$h" $out/nix_cares/include/
+    done
+    ln -s ${c-aresStatic}/lib/libcares.a $out/nix_cares/lib/
+
+    cat > $out/bazel/thirdparty/c-ares-prebuilt.BUILD <<'CARES_BUILD'
+cc_import(
+    name = "cares_lib",
+    static_library = "lib/libcares.a",
+)
+cc_library(
+    name = "c-ares",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":cares_lib"],
+    visibility = ["//visibility:public"],
+)
+CARES_BUILD
+
+    # Create nix_krb5/ — pre-built krb5 from nixpkgs.
+    # Avoids running configure_make build (~145s wall time).
+    # Uses shared libs (krb5 has duplicate-symbol issues with static linking).
+    mkdir -p $out/nix_krb5/{include,lib}
+    for item in ${krb5.dev}/include/*; do
+      ln -s "$item" $out/nix_krb5/include/
+    done
+    for lib in libcom_err.so.3 libgssapi_krb5.so.2 libk5crypto.so.3 libkrb5.so.3 libkrb5support.so.0; do
+      ln -s ${krb5.lib}/lib/$lib $out/nix_krb5/lib/
+    done
+
+    cat > $out/bazel/thirdparty/krb5-prebuilt.BUILD <<'KRB5_BUILD'
+cc_import(name = "com_err_lib", shared_library = "lib/libcom_err.so.3")
+cc_import(name = "gssapi_krb5_lib", shared_library = "lib/libgssapi_krb5.so.2")
+cc_import(name = "k5crypto_lib", shared_library = "lib/libk5crypto.so.3")
+cc_import(name = "krb5_lib", shared_library = "lib/libkrb5.so.3")
+cc_import(name = "krb5support_lib", shared_library = "lib/libkrb5support.so.0")
+cc_library(
+    name = "krb5",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":com_err_lib", ":gssapi_krb5_lib", ":k5crypto_lib", ":krb5_lib", ":krb5support_lib"],
+    visibility = ["//visibility:public"],
+)
+KRB5_BUILD
+
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
     # - Replace go_sdk.download() with go_sdk.host()
@@ -131,6 +183,8 @@ PROTOC_BUILD
 
     # Export the patch file so Bazel can resolve the label
     echo 'exports_files(["rules_buf-nix-no-download.patch"])' >> $out/bazel/thirdparty/BUILD
+    echo 'exports_files(["c-ares-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
+    echo 'exports_files(["krb5-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
 
     # Fix openssl Configure shebang: #! /usr/bin/env perl doesn't work in Nix sandbox.
     # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
@@ -147,6 +201,55 @@ for url in ["openssl-3.5.5.tar.gz", "openssl-3.1.2.tar.gz"]:
 with open(path, "w") as f:
     f.write(text)
 FIXEOF
+
+    # Replace c-ares http_archive with new_local_repository pointing to
+    # the pre-built nix_cares/ directory. Saves ~51s of cmake build time.
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'CARES_PATCH'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+# Add new_local_repository import if not present
+if 'new_local_repository' not in text:
+    text = text.replace(
+        'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")',
+        'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")\n'
+        'load("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")',
+    )
+
+# Replace c-ares http_archive with new_local_repository
+old = re.search(r'    http_archive\(\s*name = "c-ares".*?\)', text, re.DOTALL).group(0)
+new = """    new_local_repository(
+        name = "c-ares",
+        path = "nix_cares",
+        build_file = "//bazel/thirdparty:c-ares-prebuilt.BUILD",
+    )"""
+text = text.replace(old, new)
+
+with open(path, 'w') as f:
+    f.write(text)
+CARES_PATCH
+
+    # Replace krb5 http_archive with new_local_repository pointing to
+    # the pre-built nix_krb5/ directory. Saves ~145s of configure_make build time.
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'KRB5_PATCH'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+old = re.search(r'    http_archive\(\s*name = "krb5".*?\)', text, re.DOTALL).group(0)
+new = """    new_local_repository(
+        name = "krb5",
+        path = "nix_krb5",
+        build_file = "//bazel/thirdparty:krb5-prebuilt.BUILD",
+    )"""
+text = text.replace(old, new)
+
+with open(path, 'w') as f:
+    f.write(text)
+KRB5_PATCH
 
     # Replace default BCR registry with local copy (the --registry flag is
     # a list flag — CLI values append rather than replace, so we must patch
@@ -628,6 +731,11 @@ stdenv.mkDerivation {
     mkdir -p $out/bin $out/etc/redpanda
     install -m755 bazel-bin/src/v/redpanda/redpanda $out/bin/redpanda
     install -m644 conf/redpanda.yaml $out/etc/redpanda/redpanda.yaml
+
+    # Add runtime library paths for pre-built shared dependencies.
+    # Bazel's cc_import doesn't embed rpath for shared libs, so the
+    # binary can't find them at runtime without this.
+    patchelf --add-rpath ${krb5.lib}/lib:${openssl.out}/lib $out/bin/redpanda
   '';
 
   meta = {
