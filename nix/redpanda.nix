@@ -39,6 +39,7 @@
   openssl,
   c-ares,
   krb5,
+  libxml2,
   curl,
   lndir,
   protobuf,
@@ -56,6 +57,7 @@ let
   ]);
 
   c-aresStatic = callPackage ./c-ares-static.nix { };
+  libxml2Static = callPackage ./libxml2-static.nix { };
 
   gccLib = stdenv.cc.cc.lib;
 
@@ -174,6 +176,26 @@ cc_library(
 )
 KRB5_BUILD
 
+    # Create nix_libxml2/ — pre-built libxml2 from nixpkgs.
+    # Avoids running configure_make build (~78s wall time).
+    mkdir -p $out/nix_libxml2/{include,lib}
+    ln -s ${libxml2Static.dev}/include/libxml2/libxml $out/nix_libxml2/include/libxml
+    ln -s ${libxml2Static.out}/lib/libxml2.a $out/nix_libxml2/lib/
+
+    cat > $out/bazel/thirdparty/libxml2-prebuilt.BUILD <<'LIBXML2_BUILD'
+cc_import(
+    name = "libxml2_lib",
+    static_library = "lib/libxml2.a",
+)
+cc_library(
+    name = "libxml2",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":libxml2_lib"],
+    visibility = ["//visibility:public"],
+)
+LIBXML2_BUILD
+
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
     # - Replace go_sdk.download() with go_sdk.host()
@@ -185,6 +207,7 @@ KRB5_BUILD
     echo 'exports_files(["rules_buf-nix-no-download.patch"])' >> $out/bazel/thirdparty/BUILD
     echo 'exports_files(["c-ares-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
     echo 'exports_files(["krb5-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
+    echo 'exports_files(["libxml2-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
 
     # Fix openssl Configure shebang: #! /usr/bin/env perl doesn't work in Nix sandbox.
     # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
@@ -250,6 +273,26 @@ text = text.replace(old, new)
 with open(path, 'w') as f:
     f.write(text)
 KRB5_PATCH
+
+    # Replace libxml2 http_archive with new_local_repository pointing to
+    # the pre-built nix_libxml2/ directory. Saves ~78s of configure_make build time.
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'LIBXML2_PATCH'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+old = re.search(r'    http_archive\(\s*name = "libxml2".*?\)', text, re.DOTALL).group(0)
+new = """    new_local_repository(
+        name = "libxml2",
+        path = "nix_libxml2",
+        build_file = "//bazel/thirdparty:libxml2-prebuilt.BUILD",
+    )"""
+text = text.replace(old, new)
+
+with open(path, 'w') as f:
+    f.write(text)
+LIBXML2_PATCH
 
     # Replace default BCR registry with local copy (the --registry flag is
     # a list flag — CLI values append rather than replace, so we must patch
