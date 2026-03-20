@@ -41,6 +41,8 @@
   hwloc,
   krb5,
   libxml2,
+  # openssl is already in inputs (used for nixify rpath); reused here
+  # for the pre-built openssl substitution.
   curl,
   lndir,
   protobuf,
@@ -234,6 +236,69 @@ filegroup(
 )
 HWLOC_BUILD
 
+    # Create nix_openssl/ — pre-built openssl from nixpkgs.
+    # Avoids running Configure + make build (~118s wall time).
+    # Provides shared libs, headers, binary, ssl data, and the
+    # build settings that openssl-fips.BUILD cross-references.
+    mkdir -p $out/nix_openssl/{include,lib,bin,etc}
+    ln -s ${openssl.dev}/include/openssl $out/nix_openssl/include/openssl
+    for lib in libssl.so.3 libcrypto.so.3; do
+      ln -s ${openssl.out}/lib/$lib $out/nix_openssl/lib/
+    done
+    ln -s ${openssl.bin}/bin/openssl $out/nix_openssl/bin/
+    ln -s ${openssl.out}/etc/ssl $out/nix_openssl/etc/ssl
+
+    cat > $out/bazel/thirdparty/openssl-prebuilt.BUILD <<'OPENSSL_BUILD'
+load("@bazel_skylib//rules:common_settings.bzl", "int_flag", "string_flag")
+
+# Settings referenced by openssl-fips.BUILD
+int_flag(
+    name = "build_jobs",
+    build_setting_default = 8,
+    make_variable = "BUILD_JOBS",
+    visibility = ["@openssl-fips//:__pkg__"],
+)
+string_flag(
+    name = "build_mode",
+    build_setting_default = "default",
+    values = ["debug", "release", "default"],
+)
+config_setting(
+    name = "debug_mode",
+    flag_values = {":build_mode": "debug"},
+)
+config_setting(
+    name = "release_mode",
+    flag_values = {":build_mode": "release"},
+)
+
+cc_import(name = "ssl_lib", shared_library = "lib/libssl.so.3")
+cc_import(name = "crypto_lib", shared_library = "lib/libcrypto.so.3")
+
+cc_library(
+    name = "openssl_foreign_cc",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":ssl_lib", ":crypto_lib"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "openssl",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":ssl_lib", ":crypto_lib"],
+    visibility = ["//visibility:public"],
+)
+
+exports_files(["bin/openssl"])
+filegroup(
+    name = "openssl_binary",
+    srcs = ["bin/openssl"],
+    visibility = ["//visibility:public"],
+)
+OPENSSL_BUILD
+
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
     # - Replace go_sdk.download() with go_sdk.host()
@@ -247,6 +312,7 @@ HWLOC_BUILD
     echo 'exports_files(["krb5-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
     echo 'exports_files(["libxml2-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
     echo 'exports_files(["hwloc-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
+    echo 'exports_files(["openssl-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
 
     # Fix openssl Configure shebang: #! /usr/bin/env perl doesn't work in Nix sandbox.
     # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
@@ -352,6 +418,30 @@ text = text.replace(old, new)
 with open(path, 'w') as f:
     f.write(text)
 HWLOC_PATCH
+
+    # Replace main openssl http_archive with new_local_repository.
+    # Saves ~118s of Configure + make build time.
+    # Only replaces the main openssl (3.5.5), not openssl-fips (3.1.2).
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'OPENSSL_PATCH'
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+# Match the first openssl http_archive (name = "openssl", not "openssl-fips").
+# Uses \n    \) to find the closing paren on its own line, since patch_cmds
+# may contain ) characters inside strings.
+old = re.search(r'    http_archive\(\s*name = "openssl".*?\n    \)', text, re.DOTALL).group(0)
+new = """    new_local_repository(
+        name = "openssl",
+        path = "nix_openssl",
+        build_file = "//bazel/thirdparty:openssl-prebuilt.BUILD",
+    )"""
+text = text.replace(old, new)
+
+with open(path, 'w') as f:
+    f.write(text)
+OPENSSL_PATCH
 
     # Replace default BCR registry with local copy (the --registry flag is
     # a list flag — CLI values append rather than replace, so we must patch
@@ -718,6 +808,13 @@ stdenv.mkDerivation {
     export HOME=/tmp/bazel-home
     mkdir -p $HOME
 
+    # Allow shared output_base across builds by different nixbld users.
+    # Nix assigns different builder users (nixbld1, nixbld2, ...) for
+    # different derivation hashes. umask 002 makes all files group-writable
+    # so the nixbld group can share the persistent cache.
+    # Restored to 022 before installPhase (Nix rejects group-writable outputs).
+    umask 002
+
     # ── Sanitize Nix stdenv env vars for Bazel cache stability ──
     # Nix injects derivation-hash-dependent values into these env vars:
     #   NIX_CFLAGS_COMPILE: -frandom-seed=<output-hash-prefix>
@@ -825,6 +922,9 @@ stdenv.mkDerivation {
 
     # Shut down the persistent server
     bazelisk ${lib.escapeShellArgs bazelStartupArgs} shutdown || true
+
+    # Restore strict umask for installPhase outputs (Nix rejects group-writable).
+    umask 022
 
     runHook postBuild
   '';
