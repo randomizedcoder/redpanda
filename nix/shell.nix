@@ -21,6 +21,7 @@ let
   # GCC runtime lib (libstdc++.so.6) — needed by exec-config binaries
   # like protoc_minimal that are built with the auto-detected CC toolchain.
   gccLib = stdenv.cc.cc.lib;
+  libPath = "${llvmPackages_20.libcxx}/lib:${gccLib}/lib";
   pythonEnv = python312.withPackages (ps: [
     ps.jinja2
     ps.jsonschema
@@ -84,10 +85,10 @@ build --action_env=NIX_ENFORCE_NO_NATIVE
 build --host_action_env=NIX_ENFORCE_NO_NATIVE
 build --action_env=ACLOCAL_PATH=$ACLOCAL_PATH
 build --host_action_env=ACLOCAL_PATH=$ACLOCAL_PATH
-build --action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-build --host_action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-build --action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
+build --action_env=LIBRARY_PATH=${libPath}
+build --host_action_env=LIBRARY_PATH=${libPath}
+build --action_env=LD_LIBRARY_PATH=${libPath}
+build --host_action_env=LD_LIBRARY_PATH=${libPath}
 build --linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
 build --linkopt=-Wl,-rpath,${gccLib}/lib
 build --host_linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib

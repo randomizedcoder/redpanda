@@ -33,18 +33,34 @@
 
           rpk = pkgs.callPackage ./nix/rpk.nix { };
 
-          bench = import ./nix/bench.nix {
-            inherit pkgs flake-utils;
-            redpandaDrv = redpanda;
+          mkApp = drv: {
+            type = "app";
+            program = "${drv}/bin/${drv.name}";
           };
+
+          bench = import ./nix/bench.nix { inherit pkgs mkApp; };
         in
         {
           packages = {
             inherit redpanda rpk redpanda-cached;
             default = redpanda;
+
+            # OCI container images
+            redpanda-image = pkgs.callPackage ./nix/redpanda-image.nix {
+              redpandaDrv = redpanda-cached;
+            };
+            redpanda-image-debug = pkgs.callPackage ./nix/redpanda-image.nix {
+              redpandaDrv = redpanda-cached;
+              debug = true;
+            };
+            rpk-image = pkgs.callPackage ./nix/rpk-image.nix {
+              rpkDrv = rpk;
+            };
           };
 
-          apps = bench;
+          apps = bench // {
+            test-images = import ./nix/test-images.nix { inherit pkgs mkApp; };
+          };
 
           devShells.default = pkgs.callPackage ./nix/shell.nix { };
 

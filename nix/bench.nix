@@ -1,4 +1,4 @@
-{ pkgs, flake-utils, redpandaDrv }:
+{ pkgs, mkApp }:
 
 let
   lib = pkgs.lib;
@@ -17,31 +17,27 @@ let
   ];
 
   mkBench = { name, target ? "redpanda-cached", clearNix ? false, clearBazel ? false, repeat ? 1 }:
-    flake-utils.lib.mkApp {
-      drv = pkgs.writeShellApplication {
-        name = "redpanda-bench-${name}";
-        runtimeInputs = [ pkgs.coreutils pkgs.nix ];
-        text = ''
-          for i in $(seq 1 ${toString repeat}); do
-            echo "=== Run $i/${toString repeat}: ${name} ==="
-            ${mkClear { inherit clearNix clearBazel; }}
-            echo "[bench] Building..."
-            time nix build .#${target} --print-build-logs
-            echo "[bench] Done"
-            echo ""
-          done
-        '';
-      };
-    };
+    mkApp (pkgs.writeShellApplication {
+      name = "redpanda-bench-${name}";
+      runtimeInputs = [ pkgs.coreutils pkgs.nix ];
+      text = ''
+        for i in $(seq 1 ${toString repeat}); do
+          echo "=== Run $i/${toString repeat}: ${name} ==="
+          ${mkClear { inherit clearNix clearBazel; }}
+          echo "[bench] Building..."
+          time nix build .#${target} --print-build-logs
+          echo "[bench] Done"
+          echo ""
+        done
+      '';
+    });
 
   mkClearOnly = { name, clearNix ? false, clearBazel ? false }:
-    flake-utils.lib.mkApp {
-      drv = pkgs.writeShellApplication {
-        name = "redpanda-${name}";
-        runtimeInputs = [ pkgs.coreutils pkgs.nix ];
-        text = mkClear { inherit clearNix clearBazel; };
-      };
-    };
+    mkApp (pkgs.writeShellApplication {
+      name = "redpanda-${name}";
+      runtimeInputs = [ pkgs.coreutils pkgs.nix ];
+      text = mkClear { inherit clearNix clearBazel; };
+    });
 
 in
 {
@@ -96,44 +92,41 @@ in
   };
 
   # Full matrix: warm + cold-nix + cold-all
-  bench-matrix = flake-utils.lib.mkApp {
-    drv = pkgs.writeShellApplication {
-      name = "redpanda-bench-matrix";
-      runtimeInputs = [ pkgs.coreutils pkgs.nix ];
-      text = ''
-        echo "========================================="
-        echo "  Benchmark Matrix (9 builds total)"
-        echo "========================================="
+  bench-matrix = mkApp (pkgs.writeShellApplication {
+    name = "redpanda-bench-matrix";
+    runtimeInputs = [ pkgs.coreutils pkgs.nix ];
+    text = ''
+      echo "========================================="
+      echo "  Benchmark Matrix (9 builds total)"
+      echo "========================================="
+      echo ""
+
+      echo "--- Phase 1: 3x warm (both caches present) ---"
+      for i in 1 2 3; do
+        echo "=== Warm run $i/3 ==="
+        time nix build .#redpanda-cached --print-build-logs
         echo ""
+      done
 
-        echo "--- Phase 1: 3x warm (both caches present) ---"
-        for i in 1 2 3; do
-          echo "=== Warm run $i/3 ==="
-          time nix build .#redpanda-cached --print-build-logs
-          echo ""
-        done
+      echo "--- Phase 2: 3x cold-nix (Bazel cache present) ---"
+      for i in 1 2 3; do
+        echo "=== Cold-nix run $i/3 ==="
+        ${mkClear { clearNix = true; }}
+        time nix build .#redpanda-cached --print-build-logs
+        echo ""
+      done
 
-        echo "--- Phase 2: 3x cold-nix (Bazel cache present) ---"
-        for i in 1 2 3; do
-          echo "=== Cold-nix run $i/3 ==="
-          date -u +%Y-%m-%dT%H:%M:%S.%NZ > nix/entropy
-          time nix build .#redpanda-cached --print-build-logs
-          echo ""
-        done
+      echo "--- Phase 3: 3x cold-all (no caches) ---"
+      for i in 1 2 3; do
+        echo "=== Cold-all run $i/3 ==="
+        ${mkClear { clearNix = true; clearBazel = true; }}
+        time nix build .#redpanda-cached --print-build-logs
+        echo ""
+      done
 
-        echo "--- Phase 3: 3x cold-all (no caches) ---"
-        for i in 1 2 3; do
-          echo "=== Cold-all run $i/3 ==="
-          date -u +%Y-%m-%dT%H:%M:%S.%NZ > nix/entropy
-          sudo rm -rf ${bazelCacheDir}/*
-          time nix build .#redpanda-cached --print-build-logs
-          echo ""
-        done
-
-        echo "========================================="
-        echo "  Matrix complete"
-        echo "========================================="
-      '';
-    };
-  };
+      echo "========================================="
+      echo "  Matrix complete"
+      echo "========================================="
+    '';
+  });
 }

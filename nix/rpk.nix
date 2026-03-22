@@ -29,6 +29,7 @@ buildGoModule {
       containerPkg = "github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil";
     in
     [
+      "-s" "-w"
       "-X ${versionPkg}.version=${version}"
       "-X ${versionPkg}.rev=${rev}"
       "-X ${containerPkg}.tag=v${version}"
