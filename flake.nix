@@ -27,6 +27,10 @@
 
           redpanda = pkgs.callPackage ./nix/redpanda.nix { };
 
+          redpanda-cached = pkgs.callPackage ./nix/redpanda.nix {
+            bazelCacheDir = "/var/cache/bazel-nix";
+          };
+
           rpk = pkgs.callPackage ./nix/rpk.nix { };
 
           bench = import ./nix/bench.nix {
@@ -36,7 +40,7 @@
         in
         {
           packages = {
-            inherit redpanda rpk;
+            inherit redpanda rpk redpanda-cached;
             default = redpanda;
           };
 

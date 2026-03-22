@@ -41,6 +41,11 @@
   hwloc,
   krb5,
   libxml2,
+  ragel,
+  xxHash,
+  hdrhistogram_c,
+  croaring,
+  lksctp-tools,
   # openssl is already in inputs (used for nixify rpath); reused here
   # for the pre-built openssl substitution.
   curl,
@@ -62,6 +67,12 @@ let
   c-aresStatic = callPackage ./c-ares-static.nix { };
   hwlocStatic = callPackage ./hwloc-static.nix { };
   libxml2Static = callPackage ./libxml2-static.nix { };
+  base64Static = callPackage ./base64-static.nix { };
+  opensslFips = callPackage ./openssl-fips.nix { };
+  xxhashStatic = callPackage ./xxhash-static.nix { };
+  adaStatic = callPackage ./ada-static.nix { };
+  croaringStatic = callPackage ./croaring-static.nix { };
+  lksctpStatic = callPackage ./lksctp-static.nix { };
 
   gccLib = stdenv.cc.cc.lib;
 
@@ -299,6 +310,180 @@ filegroup(
 )
 OPENSSL_BUILD
 
+    # Create nix_ragel/ — pre-built ragel binary from nixpkgs.
+    # Avoids running configure_make + autoreconf build (~29s wall time).
+    mkdir -p $out/nix_ragel/bin
+    ln -s ${ragel}/bin/ragel $out/nix_ragel/bin/ragel
+
+    cat > $out/bazel/thirdparty/ragel-prebuilt.BUILD <<'RAGEL_BUILD'
+load("@bazel_skylib//rules:common_settings.bzl", "int_flag")
+
+int_flag(
+    name = "build_jobs",
+    build_setting_default = 8,
+    make_variable = "BUILD_JOBS",
+)
+
+exports_files(["bin/ragel"])
+filegroup(
+    name = "ragel_bin",
+    srcs = ["bin/ragel"],
+    visibility = ["//visibility:public"],
+)
+RAGEL_BUILD
+
+    # Create nix_base64/ — pre-built base64 static library.
+    # Avoids running cmake build (~15-25s wall time).
+    mkdir -p $out/nix_base64/{include,lib}
+    ln -s ${base64Static}/include/libbase64.h $out/nix_base64/include/
+    ln -s ${base64Static}/lib/libbase64.a $out/nix_base64/lib/
+
+    cat > $out/bazel/thirdparty/base64-prebuilt.BUILD <<'BASE64_BUILD'
+cc_import(
+    name = "base64_lib",
+    static_library = "lib/libbase64.a",
+)
+cc_library(
+    name = "base64",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":base64_lib"],
+    visibility = ["//visibility:public"],
+)
+BASE64_BUILD
+
+    # Create nix_openssl_fips/ — pre-built OpenSSL 3.1.2 FIPS module.
+    # Avoids running Configure + make build (~45-60s wall time).
+    # Provides fips.so and fipsmodule.cnf matching NIST cert #4985.
+    mkdir -p $out/nix_openssl_fips/{lib/ossl-modules,etc/ssl}
+    ln -s ${opensslFips}/lib/ossl-modules/fips.so $out/nix_openssl_fips/lib/ossl-modules/
+    ln -s ${opensslFips}/etc/ssl/fipsmodule.cnf $out/nix_openssl_fips/etc/ssl/
+
+    cat > $out/bazel/thirdparty/openssl-fips-prebuilt.BUILD <<'FIPS_BUILD'
+exports_files([
+    "lib/ossl-modules/fips.so",
+    "etc/ssl/fipsmodule.cnf",
+])
+filegroup(
+    name = "fipsmodule_so",
+    srcs = ["lib/ossl-modules/fips.so"],
+    visibility = ["//visibility:public"],
+)
+filegroup(
+    name = "fipsmodule_cnf",
+    srcs = ["etc/ssl/fipsmodule.cnf"],
+    visibility = ["//visibility:public"],
+)
+FIPS_BUILD
+
+    # Create nix_xxhash/ — pre-built xxhash from nixpkgs.
+    # Avoids compiling xxhash.c (~2-5s).
+    mkdir -p $out/nix_xxhash/{include,lib}
+    ln -s ${xxhashStatic}/include/xxhash.h $out/nix_xxhash/include/
+    ln -s ${xxhashStatic}/include/xxh3.h $out/nix_xxhash/include/
+    ln -s ${xxhashStatic}/lib/libxxhash.a $out/nix_xxhash/lib/
+
+    cat > $out/bazel/thirdparty/xxhash-prebuilt.BUILD <<'XXHASH_BUILD'
+cc_import(
+    name = "xxhash_lib",
+    static_library = "lib/libxxhash.a",
+)
+cc_library(
+    name = "xxhash",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":xxhash_lib"],
+    visibility = ["//visibility:public"],
+)
+XXHASH_BUILD
+
+    # Create nix_hdrhistogram/ — pre-built hdrhistogram from nixpkgs.
+    # Avoids compiling 8 .c files (~5-10s).
+    mkdir -p $out/nix_hdrhistogram/{include/hdr,lib}
+    for h in ${hdrhistogram_c}/include/hdr/*.h; do
+      ln -s "$h" $out/nix_hdrhistogram/include/hdr/
+    done
+    ln -s ${hdrhistogram_c}/lib/libhdr_histogram_static.a $out/nix_hdrhistogram/lib/
+
+    cat > $out/bazel/thirdparty/hdrhistogram-prebuilt.BUILD <<'HDR_BUILD'
+cc_import(
+    name = "hdrhistogram_lib",
+    static_library = "lib/libhdr_histogram_static.a",
+)
+cc_library(
+    name = "hdrhistogram",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    deps = [":hdrhistogram_lib", "@zlib"],
+    visibility = ["//visibility:public"],
+)
+HDR_BUILD
+
+    # Create nix_ada/ — pre-built ada URL parser from nixpkgs.
+    # Avoids compiling ada.cpp (~3-5s).
+    mkdir -p $out/nix_ada/{include,lib}
+    for item in ${adaStatic}/include/*; do
+      ln -s "$item" $out/nix_ada/include/
+    done
+    ln -s ${adaStatic}/lib/libada.a $out/nix_ada/lib/
+
+    cat > $out/bazel/thirdparty/ada-prebuilt.BUILD <<'ADA_BUILD'
+cc_import(
+    name = "ada_lib",
+    static_library = "lib/libada.a",
+)
+cc_library(
+    name = "ada",
+    hdrs = glob(["include/**/*.h"]),
+    includes = ["include"],
+    defines = ["ADA_INCLUDE_URL_PATTERN=0"],
+    deps = [":ada_lib"],
+    visibility = ["//visibility:public"],
+)
+ADA_BUILD
+
+    # Create nix_roaring/ — pre-built CRoaring from nixpkgs.
+    # Avoids compiling C sources (~5-10s).
+    mkdir -p $out/nix_roaring/{include,lib}
+    for item in ${croaringStatic}/include/*; do
+      ln -s "$item" $out/nix_roaring/include/
+    done
+    ln -s ${croaringStatic}/lib/libroaring.a $out/nix_roaring/lib/
+
+    cat > $out/bazel/thirdparty/roaring-prebuilt.BUILD <<'ROARING_BUILD'
+cc_import(
+    name = "roaring_lib",
+    static_library = "lib/libroaring.a",
+)
+cc_library(
+    name = "roaring",
+    hdrs = glob(["include/**/*.h", "include/**/*.hh"]),
+    strip_include_prefix = "include",
+    deps = [":roaring_lib"],
+    visibility = ["//visibility:public"],
+)
+ROARING_BUILD
+
+    # Create nix_lksctp/ — pre-built lksctp-tools from nixpkgs.
+    # Avoids compiling .c files + generating header (~2-3s).
+    mkdir -p $out/nix_lksctp/{include/netinet,lib}
+    ln -s ${lksctpStatic}/include/netinet/sctp.h $out/nix_lksctp/include/netinet/
+    ln -s ${lksctpStatic}/lib/libsctp.a $out/nix_lksctp/lib/
+
+    cat > $out/bazel/thirdparty/lksctp-prebuilt.BUILD <<'LKSCTP_BUILD'
+cc_import(
+    name = "lksctp_lib",
+    static_library = "lib/libsctp.a",
+)
+cc_library(
+    name = "lksctp",
+    hdrs = glob(["include/**/*.h"]),
+    strip_include_prefix = "include",
+    deps = [":lksctp_lib"],
+    visibility = ["//visibility:public"],
+)
+LKSCTP_BUILD
+
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
     # - Replace go_sdk.download() with go_sdk.host()
@@ -306,34 +491,36 @@ OPENSSL_BUILD
     # - Add rules_buf and rules_cc overrides (fix shebangs, stub downloads)
     ${pythonWithDeps}/bin/python3 ${./patch-module-bazel.py} $out/MODULE.bazel
 
-    # Export the patch file so Bazel can resolve the label
-    echo 'exports_files(["rules_buf-nix-no-download.patch"])' >> $out/bazel/thirdparty/BUILD
-    echo 'exports_files(["c-ares-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
-    echo 'exports_files(["krb5-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
-    echo 'exports_files(["libxml2-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
-    echo 'exports_files(["hwloc-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
-    echo 'exports_files(["openssl-prebuilt.BUILD"])' >> $out/bazel/thirdparty/BUILD
+    # Remove dead libpciaccess use_repo line from MODULE.bazel
+    # (its http_archive is deleted from repositories.bzl below)
+    sed -i '/use_repo(non_module_dependencies, "libpciaccess")/d' $out/MODULE.bazel
 
-    # Fix openssl Configure shebang: #! /usr/bin/env perl doesn't work in Nix sandbox.
-    # Add patch_cmds to both openssl http_archive entries in repositories.bzl.
-    # Uses ^#!.* to match ANY shebang variant (resilient to spaces, path differences).
-    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'FIXEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-fix = """        patch_cmds = ["sed -i '1s|^#!.*|#!'$(command -v perl)'|' Configure"],"""
-for url in ["openssl-3.5.5.tar.gz", "openssl-3.1.2.tar.gz"]:
-    marker = 'url = "https://vectorized-public.s3.amazonaws.com/dependencies/' + url + '",'
-    text = text.replace(marker, marker + "\n" + fix)
-with open(path, "w") as f:
-    f.write(text)
-FIXEOF
+    # Export prebuilt BUILD files and patches so Bazel can resolve labels
+    cat >> $out/bazel/thirdparty/BUILD <<'EXPORTS'
+exports_files([
+    "rules_buf-nix-no-download.patch",
+    "c-ares-prebuilt.BUILD",
+    "krb5-prebuilt.BUILD",
+    "libxml2-prebuilt.BUILD",
+    "hwloc-prebuilt.BUILD",
+    "openssl-prebuilt.BUILD",
+    "ragel-prebuilt.BUILD",
+    "base64-prebuilt.BUILD",
+    "openssl-fips-prebuilt.BUILD",
+    "xxhash-prebuilt.BUILD",
+    "hdrhistogram-prebuilt.BUILD",
+    "ada-prebuilt.BUILD",
+    "roaring-prebuilt.BUILD",
+    "lksctp-prebuilt.BUILD",
+])
+EXPORTS
 
-    # Replace c-ares http_archive with new_local_repository pointing to
-    # the pre-built nix_cares/ directory. Saves ~51s of cmake build time.
-    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'CARES_PATCH'
+    # ── Consolidated repositories.bzl patcher ──
+    # Replaces http_archive entries with new_local_repository for all
+    # pre-built deps, deletes dead entries, in a single Python invocation.
+    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'REPOS_PATCH'
 import sys, re
+
 path = sys.argv[1]
 with open(path) as f:
     text = f.read()
@@ -346,102 +533,64 @@ if 'new_local_repository' not in text:
         'load("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")',
     )
 
-# Replace c-ares http_archive with new_local_repository
-old = re.search(r'    http_archive\(\s*name = "c-ares".*?\)', text, re.DOTALL).group(0)
-new = """    new_local_repository(
-        name = "c-ares",
-        path = "nix_cares",
-        build_file = "//bazel/thirdparty:c-ares-prebuilt.BUILD",
+# Table of deps to replace: (name, local_path, build_file)
+replacements = [
+    ("c-ares",      "nix_cares",        "c-ares-prebuilt.BUILD"),
+    ("krb5",        "nix_krb5",         "krb5-prebuilt.BUILD"),
+    ("libxml2",     "nix_libxml2",      "libxml2-prebuilt.BUILD"),
+    ("hwloc",       "nix_hwloc",        "hwloc-prebuilt.BUILD"),
+    ("ragel",       "nix_ragel",        "ragel-prebuilt.BUILD"),
+    ("base64",      "nix_base64",       "base64-prebuilt.BUILD"),
+    ("xxhash",      "nix_xxhash",       "xxhash-prebuilt.BUILD"),
+    ("hdrhistogram","nix_hdrhistogram",  "hdrhistogram-prebuilt.BUILD"),
+    ("ada",         "nix_ada",          "ada-prebuilt.BUILD"),
+    ("roaring",     "nix_roaring",      "roaring-prebuilt.BUILD"),
+    ("lksctp",      "nix_lksctp",       "lksctp-prebuilt.BUILD"),
+]
+
+# These need \n    \) pattern because patch_cmds contain ) chars
+needs_multiline_close = {"openssl", "openssl-fips"}
+
+# Special: openssl and openssl-fips (have patch_cmds with parens)
+replacements_special = [
+    ("openssl",     "nix_openssl",      "openssl-prebuilt.BUILD"),
+    ("openssl-fips","nix_openssl_fips",  "openssl-fips-prebuilt.BUILD"),
+]
+
+# Dead entries to delete
+deletions = ["libpciaccess"]
+
+for name, local_path, build_file in replacements:
+    pattern = r'    http_archive\(\s*name = "' + re.escape(name) + r'".*?\)'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        new = f"""    new_local_repository(
+        name = "{name}",
+        path = "{local_path}",
+        build_file = "//bazel/thirdparty:{build_file}",
     )"""
-text = text.replace(old, new)
+        text = text.replace(match.group(0), new)
+
+for name, local_path, build_file in replacements_special:
+    pattern = r'    http_archive\(\s*name = "' + re.escape(name) + r'".*?\n    \)'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        new = f"""    new_local_repository(
+        name = "{name}",
+        path = "{local_path}",
+        build_file = "//bazel/thirdparty:{build_file}",
+    )"""
+        text = text.replace(match.group(0), new)
+
+for name in deletions:
+    pattern = r'    http_archive\(\s*name = "' + re.escape(name) + r'".*?\)'
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        text = text.replace(match.group(0), "")
 
 with open(path, 'w') as f:
     f.write(text)
-CARES_PATCH
-
-    # Replace krb5 http_archive with new_local_repository pointing to
-    # the pre-built nix_krb5/ directory. Saves ~145s of configure_make build time.
-    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'KRB5_PATCH'
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-
-old = re.search(r'    http_archive\(\s*name = "krb5".*?\)', text, re.DOTALL).group(0)
-new = """    new_local_repository(
-        name = "krb5",
-        path = "nix_krb5",
-        build_file = "//bazel/thirdparty:krb5-prebuilt.BUILD",
-    )"""
-text = text.replace(old, new)
-
-with open(path, 'w') as f:
-    f.write(text)
-KRB5_PATCH
-
-    # Replace libxml2 http_archive with new_local_repository pointing to
-    # the pre-built nix_libxml2/ directory. Saves ~78s of configure_make build time.
-    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'LIBXML2_PATCH'
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-
-old = re.search(r'    http_archive\(\s*name = "libxml2".*?\)', text, re.DOTALL).group(0)
-new = """    new_local_repository(
-        name = "libxml2",
-        path = "nix_libxml2",
-        build_file = "//bazel/thirdparty:libxml2-prebuilt.BUILD",
-    )"""
-text = text.replace(old, new)
-
-with open(path, 'w') as f:
-    f.write(text)
-LIBXML2_PATCH
-
-    # Replace hwloc http_archive with new_local_repository pointing to
-    # the pre-built nix_hwloc/ directory. Saves ~72s of configure_make build time.
-    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'HWLOC_PATCH'
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-
-old = re.search(r'    http_archive\(\s*name = "hwloc".*?\)', text, re.DOTALL).group(0)
-new = """    new_local_repository(
-        name = "hwloc",
-        path = "nix_hwloc",
-        build_file = "//bazel/thirdparty:hwloc-prebuilt.BUILD",
-    )"""
-text = text.replace(old, new)
-
-with open(path, 'w') as f:
-    f.write(text)
-HWLOC_PATCH
-
-    # Replace main openssl http_archive with new_local_repository.
-    # Saves ~118s of Configure + make build time.
-    # Only replaces the main openssl (3.5.5), not openssl-fips (3.1.2).
-    ${pythonWithDeps}/bin/python3 - $out/bazel/repositories.bzl << 'OPENSSL_PATCH'
-import sys, re
-path = sys.argv[1]
-with open(path) as f:
-    text = f.read()
-
-# Match the first openssl http_archive (name = "openssl", not "openssl-fips").
-# Uses \n    \) to find the closing paren on its own line, since patch_cmds
-# may contain ) characters inside strings.
-old = re.search(r'    http_archive\(\s*name = "openssl".*?\n    \)', text, re.DOTALL).group(0)
-new = """    new_local_repository(
-        name = "openssl",
-        path = "nix_openssl",
-        build_file = "//bazel/thirdparty:openssl-prebuilt.BUILD",
-    )"""
-text = text.replace(old, new)
-
-with open(path, 'w') as f:
-    f.write(text)
-OPENSSL_PATCH
+REPOS_PATCH
 
     # Replace default BCR registry with local copy (the --registry flag is
     # a list flag — CLI values append rather than replace, so we must patch
