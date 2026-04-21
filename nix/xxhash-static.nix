@@ -5,7 +5,7 @@
 { xxHash }:
 
 xxHash.overrideAttrs (old: {
-  cmakeFlags = (old.cmakeFlags or []) ++ [
+  cmakeFlags = (old.cmakeFlags or [ ]) ++ [
     "-DBUILD_SHARED_LIBS=OFF"
   ];
 })

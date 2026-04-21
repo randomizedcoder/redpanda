@@ -2,7 +2,11 @@
 #
 # Layer 1: Sandboxed smoke tests for `nix flake check`.
 # Verifies binaries exist and basic CLI works without a running cluster.
-{ pkgs, redpandaDrv, rpkDrv }:
+{
+  pkgs,
+  redpandaDrv,
+  rpkDrv,
+}:
 
 let
   constants = import ./constants.nix;

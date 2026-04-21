@@ -1,8 +1,11 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "kafka",
-    srcs = ["client_franz.go"],
+    srcs = [
+        "client_franz.go",
+        "uds_dialer.go",
+    ],
     importpath = "github.com/redpanda-data/redpanda/src/go/rpk/pkg/kafka",
     visibility = ["//visibility:public"],
     deps = [
@@ -19,5 +22,14 @@ go_library(
         "@com_github_twmb_franz_go_pkg_kadm//:kadm",
         "@com_github_twmb_franz_go_pkg_kmsg//:kmsg",
         "@com_github_twmb_franz_go_plugin_kzap//:kzap",
+    ],
+)
+
+go_test(
+    name = "kafka_test",
+    srcs = ["uds_dialer_test.go"],
+    embed = [":kafka"],
+    deps = [
+        "@com_github_stretchr_testify//require",
     ],
 )

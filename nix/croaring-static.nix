@@ -9,7 +9,7 @@
 { croaring }:
 
 croaring.overrideAttrs (old: {
-  cmakeFlags = (old.cmakeFlags or []) ++ [
+  cmakeFlags = (old.cmakeFlags or [ ]) ++ [
     "-DROARING_DISABLE_AVX=ON"
     "-DROARING_DISABLE_NEON=ON"
   ];

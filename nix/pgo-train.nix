@@ -20,7 +20,6 @@
 # production-quality profiles, use the full train_pgo.py pipeline and
 # pass the result via lib.mkRedpandaPgo.
 {
-  lib,
   runCommand,
   redpandaInstrumented, # derivation built with pgoMode = "instrument"
   rpkDrv, # rpk Go CLI derivation
@@ -31,7 +30,6 @@
   procps,
   gawk,
   iproute2,
-  yaml-cpp,
 }:
 
 runCommand "redpanda-pgo-profile"

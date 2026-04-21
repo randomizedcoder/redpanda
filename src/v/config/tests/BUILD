@@ -62,6 +62,22 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_btest(
+    name = "broker_authn_endpoint_test",
+    timeout = "short",
+    srcs = [
+        "broker_authn_endpoint_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/config",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+        "@yaml-cpp",
+    ],
+)
+
+redpanda_cc_btest(
     name = "socket_address_convert_test",
     timeout = "short",
     srcs = [
@@ -167,7 +183,9 @@ redpanda_cc_btest(
     cpu = 1,
     deps = [
         "//src/v/config",
+        "//src/v/model",
         "//src/v/test_utils:seastar_boost",
+        "//src/v/utils:unresolved_address",
         "@seastar",
         "@seastar//:testing",
     ],

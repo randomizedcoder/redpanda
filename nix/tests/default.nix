@@ -15,6 +15,7 @@ let
   smoke = import ./smoke.nix { inherit pkgs redpandaDrv rpkDrv; };
   singleNode = import ./single-node.nix { inherit pkgs redpandaDrv rpkDrv; };
   lifecycle = import ./lifecycle.nix { inherit pkgs redpandaDrv rpkDrv; };
+  uds = import ./uds.nix { inherit pkgs redpandaDrv rpkDrv; };
   containers = import ./containers.nix { inherit pkgs mkApp; };
 
   # Run-all: smoke + single-node + lifecycle in sequence.
@@ -24,6 +25,7 @@ let
     runtimeInputs = [
       singleNode
       lifecycle
+      uds
       pkgs.coreutils
     ];
     text = ''
@@ -69,8 +71,20 @@ let
       fi
       echo ""
 
-      # Layer 4: Container tests (informational)
-      echo "━━━ Layer 4: Containers ━━━"
+      # Layer 4: UDS (Kafka unix-domain-socket listener)
+      echo "━━━ Layer 4: UDS Kafka Listener ━━━"
+      if test-uds; then
+        echo ""
+        echo "  ✓ UDS tests passed"
+      else
+        echo ""
+        echo "  ✗ UDS tests FAILED"
+        FAILED=$((FAILED + 1))
+      fi
+      echo ""
+
+      # Layer 5: Container tests (informational)
+      echo "━━━ Layer 5: Containers ━━━"
       echo "  (Requires Docker — run 'nix run .#test-images' separately)"
       echo ""
 
@@ -93,10 +107,11 @@ in
     redpanda-smoke = smoke;
   };
 
-  # Runnable packages — `nix run .#test-single-node`, `nix run .#test-lifecycle`, `nix run .#test-all`
+  # Runnable packages — `nix run .#test-single-node`, `nix run .#test-lifecycle`, `nix run .#test-uds`, `nix run .#test-all`
   packages = {
     test-single-node = singleNode;
     test-lifecycle = lifecycle;
+    test-uds = uds;
     test-all = testAll;
   };
 

@@ -6,7 +6,7 @@
 { lksctp-tools }:
 
 lksctp-tools.overrideAttrs (old: {
-  configureFlags = (old.configureFlags or []) ++ [
+  configureFlags = (old.configureFlags or [ ]) ++ [
     "--disable-shared"
     "--enable-static"
   ];

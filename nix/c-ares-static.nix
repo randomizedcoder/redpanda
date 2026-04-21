@@ -9,7 +9,7 @@
 { c-ares }:
 
 c-ares.overrideAttrs (old: {
-  cmakeFlags = (old.cmakeFlags or []) ++ [
+  cmakeFlags = (old.cmakeFlags or [ ]) ++ [
     "-DCARES_STATIC=ON"
     "-DCARES_SHARED=OFF"
   ];

@@ -22,6 +22,11 @@
 
   # Generate a developer-mode redpanda.yaml for testing.
   # dataDir is a placeholder string replaced at runtime via sed.
+  #
+  # When kafkaUnixPath is non-null, a second kafka_api entry is emitted
+  # alongside the TCP one so tests can exercise mixed-transport (UDS +
+  # TCP) deployments — the default production shape for same-node
+  # colocation on K8s where service meshes/CNIs intercept loopback TCP.
   mkRedpandaYaml =
     {
       dataDir ? "DATA_DIR_PLACEHOLDER",
@@ -29,7 +34,22 @@
       kafkaPort ? 9092,
       adminPort ? 9644,
       rpcPort ? 33145,
+      kafkaUnixPath ? null,
+      kafkaUnixMode ? "0660",
     }:
+    let
+      # Plain string (not indented) so whitespace is preserved verbatim
+      # when concatenated into the indented YAML body below. Indent
+      # level matches the `- address:` line of the TCP kafka_api entry
+      # (4 spaces for list-item dash, 6 for sub-properties).
+      udsEntry =
+        if kafkaUnixPath != null then
+          "    - unix_path: ${kafkaUnixPath}\n"
+          + "      unix_socket_mode: ${kafkaUnixMode}\n"
+          + "      name: uds\n"
+        else
+          "";
+    in
     ''
       redpanda:
         data_directory: ${dataDir}
@@ -41,6 +61,10 @@
         kafka_api:
           - address: 127.0.0.1
             port: ${toString kafkaPort}
+            name: tcp
+    ''
+    + udsEntry
+    + ''
         admin:
           - address: 127.0.0.1
             port: ${toString adminPort}

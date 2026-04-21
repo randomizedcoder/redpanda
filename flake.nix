@@ -6,11 +6,14 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
+  # `...` absorbs the `self` argument Nix always passes to the outputs
+  # function. Naming `self` explicitly would trip deadnix; omitting the
+  # `...` would fail the call convention.
   outputs =
     {
-      self,
       nixpkgs,
       flake-utils,
+      ...
     }:
     flake-utils.lib.eachSystem
       [
@@ -33,7 +36,41 @@
             bazelCacheDir = "/var/cache/bazel-nix";
           };
 
-          rpk = pkgs.callPackage ./nix/rpk.nix { };
+          # Redpanda binary + Seastar PERF_TEST bench for UDS vs TCP loopback.
+          # Built under the cached sandbox so the ~5-10min warm path applies;
+          # the bench lives under $out/libexec so it doesn't shadow redpanda.
+          uds-bench-cached =
+            let
+              # One entry per Seastar-level bench. Kept as a local so adding
+              # a new bench file is a single-line change here plus the BUILD.
+              benches = [
+                "uds_rtt_bench"
+                "uds_throughput_bench"
+                "uds_connect_bench"
+                "uds_concurrency_bench"
+              ];
+              boostTestSo = "external/rules_boost++non_module_dependencies+boost/lib_internal_test.so";
+            in
+            pkgs.callPackage ./nix/redpanda.nix {
+              bazelCacheDir = "/var/cache/bazel-nix";
+              extraBazelTargets = map (n: "//src/v/net/tests:${n}_rpbench") benches;
+              extraInstallBins = map (n: {
+                # redpanda_cc_bench emits `foo` (wrapper) and `foo_binary`
+                # (the Seastar-linked ELF). Install the ELF; patchelf stamps
+                # krb5/openssl rpaths and bundles the Boost test dylib so
+                # libexec/ is self-contained.
+                src = "src/v/net/tests/${n}_rpbench_binary";
+                dst = "libexec/${n}";
+                extraLibs = [ boostTestSo ];
+              }) benches;
+            };
+
+          rpk = pkgs.callPackage ./nix/rpk.nix {
+            # Force Go 1.26 to satisfy transitive deps (e.g. twmb/types
+            # v1.2.0) that require go >= 1.26. nixpkgs' default go is
+            # currently 1.25.7, which would fail module resolution.
+            buildGoModule = pkgs.buildGo126Module;
+          };
 
           # ── Optimization tiers ──
           # Nix makes it trivial to offer every combination of optimization
@@ -73,54 +110,70 @@
           };
 
           # Automated PGO: instrument → train (~15k msgs, 5 size tiers) → optimize.
-          redpanda-pgo = let
-            instrumented = pkgs.callPackage ./nix/redpanda.nix {
-              pgoMode = "instrument";
+          redpanda-pgo =
+            let
+              instrumented = pkgs.callPackage ./nix/redpanda.nix {
+                pgoMode = "instrument";
+              };
+              profile = pkgs.callPackage ./nix/pgo-train.nix {
+                redpandaInstrumented = instrumented;
+                rpkDrv = rpk;
+              };
+            in
+            pkgs.callPackage ./nix/redpanda.nix {
+              pgoMode = "optimize";
+              pgoProfilePath = "${profile}/pgo_profile.profdata";
             };
-            profile = pkgs.callPackage ./nix/pgo-train.nix {
-              redpandaInstrumented = instrumented;
-              rpkDrv = rpk;
-            };
-          in pkgs.callPackage ./nix/redpanda.nix {
-            pgoMode = "optimize";
-            pgoProfilePath = "${profile}/pgo_profile.profdata";
-          };
 
           # Cached PGO variants for repeat builders.
-          redpanda-pgo-cached = let
-            instrumented = pkgs.callPackage ./nix/redpanda.nix {
-              pgoMode = "instrument";
+          redpanda-pgo-cached =
+            let
+              instrumented = pkgs.callPackage ./nix/redpanda.nix {
+                pgoMode = "instrument";
+                bazelCacheDir = "/var/cache/bazel-nix";
+              };
+              profile = pkgs.callPackage ./nix/pgo-train.nix {
+                redpandaInstrumented = instrumented;
+                rpkDrv = rpk;
+              };
+            in
+            pkgs.callPackage ./nix/redpanda.nix {
+              pgoMode = "optimize";
+              pgoProfilePath = "${profile}/pgo_profile.profdata";
               bazelCacheDir = "/var/cache/bazel-nix";
             };
-            profile = pkgs.callPackage ./nix/pgo-train.nix {
-              redpandaInstrumented = instrumented;
-              rpkDrv = rpk;
-            };
-          in pkgs.callPackage ./nix/redpanda.nix {
-            pgoMode = "optimize";
-            pgoProfilePath = "${profile}/pgo_profile.profdata";
-            bazelCacheDir = "/var/cache/bazel-nix";
-          };
 
           # Helper for external profile workflow: build an optimized binary
           # using pre-generated .profdata from the full train_pgo.py pipeline.
-          mkRedpandaPgo = profilePath: pkgs.callPackage ./nix/redpanda.nix {
-            pgoMode = "optimize";
-            pgoProfilePath = profilePath;
-          };
+          mkRedpandaPgo =
+            profilePath:
+            pkgs.callPackage ./nix/redpanda.nix {
+              pgoMode = "optimize";
+              pgoProfilePath = profilePath;
+            };
 
           mkApp = drv: {
             type = "app";
             program = "${drv}/bin/${drv.name}";
           };
 
-          bench = import ./nix/bench.nix { inherit pkgs mkApp; };
+          bench = import ./nix/bench.nix {
+            inherit pkgs mkApp;
+            redpandaDrv = redpanda-cached;
+            rpkDrv = rpk;
+          };
 
           tests = import ./nix/tests {
             inherit pkgs mkApp;
             redpandaDrv = redpanda;
             rpkDrv = rpk;
           };
+
+          # Static-analysis apps + `nix flake check` Nix-lint
+          # derivation. Modular so adding a new linter (e.g. a BUILD
+          # buildifier pass) is a single entry in nix/lint.nix, not a
+          # flake.nix rewrite.
+          lintTools = import ./nix/lint.nix { inherit pkgs mkApp; };
 
           # Tests using the cached build (faster for repeat testing).
           testsCached = import ./nix/tests {
@@ -135,6 +188,7 @@
               redpanda
               rpk
               redpanda-cached
+              uds-bench-cached
               redpanda-release
               redpanda-release-cached
               redpanda-lto
@@ -165,15 +219,18 @@
             rpk-image = pkgs.callPackage ./nix/rpk-image.nix {
               rpkDrv = rpk;
             };
-          } // tests.packages // {
+          }
+          // tests.packages
+          // {
             # Cached variants for faster iteration (requires /var/cache/bazel-nix)
             test-single-node-cached = testsCached.packages.test-single-node;
             test-lifecycle-cached = testsCached.packages.test-lifecycle;
-            test-all = tests.packages.test-all;
+            test-uds-cached = testsCached.packages.test-uds;
+            inherit (tests.packages) test-all;
             test-all-cached = testsCached.packages.test-all;
           };
 
-          apps = bench // tests.apps;
+          apps = bench // tests.apps // lintTools.apps;
 
           devShells.default = pkgs.callPackage ./nix/shell.nix { };
 
@@ -186,7 +243,9 @@
               ${rpk}/bin/rpk version
               touch $out
             '';
-          } // tests.checks;
+          }
+          // tests.checks
+          // lintTools.checks;
         }
       );
 }

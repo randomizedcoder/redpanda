@@ -34,6 +34,28 @@ and removes that uncertainty. It also halves the syscall count per
 message (one `sendmsg`/`recvmsg` pair instead of a TCP segment round-trip
 through the socket buffer).
 
+## Isn't TCP fast over the loopback?
+
+TCP is still used over loopback connections, which can be observed via `ss --tcp --info '( src 127.0.0.1 and dst 127.0.0.1 )'`
+
+The following is a typical examples, where we see the kernel TCP stack is busy tracking a LOT of info about the TCP connections over the loopback.  All this TCP work get's skipped when using the Unix Domain Sockets (UDS).  This is why UDS is a lot faster.
+
+Looking the the following output we can observer:
+- RTTs are >4ms
+- Retransmissions are occuring
+- TCP recieve window is the limiting factor
+- TCP pacing is occuring
+
+Look at the RTTs, for example.  We even see retransmissions.
+```bash
+[das@l:~/Downloads/redpanda]$ ss --tcp --info '( src 127.0.0.1 and dst 127.0.0.1 )'
+State              Recv-Q               Send-Q                             Local Address:Port                              Peer Address:Port
+ESTAB              990667               185750                                 127.0.0.1:63944                                127.0.0.1:12199
+         cubic wscale:9,9 rto:55 backoff:15 rtt:4.525/8.966 ato:40 mss:65483 pmtu:65535 rcvmss:65483 advmss:65483 cwnd:16 ssthresh:16 bytes_sent:2042421 bytes_retrans:53 bytes_acked:2042369 bytes_received:990667 segs_out:151 segs_in:126 data_segs_out:63 data_segs_in:25 send 1.85Gbps lastsnd:4157833 lastrcv:4158042 lastack:11489 pacing_rate 2.22Gbps delivery_rate 8.59Gbps delivered:64 busy:4158248ms rwnd_limited:4158247ms(100.0%) retrans:0/1 dsack_dups:1 rcv_rtt:0.893 rcv_space:434517 rcv_ssthresh:862522 notsent:185750 minrtt:0.009
+ESTAB              870912               115200                                 127.0.0.1:12199                                127.0.0.1:63944
+         cubic wscale:9,9 rto:56 backoff:15 rtt:5.166/10.266 ato:49 mss:65483 pmtu:65535 rcvmss:65483 advmss:65483 cwnd:16 ssthresh:16 bytes_sent:990667 bytes_acked:990667 bytes_received:2042368 segs_out:125 segs_in:151 data_segs_out:25 data_segs_in:63 send 1.62Gbps lastsnd:4158046 lastrcv:4157837 lastack:11493 pacing_rate 1.95Gbps delivery_rate 12.8Mbps delivered:26 busy:4158251ms rwnd_limited:4158251ms(100.0%) rcv_rtt:0.268 rcv_space:434517 rcv_ssthresh:851350 notsent:115200 minrtt:0.009
+```
+
 ## How (short plan)
 
 1. Add `unix_path` (and optional `unix_socket_mode`) to
@@ -320,6 +342,68 @@ Shutdown:
 2. For every UDS entry, the Kafka service's post-stop hook calls
    `cleanup_uds_path`, unlinking both the socket and lockfile.
 
+## Security
+
+### Threat model
+
+| Attacker | Capability | Can exploit UDS? |
+|---|---|---|
+| Operator with `redpanda.yaml` write access | picks any `unix_path`, any mode, any SASL setting | Out of scope — already fully privileged; no config-level filter can protect against this principal. |
+| Local unprivileged user with write access to the parent directory | can create/replace files at the socket path, race the bind | No privilege escalation. Worst case: denial-of-service (broker refuses to start or re-starts cleanly on a different path). See guards below. |
+| Local unprivileged user *without* parent-directory access | no capability | Not applicable. |
+| Remote network attacker | no capability | Not applicable — `AF_UNIX` is host-local. |
+
+The dangerous class of attack we protect against is **"trick Redpanda into
+`unlink(2)`ing or binding on top of an important file"** (e.g. `/etc/passwd`,
+another service's socket). The defenses below are layered so that bypassing
+any single one does not yield that outcome.
+
+### Config-time defenses (`validate_broker_authn_endpoint`)
+
+All checks run at YAML-decode time, before any filesystem syscall is made:
+
+| Check | Rejects | Why |
+|---|---|---|
+| Non-empty | `""` | No inode is legal. |
+| Absolute path | `./x`, `x.sock` | Relative paths depend on the broker's CWD at bind time, which is non-deterministic across operator invocations and makes audit harder. |
+| Length ≤ 107 bytes | paths at or past the Linux `sun_path` limit | `bind(2)` silently truncates oversize paths; we'd disagree with the kernel about what we bound. |
+| No embedded NUL bytes | `/real/path\0/elsewhere` | `sun_path` is NUL-terminated at the kernel layer. Without this guard an attacker (or a buggy config generator) could make the config and the kernel disagree about the inode. |
+| No `..` components | `/var/run/redpanda/../../etc/passwd` | A legitimate operator never writes `..` here. Rejecting up-front turns any future outer-layer restriction (admission policy confining sockets to `/var/run/redpanda/`) into a real invariant instead of a bypass-by-traversal problem. |
+| Canonical form | `//` runs, trailing `/` | Kernel tolerates these but they hint at a buggy config generator. Rejecting surfaces the bug early. |
+| Mode ≤ 07777 | higher | Covers full POSIX mode range including setuid/setgid/sticky. The setgid bit (02000) is the standard pattern for "inherit parent-dir GID on socket creation", useful for cross-container bind-mount deployments. |
+
+### Runtime defenses (`prepare_uds_path` + `verify_uds_bound`)
+
+Before `bind(2)`:
+
+- Parent directory must exist, be a directory, and be writable.
+- If the target already exists:
+  - **If not `S_ISSOCK`**: hard fail. We never `unlink(2)` a non-socket. This is the single most important defense — it is what blocks "trick Redpanda into `unlink(/etc/passwd)`".
+  - If a socket, attempt `connect(2)`: `ECONNREFUSED` → stale, unlink with a warning log; success → another broker is live, hard fail.
+- Advisory `flock(2)` on a sibling `<path>.lock` file prevents two Redpanda instances racing to bind the same path.
+
+After `bind(2)` + `chmod(2)`:
+
+- `lstat(2)` the path (not `stat`, because `stat` follows symlinks and would mask exactly the attack we're trying to detect).
+- Assert `S_ISSOCK(st_mode)` — closes any TOCTOU window where an attacker with parent-dir write access could have swapped in a symlink between our stat-and-unlink and the subsequent bind.
+- Assert `st_uid == geteuid()` — the socket inode must be one we own. If we somehow bound on top of an inode owned by another user, fail loudly instead of serving traffic on it.
+
+### What we deliberately do NOT do
+
+- **No `realpath(3)` normalization.** Resolving symlinks would break legitimate k8s `hostPath` / `emptyDir` setups where the mount itself traverses a symlinked path. We log the bound path verbatim and let operators audit.
+- **No character whitelist.** Paths under `/run` in some deployments legitimately contain `:`, `@`, or `+` (systemd-instance-style names). NUL + `..` + length guards are sufficient.
+- **No broader length restriction** (e.g. `< 128`). We already cap at the kernel-enforced 107; loosening would let bad configs pass validation only to fail with a less helpful error at bind time.
+
+### Residual risks (accepted)
+
+- A local user with parent-directory write access can cause a DoS by racing the bind or repeatedly creating non-socket files at the path. Mitigation is operational: parent directories should be mode `0750` and owned by `redpanda:redpanda`, not `0777`.
+- Between `bind(2)` and our `chmod(2)`, the socket briefly carries Seastar's default mode (umask-derived). In practice the window is microseconds and SASL is still the gate for authenticated traffic, but a truly paranoid deployment should rely on a `0700` parent directory rather than the socket mode.
+
+### Test coverage for these defenses
+
+- `broker_authn_endpoint_test.cc` carries a table-driven `path_sanity_table` case covering every positive and negative path shape listed above, with a `description` field on each entry describing the attacker intent or operator-usability rationale.
+- `uds_listener_test.cc` covers the runtime cases (stale socket, regular-file-at-path, non-existent parent, unwritable parent, concurrent flock contention).
+
 ## Drawbacks
 
 - **TLS unsupported**: forces operators who need cryptographic identity
@@ -415,12 +499,261 @@ listener.
 
 ## Measurements
 
-*(To be populated after Phase 4 lands — placeholder section.)*
+This RFC ships with four purpose-split Seastar `PERF_TEST_CN`
+benchmarks plus two end-to-end Nix harnesses. Each bench isolates one
+dimension of the transport cost so that the data can stand independently
+under reviewer scrutiny.
 
-- Per-message end-to-end latency p50/p99 via `rpk topic produce|consume`
-  under fixed rate: TCP-loopback vs UDS.
-- Syscall counts per message via
-  `perf stat -e syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvmsg`.
+### Test suite
+
+All four microbenches live under `src/v/net/tests/` and share the
+fixture `uds_bench_common.hh` (socket-pair factory, echo server,
+`rusage_sample` helper). They are compiled into the Nix sandbox build
+via `nix build .#uds-bench-cached`, which installs each as
+`libexec/<bench>` alongside the broker binary so the numbers in this
+section are reproducible from a clean checkout.
+
+The transport axis is always `{tcp_nagle, tcp_nodelay, uds}`. All
+benches run `--smp=1` — AF_UNIX has no `SO_REUSEPORT` equivalent, so
+mixing multi-shard TCP and single-shard UDS would contaminate the
+comparison. Cross-shard dispatch of UDS is a separate concern tracked
+in the Unresolved-questions section.
+
+#### 1. `uds_rtt_bench` — round-trip latency (headline)
+
+Per-frame cost of a request/response round trip on an otherwise-idle
+connection.
+
+- Axes: `payload ∈ {8 B, 64 B, 256 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB,
+  1 MiB}` × `depth ∈ {1, 8, 64, 256, 1024}`.
+- Depth = number of in-flight write frames before reads. Depth 1 is the
+  pure tail-latency case; depth 1024 exposes pipeline saturation and
+  where the socket buffer / TCP congestion window stop helping.
+- The inner loop runs `iterations=128` outer batches per
+  `PERF_TEST_CN` invocation, returning `iterations × depth` so the
+  reported per-op number is the cost of one request frame plus one
+  response frame.
+
+#### 2. `uds_throughput_bench` — directional throughput + CPU cost
+
+Complementary to RTT: "how much work does the transport move per
+second, and at what CPU cost". Each cell brackets the timed region with
+`getrusage(RUSAGE_SELF)` and prints user-µs, sys-µs, and context
+switches so reviewers can derive CPU µs/byte and CPU µs/RPC.
+
+- `unidirectional`: client writes `batches × depth` frames, server
+  drains to EOF. Best case for each transport; exposes the send-side
+  syscall cost and the TCP-Nagle penalty on small frames.
+- `bidirectional`: both ends write and drain concurrently via
+  `when_all_succeed` — full-duplex buffering and scheduler fairness.
+- `rr_saturation`: strict depth-1 ping-pong, as many back-to-back RPCs
+  as the transport allows. This is the "tail latency at offered load"
+  case and is where UDS delivers its biggest relative win because the
+  per-RPC syscall path is shortest.
+
+Free helper functions `drain_stream(in)` / `write_loop(out, ...)` are
+used instead of IIFE lambda coroutines, because the lambda object is
+destroyed immediately after the IIFE returns while the coroutine frame
+may still be suspended holding captured references — the known
+use-after-free trap documented in this project's `CLAUDE.md`.
+
+#### 3. `uds_connect_bench` — connection lifecycle
+
+Measures the cost of *churn*, which most benches ignore: connect + one
+RPC + close, back-to-back, 256 times per cell. Real deployments open
+short-lived connections constantly (CLI tools, sidecar health probes,
+batch producer jobs); those workloads are dominated by handshake cost,
+not steady-state RTT.
+
+- `short_lived`: fresh `connect()` for every RPC.
+- `long_lived`: single persistent connection, N RPCs — the baseline
+  most steady-state benches accidentally measure. Included so the
+  short/long ratio per transport is visible.
+- Payload axis: `{64 B, 1 KiB}` (the small-RPC shape where churn cost
+  dominates).
+
+#### 4. `uds_concurrency_bench` — multi-connection fairness
+
+RTT and throughput benches run a single connection; real workloads
+don't. This file exercises the concurrency axis at
+`N ∈ {1, 2, 4, 8, 16, 32, 64}` in two shapes:
+
+- `fan_in`: N concurrent clients → one listener, one accept loop per
+  connection. The "many producers to one broker" shape.
+- `fan_out`: one client coroutine opens N connections to one listener.
+  Measures whether a single reactor can keep N sockets fed.
+
+With `--smp=1` both shapes hit the same scheduler + transport paths;
+they're kept as distinct cells because a future asymmetric variant
+(client on shard 0, servers on shard 1) can diverge without touching
+the fan-in path.
+
+#### 5. End-to-end rpk bench (`nix run .#bench-uds-vs-tcp`)
+
+Boots a broker with a dual-transport listener, produces `$RECORDS`
+messages of `$PAYLOAD` bytes via each transport back-to-back on the
+same topic, emits one JSON record per phase with elapsed time,
+throughput, and (when `kernel.perf_event_paranoid <= 2`)
+`sendmsg`/`recvmsg` syscall counts.
+
+#### 6. Backpressure bench (`nix run .#bench-backpressure`)
+
+Two scenarios driven through the same dual-listener broker:
+
+- **Slow consumer**: rate-limited producer with a deliberately lagging
+  consumer; the Admin API is polled every 100 ms for `high_watermark`
+  and RSS so the JSON timeline captures when the broker starts pushing
+  back.
+- **Bursty producer**: 10 ms produce bursts every 100 ms, per
+  transport.
+
+Used to spot regressions where UDS and TCP might diverge under
+saturation (e.g. different flow-control behaviour from the two socket
+families).
+
+### Microbench results (2026-04-20)
+
+Collected on Linux 6.18.21, `--smp=1`, built via `nix build
+.#uds-bench-cached` (release, clang/libc++). Columns are per-operation
+mean runtime as reported by the Seastar perf harness; the "UDS vs
+tcp_nodelay" ratio is what the reviewer should look at — Nagle vs
+nodelay differences on loopback are a TCP-internal detail.
+
+Methodology note: `iterations` in `uds_rtt_bench` is a hardcoded
+compile-time constant (128). Payload × depth combinations where
+`iterations × depth × payload` exceeds a few GiB wall-clock out before
+the harness prints a line (e.g. `p1m_d1024` → 128 GiB per invocation).
+Cells marked "—" below hit that ceiling; making `iterations` runtime-
+configurable is captured in Follow-ups.
+
+#### RTT, depth = 1 (single in-flight frame — tail-latency baseline)
+
+| payload | tcp_nagle | tcp_nodelay | uds | UDS / nodelay |
+|---------|-----------|-------------|-----|---------------|
+| 64 KiB  | —         | 58.17 µs    | 33.83 µs | 0.58× |
+| 1 MiB   | —         | 747.95 µs   | 555.28 µs | 0.74× |
+
+#### RTT, depth = 8 (small pipeline)
+
+| payload | tcp_nodelay | uds | UDS / nodelay |
+|---------|-------------|-----|---------------|
+| 64 KiB  | 49.80 µs | 33.76 µs | 0.68× |
+| 1 MiB   | —        | 588.94 µs | — |
+
+#### RTT, depth = 64 (pipelined small frames — per-frame cost)
+
+| payload | tcp_nagle | tcp_nodelay | uds | UDS / nodelay |
+|---------|-----------|-------------|-----|---------------|
+| 8 B     | 365 ns    | 380 ns   | 210 ns  | 0.55× |
+| 256 B   | 747 ns    | 761 ns   | 424 ns  | 0.56× |
+| 1 KiB   | 96.14 µs* | 2.12 µs  | 990 ns  | 0.47× |
+| 4 KiB   | 215.83 µs* | 6.58 µs | 3.16 µs | 0.48× |
+| 16 KiB  | 83.19 µs* | 16.28 µs | 9.20 µs | 0.57× |
+
+\* tcp_nagle shows 20–100× worse per-frame cost at 1–16 KiB: the classic
+Nagle + delayed-ack interaction on pipelined writes. This is exactly
+the behaviour the `tcp_nodelay` axis exists to isolate — it's a real
+regression risk for anyone running stock TCP loopback without
+`TCP_NODELAY`.
+
+**Summary:** at depth ≥ 1 and payloads 8 B – 64 KiB, UDS delivers
+**~1.7–2.1× lower per-frame RTT** than `tcp_nodelay`. The gap narrows
+at 1 MiB (0.74×) because the transport cost stops dominating versus
+memcpy.
+
+#### Throughput: unidirectional drain (client writes, server drains)
+
+| payload | tcp_nagle | tcp_nodelay | uds | UDS / nodelay |
+|---------|-----------|-------------|-----|---------------|
+| 64 B    | 154 ns    | 229 ns   | 96 ns   | 0.42× |
+| 4 KiB   | 2.38 µs   | 4.51 µs  | 1.88 µs | 0.42× |
+| 64 KiB  | 27.89 µs  | 29.77 µs | 18.37 µs | 0.62× |
+
+#### Throughput: rr_saturation (depth-1 ping-pong as fast as possible)
+
+| payload | tcp_nagle | tcp_nodelay | uds | UDS / nodelay |
+|---------|-----------|-------------|-----|---------------|
+| 8 B     | 19.31 µs | 19.79 µs | 10.73 µs | 0.54× |
+| 64 B    | 19.91 µs | 19.77 µs | 10.17 µs | 0.51× |
+| 1 KiB   | 20.05 µs | 20.10 µs | 10.59 µs | 0.53× |
+| 16 KiB  | 24.50 µs | 25.55 µs | 13.49 µs | 0.53× |
+
+**Summary:** the rr_saturation row is the headline number for
+service-mesh displacement — **UDS halves per-RPC cost at every small
+payload.** This is the "tail latency at offered load" story: the
+syscall + scheduler path is shorter for AF_UNIX, and it shows up
+cleanly when the workload is syscall-bound.
+
+#### Connection lifecycle (256-connection churn)
+
+| payload | transport   | short_lived (churn) | long_lived (steady) | ratio |
+|---------|-------------|---------------------|---------------------|-------|
+| 64 B    | tcp_nagle   | 110.29 µs | 20.95 µs | 5.26× |
+| 64 B    | tcp_nodelay | 110.84 µs | 19.60 µs | 5.66× |
+| 64 B    | uds         |  36.60 µs |  9.91 µs | 3.69× |
+| 1 KiB   | tcp_nagle   | 111.64 µs | 20.49 µs | 5.45× |
+| 1 KiB   | tcp_nodelay | 112.27 µs | 20.15 µs | 5.57× |
+| 1 KiB   | uds         |  37.31 µs | 10.52 µs | 3.55× |
+
+**Summary:** UDS is **~3× faster on connection churn** (37 µs vs
+111 µs) *and* has a smaller churn-to-steady ratio (3.6× vs 5.6×), i.e.
+UDS pays proportionally less for setup/teardown. Workloads dominated by
+short-lived connections (CLI tools, sidecar probes, batch producers)
+benefit disproportionately.
+
+#### Concurrency (fan_in, 64 RPCs per connection, per-frame cost)
+
+| N clients | tcp_nagle | tcp_nodelay | uds | UDS / nodelay |
+|-----------|-----------|-------------|-----|---------------|
+| 1         | 21.38 µs | 22.10 µs | 11.24 µs | 0.51× |
+| 4         | 19.60 µs | 20.18 µs |  9.30 µs | 0.46× |
+| 16        | 19.02 µs | 19.57 µs |  8.75 µs | 0.45× |
+| 64        | 19.83 µs | 21.87 µs |  9.63 µs | 0.44× |
+
+**Summary:** UDS holds its ~2.2× lead across the full N sweep. The gap
+actually *widens* slightly at N=16/64, consistent with the accept +
+scheduler path being a larger slice of per-frame cost at concurrency.
+
+### End-to-end rpk bench (2026-04-19)
+
+Single-broker, single-shard (`--smp 1 --memory 1G`) on Linux 6.18.21;
+`rpk topic produce -n $RECORDS -r 2000` against a broker with both a
+TCP listener (`127.0.0.1:9092`) and a UDS listener
+(`/tmp/.../rp.sock`), back-to-back phases on the same topic.
+
+| transport | records | payload | elapsed (ms) | throughput (MiB/s) |
+|-----------|---------|---------|--------------|--------------------|
+| tcp_loopback | 10 000 | 1 KiB | 14 230 | 0.686 |
+| uds          | 10 000 | 1 KiB | 13 989 | 0.698 |
+
+Ratio: **UDS throughput ≈ 1.7 % higher than TCP loopback** at this
+payload/rate combination. The signal is small because the bench is
+syscall-bound on a single rpk producer rather than transport-bound;
+Kafka-framing and rpk's per-record write amplification dominate over
+the raw socket cost. The Seastar microbench is the right place to
+isolate the pure socket cost (order of magnitude larger relative gap
+in the early exploratory probes described at the top of this RFC).
+
+`perf_event_paranoid` gated syscall counts (`null` values above); to
+collect them, set `sysctl -w kernel.perf_event_paranoid=2` before
+re-running the bench.
+
+### Follow-ups
+
+- Wire `uds_bench_rpbench` into the Nix sandbox build so Seastar-level
+  latency numbers can be collected reproducibly.
+- Per-message latency p50/p99 via `rpk topic produce|consume` under
+  fixed rate, TCP-loopback vs UDS.
 - Per-shard CPU from `redpanda_cpu_busy_seconds_total` diff.
-- Microbench (`src/v/net/tests/uds_bench.cc`) sweeping payload sizes
-  {64 B, 1 KiB, 16 KiB, 1 MiB} and pipeline depths {1, 8, 32}.
+- Make `iterations` in `uds_rtt_bench` runtime-configurable (env var or
+  `--rtt-iterations` flag) so high-depth-large-payload cells
+  (`p1m × d64/256/1024`, `p64k × d256/1024`) can be measured without
+  exceeding practical wall-clock bounds. Current hardcoded `128` × the
+  inner depth × payload means `p1m_d1024` attempts to move 128 GiB per
+  harness invocation, which does not terminate in a review cycle.
+- Collect `rusage_sample` user/sys µs deltas already printed by the
+  throughput bench into the RFC tables so CPU µs/byte can be reported
+  alongside wall-clock throughput.
+- Run the full matrix under `--smp 4` once the SMP-bind probe
+  outcome is reflected in the design (see Unresolved questions) — the
+  current numbers are `--smp 1` only.

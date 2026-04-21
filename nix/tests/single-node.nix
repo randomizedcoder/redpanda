@@ -3,11 +3,15 @@
 # Layer 2: Single-node integration test.
 # Starts a real Redpanda in developer mode and exercises all APIs.
 # Run with: nix run .#test-single-node
-{ pkgs, redpandaDrv, rpkDrv }:
+{
+  pkgs,
+  redpandaDrv,
+  rpkDrv,
+}:
 
 let
   testLib = import ./lib.nix { inherit redpandaDrv rpkDrv; };
-  constants = testLib.constants;
+  inherit (testLib) constants;
   kafkaChecks = import ./checks/kafka-checks.nix { inherit rpkDrv constants; };
   adminChecks = import ./checks/admin-checks.nix { inherit constants; };
   schemaChecks = import ./checks/schema-checks.nix { inherit constants; };

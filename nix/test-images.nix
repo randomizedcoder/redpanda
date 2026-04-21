@@ -1,6 +1,7 @@
 { pkgs, mkApp }:
 
-mkApp (pkgs.writeShellApplication {
+mkApp (
+  pkgs.writeShellApplication {
     name = "redpanda-test-images";
     runtimeInputs = with pkgs; [
       coreutils
@@ -84,4 +85,5 @@ mkApp (pkgs.writeShellApplication {
 
       echo "[test] All tests passed"
     '';
-  })
+  }
+)

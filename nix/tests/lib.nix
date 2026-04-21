@@ -5,7 +5,12 @@
 #
 # Each attribute returns a bash string fragment that can be interpolated
 # into writeShellApplication scripts.
-{ redpandaDrv, rpkDrv }:
+{
+  redpandaDrv,
+  # Callers pass rpkDrv too; this file no longer references it, but the
+  # `...` keeps the interface stable for callers in default.nix.
+  ...
+}:
 
 let
   constants = import ./constants.nix;

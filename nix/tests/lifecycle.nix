@@ -2,11 +2,15 @@
 #
 # Layer 3: Lifecycle test — restart, data persistence, graceful shutdown.
 # Run with: nix run .#test-lifecycle
-{ pkgs, redpandaDrv, rpkDrv }:
+{
+  pkgs,
+  redpandaDrv,
+  rpkDrv,
+}:
 
 let
   testLib = import ./lib.nix { inherit redpandaDrv rpkDrv; };
-  constants = testLib.constants;
+  inherit (testLib) constants;
   resilienceChecks = import ./checks/resilience-checks.nix { inherit rpkDrv constants; };
 in
 pkgs.writeShellApplication {
