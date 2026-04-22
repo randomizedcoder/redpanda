@@ -223,57 +223,9 @@ def main():
 single_version_override(
     module_name = "rules_buf",
     patch_strip = 1,
-    patches = ["//nix/patches:rules_buf-nix-no-download.patch"],
+    patches = ["//bazel/thirdparty:rules_buf-nix-no-download.patch"],
 )
 '''
-
-    # ── Add local_path_override for rules_python ──
-    # Uses the patched fork (nix-local-toolchain branch) embedded in
-    # third_party/rules_python by the redpanda-src-patched derivation.
-    if 'module_name = "rules_python"' not in text:
-        text += '''
-# Nix: use patched rules_python with local toolchain support
-local_path_override(
-    module_name = "rules_python",
-    path = "third_party/rules_python",
-)
-'''
-
-    # ── Add cc_configure extension for system-clang config ──
-    # Registers @local_config_cc_toolchains so build:system-clang works.
-    if 'cc_configure' not in text:
-        text = text.replace(
-            'bazel_dep(name = "rules_cc",',
-            'bazel_dep(name = "rules_cc",',
-            1,
-        )
-        # Insert after rules_cc bazel_dep line
-        text = re.sub(
-            r'(bazel_dep\(name = "rules_cc"[^)]*\))',
-            r'''\1
-
-cc_configure = use_extension("@rules_cc//cc:extensions.bzl", "cc_configure_extension")
-use_repo(cc_configure, "local_config_cc_toolchains")''',
-            text,
-            count=1,
-        )
-
-    # ── Add python.local_toolchain for Nix system Python ──
-    # The local_toolchain() call tells rules_python to use Python from PATH
-    # instead of downloading a hermetic interpreter (which fails in the sandbox).
-    if 'python.local_toolchain' not in text:
-        text = re.sub(
-            r'(python\.toolchain\([^)]*\))',
-            r'''\1
-python.local_toolchain(
-    python_version = "3.12",
-    interpreter_path = "python3",
-)
-use_repo(python, "local_python_3_12", "local_python_3_12_toolchains")
-register_toolchains("@local_python_3_12_toolchains//:all")''',
-            text,
-            count=1,
-        )
 
     # ── Replace pip with stub python_deps extension ──
     # nixpkgs provides jinja2/jsonschema via python312.withPackages.

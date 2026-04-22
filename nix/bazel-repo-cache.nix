@@ -9,10 +9,7 @@
 # Usage:
 #   callPackage ./bazel-repo-cache.nix {} { archives = import ./bazel-deps.nix; }
 #
-{
-  linkFarm,
-  fetchurl,
-}:
+{ lib, linkFarm, fetchurl }:
 
 { archives }:
 
@@ -22,9 +19,9 @@ let
   cacheEntries = map (a: {
     name = "content_addressable/sha256/${a.sha256}/file";
     path = fetchurl {
-      inherit (a) url;
-      inherit (a) sha256;
-      inherit (a) name;
+      url = a.url;
+      sha256 = a.sha256;
+      name = a.name;
     };
   }) archives;
 in

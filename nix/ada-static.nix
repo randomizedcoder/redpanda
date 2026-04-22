@@ -5,11 +5,7 @@
 # a different build structure, so we build from the same tarball Bazel uses.
 #
 # Must be built with clang/libc++ to match the Bazel build toolchain.
-{
-  fetchurl,
-  llvmPackages_20,
-  unzip,
-}:
+{ stdenv, fetchurl, llvmPackages_20, unzip }:
 
 let
   clangStdenv = llvmPackages_20.libcxxStdenv;

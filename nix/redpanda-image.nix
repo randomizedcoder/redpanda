@@ -14,15 +14,16 @@ dockerTools.streamLayeredImage {
   tag = if debug then "nix-debug" else "nix";
   maxLayers = 120;
 
-  contents = [
-    redpandaDrv
-    cacert
-    tzdata
-  ]
-  ++ lib.optionals debug [
-    bash
-    coreutils
-  ];
+  contents =
+    [
+      redpandaDrv
+      cacert
+      tzdata
+    ]
+    ++ lib.optionals debug [
+      bash
+      coreutils
+    ];
 
   fakeRootCommands = ''
     mkdir -p ./var/lib/redpanda/data
@@ -30,10 +31,7 @@ dockerTools.streamLayeredImage {
   '';
 
   config = {
-    Entrypoint = [
-      "${redpandaDrv}/bin/redpanda"
-      "--redpanda-cfg=${redpandaDrv}/etc/redpanda/redpanda.yaml"
-    ];
+    Entrypoint = [ "${redpandaDrv}/bin/redpanda" ];
     Cmd = [
       "--default-log-level=info"
       "--smp=1"

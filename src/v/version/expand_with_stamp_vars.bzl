@@ -27,7 +27,7 @@ def _expand_with_stamp_vars(ctx):
             ctx.outputs.out.path,
         ],
         mnemonic = "ExpandStampVars",
-        use_default_shell_env = False,
+        use_default_shell_env = True,
     )
     return DefaultInfo(
         files = depset([ctx.outputs.out]),

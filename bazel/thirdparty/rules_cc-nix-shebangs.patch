@@ -1,0 +1,24 @@
+--- a/cc/private/toolchain/generate_system_module_map.sh
++++ b/cc/private/toolchain/generate_system_module_map.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#!/bin/sh
+ # Copyright 2020 The Bazel Authors. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+--- a/cc/private/toolchain/grep-includes.sh
++++ b/cc/private/toolchain/grep-includes.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#!/bin/sh
+ #
+ # Copyright 2018 The Bazel Authors. All rights reserved.
+ #
+--- a/cc/private/toolchain/link_dynamic_library.sh
++++ b/cc/private/toolchain/link_dynamic_library.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#!/bin/sh
+ #
+ # Copyright 2016 The Bazel Authors. All rights reserved.
+ #

@@ -16,9 +16,8 @@
   pythonSupport = false;
   icuSupport = false;
   enableHttp = false;
-}).overrideAttrs
-  {
-    # testModule tries to dlopen a shared plugin, which doesn't exist
-    # in a static-only build. The upstream tests pass with shared libs.
-    doCheck = false;
-  }
+}).overrideAttrs {
+  # testModule tries to dlopen a shared plugin, which doesn't exist
+  # in a static-only build. The upstream tests pass with shared libs.
+  doCheck = false;
+}

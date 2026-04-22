@@ -14,17 +14,7 @@
 # entries to support new scripting languages, add module-shebang
 # entries for modules that need shebangs fixed at extraction time.
 #
-{
-  lib,
-  bash,
-  perl,
-  python3,
-  glibc,
-  gcc-unwrapped,
-  zlib,
-  openssl,
-  curl,
-}:
+{ lib, bash, perl, python3, glibc, gcc-unwrapped, zlib, openssl, curl }:
 
 let
   nixInterp = "${glibc}/lib/ld-linux-x86-64.so.2";
@@ -60,10 +50,10 @@ in
   {
     type = "fix-shebangs";
     interpreters = {
-      bash = "${bash}/bin/bash";
-      sh = "${bash}/bin/bash";
-      perl = "${perl}/bin/perl";
-      python = "${python3}/bin/python3";
+      bash    = "${bash}/bin/bash";
+      sh      = "${bash}/bin/bash";
+      perl    = "${perl}/bin/perl";
+      python  = "${python3}/bin/python3";
       python3 = "${python3}/bin/python3";
     };
   }
@@ -85,7 +75,7 @@ in
     modules = [
       {
         module = "rules_foreign_cc";
-        interpreter = "bash"; # key into interpreters map above
+        interpreter = "bash";  # key into interpreters map above
         files = [
           "foreign_cc/private/framework/toolchains/linux_commands.bzl"
           "foreign_cc/private/framework/toolchains/macos_commands.bzl"

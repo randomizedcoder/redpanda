@@ -3,12 +3,7 @@
 # NIST FIPS certificate #4985 requires exactly OpenSSL 3.1.2.
 # This builds only the FIPS provider (fips.so + fipsmodule.cnf),
 # not the full OpenSSL library.
-{
-  stdenv,
-  fetchurl,
-  perl,
-  gnumake,
-}:
+{ stdenv, fetchurl, perl, gnumake, coreutils }:
 
 stdenv.mkDerivation rec {
   pname = "openssl-fips";
@@ -19,10 +14,7 @@ stdenv.mkDerivation rec {
     sha256 = "a0ce69b8b97ea6a35b96875235aa453b966ba3cba8af2de23657d8b6767d6539";
   };
 
-  nativeBuildInputs = [
-    perl
-    gnumake
-  ];
+  nativeBuildInputs = [ perl gnumake ];
 
   configurePhase = ''
     patchShebangs Configure

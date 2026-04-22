@@ -341,4 +341,5 @@ build:io_uring --//bazel:io_uring=True
 test --test_env=REDPANDA_RNG_SEEDING_MODE
 test --test_env=REDPANDA_DEBUG_TEST_HOOKS
 
+try-import %workspace%/.bazelrc.nix
 try-import %workspace%/user.bazelrc

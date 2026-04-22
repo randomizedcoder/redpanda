@@ -13,7 +13,7 @@
 { hwloc }:
 
 hwloc.overrideAttrs (old: {
-  configureFlags = (old.configureFlags or [ ]) ++ [
+  configureFlags = (old.configureFlags or []) ++ [
     "--disable-shared"
     "--enable-static"
     "--disable-libudev"
