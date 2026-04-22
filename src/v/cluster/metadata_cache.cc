@@ -16,7 +16,6 @@
 #include "cluster/topic_table.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "config/node_config.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -24,13 +23,8 @@
 #include "storage/disk.h"
 #include "utils/tristate.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/sharded.hh>
 
-#include <fmt/format.h>
-
-#include <algorithm>
-#include <iterator>
 #include <optional>
 
 namespace cluster {
@@ -47,7 +41,7 @@ metadata_cache::metadata_cache(
   , _leaders(leaders)
   , _health_monitor(health_monitor) {}
 
-std::vector<model::topic_namespace> metadata_cache::all_topics() const {
+chunked_vector<model::topic_namespace> metadata_cache::all_topics() const {
     return _topics_state.local().all_topics();
 }
 

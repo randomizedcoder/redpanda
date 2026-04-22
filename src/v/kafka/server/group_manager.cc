@@ -13,7 +13,6 @@
 #include "cluster/cluster_utils.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/logger.h"
-#include "cluster/metadata_cache.h"
 #include "cluster/offsets_snapshot.h"
 #include "cluster/partition.h"
 #include "cluster/partition_manager.h"
@@ -1055,10 +1054,11 @@ group_manager::do_bulk_write_offsets(group_offsets_snapshot snap, bool merge) {
             kafka_topics.emplace_back(std::move(kafka_t));
             co_await ss::maybe_yield();
         }
+        auto group_id = kafka_r.data.group_id;
         vlog(
           cg_klog.info,
           "Restoring group {} from snapshot on {}",
-          kafka_r.data.group_id,
+          group_id,
           offsets_ntp);
         auto stages = offset_commit(std::move(kafka_r));
         co_await std::move(stages.dispatched);
@@ -1072,7 +1072,7 @@ group_manager::do_bulk_write_offsets(group_offsets_snapshot snap, bool merge) {
                       "Error on {}/{} while restoring group {} on {}: {}",
                       kafka_t.name,
                       kafka_p.partition_index,
-                      kafka_r.data.group_id,
+                      group_id,
                       offsets_ntp,
                       kafka_p.error_code);
                     if (first_error != error_code::none) {

@@ -14,8 +14,6 @@
 #include <seastar/testing/thread_test_case.hh>
 
 #include <boost/test/tools/old/interface.hpp>
-
-#include <chrono>
 using namespace std::chrono_literals;
 
 constexpr size_t RATE = 25;
@@ -129,6 +127,22 @@ SEASTAR_THREAD_TEST_CASE(test_update_rate) {
     // consumed RATE_PART and upgraded rate to RATE_PART
     try_consume(throttler, RATE - RATE_PART);
     BOOST_REQUIRE(!throttler.try_throttle(1));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_update_rate_no_underflow) {
+    const size_t RATE = 100000;
+    token_bucket<ss::manual_clock> throttler(RATE, "test_update_rate");
+    throttler.try_throttle(RATE);
+
+    throttler.update_rate(10);
+
+    // Can't consume anything because the bucket was empty when the rate was
+    // updated. Need to wait for the next refill.
+    BOOST_REQUIRE(!throttler.try_throttle(1));
+
+    // Refill and consume.
+    ss::manual_clock::advance(ss::lowres_clock::duration(2s));
+    BOOST_REQUIRE(throttler.try_throttle(1));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_update_rate_burst) {

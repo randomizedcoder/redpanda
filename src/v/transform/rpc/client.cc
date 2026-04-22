@@ -38,17 +38,11 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/map_reduce.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/smp.hh>
-#include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
-#include <seastar/util/noncopyable_function.hh>
 
-#include <boost/fusion/sequence/intrinsic/back.hpp>
 #include <boost/outcome/basic_result.hpp>
 #include <boost/range/irange.hpp>
 
@@ -443,9 +437,9 @@ client::do_load_wasm_binary_once(
                       : do_remote_load_wasm_binary(*leader, offset, timeout));
     vlog(
       log.trace,
-      "do_load_wasm_binary_once_response(node={}): {}",
+      "do_load_wasm_binary_once_response(node={}): has_value={}",
       *leader,
-      reply);
+      reply.has_value());
     co_return reply;
 }
 
@@ -1022,12 +1016,13 @@ ss::future<cluster::errc> client::do_remote_delete_committed_offsets(
   model::partition_id partition,
   absl::btree_set<model::transform_id> ids,
   model::timeout_clock::duration timeout) {
+    auto ids_size = ids.size();
     vlog(
       log.trace,
       "delete_committed_offsets(node={}): {} {}",
       node,
       partition,
-      ids.size());
+      ids_size);
     auto resp = co_await _connections->local()
                   .with_node_client<impl::transform_rpc_client_protocol>(
                     _self,
@@ -1047,7 +1042,7 @@ ss::future<cluster::errc> client::do_remote_delete_committed_offsets(
       "delete_committed_offsets(node={}): {} {}",
       node,
       resp,
-      ids.size());
+      ids_size);
     if (resp.has_error()) {
         co_return map_errc(resp.error());
     }

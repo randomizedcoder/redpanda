@@ -30,7 +30,6 @@
 #include "raft/state_machine_base.h"
 #include "ssx/future-util.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sstring.hh>
@@ -1755,11 +1754,12 @@ void rm_stm::apply_fence(model::producer_identity pid, model::record_batch b) {
     }
     auto producer = result.value().first;
     auto header = b.header();
+    auto base_offset = b.base_offset();
     auto batch_data = read_fence_batch(std::move(b));
     vlog(
       _ctx_log.trace,
       "applying fence batch, offset: {}, pid: {}",
-      b.base_offset(),
+      base_offset,
       batch_data.bid.pid);
     producer->apply_transaction_begin(header, batch_data);
     _highest_producer_id = std::max(
@@ -2302,10 +2302,38 @@ ss::future<> rm_stm::do_remove_persistent_state() {
 
 ss::future<iobuf>
 rm_stm::take_raft_snapshot(model::offset last_included_offset) {
-    // this is always called under apply lock, so we can be sure
-    // that no concurrent modifications to the state are happening via apply
-    // path.
-    auto units = co_await _state_lock.hold_write_lock();
+    // This method always runs under the manager's apply mutex, so no
+    // concurrent modifications to the state are happening via the apply path.
+    auto holder = _gate.hold();
+    // Note on locking:
+    // Holding _state_lock in write mode here causes a lock-inversion deadlock
+    // with concurrent begin_tx/commit_tx/abort_tx: those paths hold the read
+    // lock and then implicitly wait for apply progress in wait_no_throw/sync,
+    // which cannot advance while this path holds the apply mutex. The wait is
+    // time-bounded by _sync_timeout, but it is still practically a deadlock.
+    //
+    // Dropping the write lock is safe here for the following reasons:
+    //  - The loop below is fully synchronous, so it is atomic
+    //    with respect to every other fiber on this shard.
+    //  - This method always runs under the manager's apply mutex, so do_apply
+    //    and its producer mutations (maybe_create_producer, apply_fence,
+    //    apply_control, apply_data) cannot run in parallel.
+    //
+    // The one operation that could leave _producers in an intermediate state
+    // is reset_producers, which yields mid-reset. All three call sites are
+    // excluded:
+    //  - stop() is blocked by the _gate.hold() above.
+    //  - apply_raft_snapshot() runs under the same apply mutex as we do.
+    //  - apply_local_snapshot() only runs during persisted_stm::start(),
+    //    before the manager's apply loop starts dispatching to this STM.
+    //
+    // Other _producers mutators (maybe_create_producer invoked from
+    // begin_tx/commit_tx/abort_tx under _state_lock.read, and
+    // cleanup_evicted_producers) execute in synchronous blocks, so they
+    // cannot interleave with the synchronous loop below on a single shard.
+    //
+    // TODO: codify these invariants in types/asserts so this comment stops
+    // being the load-bearing proof of correctness.
     tx::raft_snapshot snapshot;
     auto kafka_offset = from_log_offset(last_included_offset);
     for (const auto& [_, state] : _producers) {

@@ -8,8 +8,9 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
+#include "cloud_io/cache_service.h"
 #include "cloud_io/remote.h"
-#include "cloud_io/tests/s3_imposter.h"
+#include "cloud_io/tests/db_s3_imposter_fixture.h"
 #include "cloud_io/tests/scoped_remote.h"
 #include "cloud_storage_clients/types.h"
 #include "cloud_topics/level_one/metastore/domain_uuid.h"
@@ -18,16 +19,14 @@
 #include "cloud_topics/level_one/metastore/lsm/write_batch_row.h"
 #include "config/node_config.h"
 #include "gmock/gmock.h"
-#include "lsm/io/cloud_persistence.h"
+#include "lsm/io/cloud_cache_persistence.h"
 #include "lsm/io/persistence.h"
 #include "model/fundamental.h"
 #include "raft/tests/raft_fixture.h"
-#include "random/generators.h"
+#include "storage/disk.h"
 #include "test_utils/async.h"
 #include "test_utils/scoped_config.h"
 #include "test_utils/tmp_dir.h"
-
-#include <seastar/util/defer.hh>
 
 #include <gtest/gtest.h>
 
@@ -68,18 +67,18 @@ struct replicated_db_node {
       ss::shared_ptr<stm> s,
       cloud_io::remote* remote,
       const cloud_storage_clients::bucket_name& bucket,
-      const ss::sstring& staging_path)
+      cloud_io::cache* cache)
       : stm_ptr(std::move(s))
       , remote(remote)
       , bucket(bucket)
-      , staging_directory(staging_path.data()) {}
+      , cache(cache) {}
 
     ss::future<std::expected<replicated_database*, replicated_database::error>>
     open_db() {
         auto ret = co_await replicated_database::open(
           stm_ptr->raft()->confirmed_term(),
           stm_ptr.get(),
-          staging_directory.get_path(),
+          cache,
           remote,
           bucket,
           as,
@@ -107,7 +106,7 @@ struct replicated_db_node {
     ss::shared_ptr<stm> stm_ptr;
     cloud_io::remote* remote;
     const cloud_storage_clients::bucket_name& bucket;
-    temporary_dir staging_directory;
+    cloud_io::cache* cache;
     ss::abort_source as;
     std::list<std::unique_ptr<replicated_database>> dbs;
 };
@@ -116,7 +115,7 @@ struct replicated_db_node {
 
 class ReplicatedDatabaseTest
   : public raft::raft_fixture
-  , public s3_imposter_fixture {
+  , public db_s3_imposter_fixture {
 public:
     static constexpr auto num_nodes = 3;
     using opt_ref = std::optional<std::reference_wrapper<replicated_db_node>>;
@@ -128,8 +127,35 @@ public:
         cfg.get("raft_heartbeat_interval_ms").set_value(50ms);
         cfg.get("raft_heartbeat_timeout_ms").set_value(500ms);
 
-        set_expectations_and_listen({});
+        db_s3_imposter_fixture::start().get();
         sr = cloud_io::scoped_remote::create(10, conf);
+
+        // Set up cloud cache.
+        cache_tmpdir = std::make_unique<temporary_dir>("replicated_db_cache");
+        auto cache_dir = cache_tmpdir->get_path() / "cache";
+        cloud_io::cache::initialize(cache_dir).get();
+        test_cache
+          .start(
+            cache_dir,
+            30_GiB,
+            config::mock_binding<double>(0.0),
+            config::mock_binding<uint64_t>(100_MiB),
+            config::mock_binding<std::optional<double>>(std::nullopt),
+            config::mock_binding<uint32_t>(100000),
+            config::mock_binding<uint16_t>(3))
+          .get();
+        test_cache.invoke_on_all([](cloud_io::cache& c) { return c.start(); })
+          .get();
+        test_cache
+          .invoke_on(
+            ss::shard_id{0},
+            [](cloud_io::cache& c) {
+                c.notify_disk_status(
+                  100ULL * 1024 * 1024 * 1024,
+                  50ULL * 1024 * 1024 * 1024,
+                  storage::disk_space_alert::ok);
+            })
+          .get();
 
         raft::raft_fixture::SetUpAsync().get();
 
@@ -148,10 +174,11 @@ public:
 
             node->start(std::move(builder)).get();
 
-            // Create staging directory for this node.
-            auto staging_path = fmt::format("replicated_db_test_{}", id());
             db_nodes.at(id()) = std::make_unique<replicated_db_node>(
-              std::move(s), &sr->remote.local(), bucket_name, staging_path);
+              std::move(s),
+              &sr->remote.local(),
+              bucket_name,
+              &test_cache.local());
         }
         opt_ref leader;
         ASSERT_NO_FATAL_FAILURE(wait_for_leader(leader).get());
@@ -169,7 +196,10 @@ public:
             }
         }
         raft::raft_fixture::TearDownAsync().get();
+        test_cache.stop().get();
         sr.reset();
+        cache_tmpdir.reset();
+        db_s3_imposter_fixture::stop().get();
     }
 
     // Returns the node on the current leader.
@@ -214,17 +244,15 @@ public:
       chunked_vector<volatile_row> rows) {
         auto domain_prefix = cloud_storage_clients::object_key{
           domain_cloud_prefix(domain_uuid)};
-        temporary_dir tmp("lsm_staging_scratch");
         auto cloud_db
           = lsm::database::open(
               {.database_epoch = db_epoch},
               lsm::io::persistence{
-                .data = lsm::io::open_cloud_data_persistence(
-                          tmp.get_path(),
+                .data = lsm::io::open_cloud_cache_data_persistence(
+                          &test_cache.local(),
                           &sr->remote.local(),
                           bucket_name,
-                          domain_prefix,
-                          ss::sstring(domain_uuid()))
+                          domain_prefix)
                           .get(),
                 .metadata = lsm::io::open_cloud_metadata_persistence(
                               &sr->remote.local(), bucket_name, domain_prefix)
@@ -259,6 +287,8 @@ public:
     std::array<std::unique_ptr<replicated_db_node>, num_nodes> db_nodes;
     scoped_config cfg;
     std::unique_ptr<cloud_io::scoped_remote> sr;
+    std::unique_ptr<temporary_dir> cache_tmpdir;
+    ss::sharded<cloud_io::cache> test_cache;
 
     // Initial leader and a database opened on that leader.
     replicated_db_node* initial_leader;

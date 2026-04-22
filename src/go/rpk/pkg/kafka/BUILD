@@ -27,9 +27,15 @@ go_library(
 
 go_test(
     name = "kafka_test",
-    srcs = ["uds_dialer_test.go"],
+    size = "small",
+    srcs = [
+        "client_franz_test.go",
+        "uds_dialer_test.go",
+    ],
     embed = [":kafka"],
     deps = [
+        "//src/go/rpk/pkg/config",
+        "@com_github_spf13_afero//:afero",
         "@com_github_stretchr_testify//require",
     ],
 )

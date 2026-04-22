@@ -21,7 +21,7 @@ bazel_dep(name = "gazelle", version = "0.45.0")
 bazel_dep(name = "abseil-cpp", version = "20250814.0")
 bazel_dep(name = "bazel_skylib", version = "1.8.1")
 bazel_dep(name = "crc32c", version = "1.1.0")
-bazel_dep(name = "fmt", version = "9.1.0")
+bazel_dep(name = "fmt", version = "12.1.0")
 bazel_dep(name = "googletest", version = "1.17.0")
 bazel_dep(name = "lexy", version = "2025.05.0")
 bazel_dep(name = "liburing", version = "2.14")
@@ -33,6 +33,7 @@ single_version_override(
     ],
 )
 
+bazel_dep(name = "libxml2", version = "2.15.2")
 bazel_dep(name = "lz4", version = "1.9.4")
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "protobuf", version = "33.5")
@@ -45,7 +46,7 @@ single_version_override(
 )
 
 bazel_dep(name = "re2", version = "2024-07-02.bcr.1")
-bazel_dep(name = "rules_cc", version = "0.2.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
 
 cc_configure = use_extension("@rules_cc//cc:extensions.bzl", "cc_configure_extension")
 use_repo(cc_configure, "local_config_cc_toolchains")
@@ -109,7 +110,6 @@ use_repo(non_module_dependencies, "jsoncons")
 use_repo(non_module_dependencies, "krb5")
 use_repo(non_module_dependencies, "libpciaccess")
 use_repo(non_module_dependencies, "libprotobuf_mutator")
-use_repo(non_module_dependencies, "libxml2")
 use_repo(non_module_dependencies, "lksctp")
 use_repo(non_module_dependencies, "openssl")
 use_repo(non_module_dependencies, "openssl-fips")
@@ -491,4 +491,21 @@ http_archive(
     sha256 = "e083cec08b4e173df23e0b07beda5509eddebc1f11d9adc71a8a39d0a229da97",
     strip_prefix = "antithesis-sdk-cpp-0.4.7",
     urls = ["https://github.com/antithesishq/antithesis-sdk-cpp/archive/refs/tags/0.4.7.tar.gz"],
+)
+
+# JSON parser conformance corpus used by
+# //src/v/serde/json/tests:json_test_suite_test. MIT-licensed; see
+# https://github.com/nst/JSONTestSuite.
+http_archive(
+    name = "nst_json_test_suite",
+    build_file_content = """
+filegroup(
+    name = "test_parsing",
+    srcs = glob(["test_parsing/*.json"]),
+    visibility = ["//visibility:public"],
+)
+""",
+    integrity = "sha256-Mqsvs3zCZnnb2RZNu3BTvO8QE0ZD1TywzvRd52gNzcw=",
+    strip_prefix = "JSONTestSuite-1ef36fa01286573e846ac449e8683f8833c5b26a",
+    urls = ["https://github.com/nst/JSONTestSuite/archive/1ef36fa01286573e846ac449e8683f8833c5b26a.tar.gz"],
 )

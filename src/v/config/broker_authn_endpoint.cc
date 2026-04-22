@@ -11,7 +11,6 @@
 
 #include "config/configuration.h"
 #include "config/node_config.h"
-#include "model/metadata.h"
 #include "strings/string_switch.h"
 
 #include <algorithm>
@@ -30,6 +29,9 @@ std::string_view to_string_view(broker_authn_method m) {
         return "mtls_identity";
     }
 }
+fmt::iterator format_to(broker_authn_method m, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(m));
+}
 
 template<>
 std::optional<broker_authn_method>
@@ -41,19 +43,22 @@ from_string_view<broker_authn_method>(std::string_view sv) {
       .default_match(broker_authn_method::none);
 }
 
-std::ostream& operator<<(std::ostream& os, const broker_authn_endpoint& ep) {
-    if (ep.unix_path) {
-        fmt::print(
-          os,
+fmt::iterator broker_authn_endpoint::format_to(fmt::iterator it) const {
+    if (unix_path) {
+        return fmt::format_to(
+          it,
           "{{{}:unix:{}:mode={:#o}:{}}}",
-          ep.name,
-          *ep.unix_path,
-          ep.unix_socket_mode.value_or(0660),
-          ep.authn_method);
-    } else {
-        fmt::print(os, "{{{}:{}:{}}}", ep.name, ep.address, ep.authn_method);
+          name,
+          *unix_path,
+          unix_socket_mode.value_or(0660),
+          authn_method ? to_string_view(*authn_method) : "none");
     }
-    return os;
+    return fmt::format_to(
+      it,
+      "{{{}:{}:{}}}",
+      name,
+      address,
+      authn_method ? to_string_view(*authn_method) : "none");
 }
 
 std::optional<ss::sstring>

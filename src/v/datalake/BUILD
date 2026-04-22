@@ -10,7 +10,6 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        "//src/v/base",
         "//src/v/features",
         "//src/v/iceberg:compatibility",
         "//src/v/iceberg:compatibility_types",
@@ -20,6 +19,7 @@ redpanda_cc_library(
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/base",
         "//src/v/iceberg:catalog",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:table_identifier",
@@ -62,13 +62,13 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        "//src/v/base",
         "//src/v/iceberg:struct_accessor",
     ],
     visibility = [":__subpackages__"],
     deps = [
         ":partition_key_path",
         ":writer",
+        "//src/v/base",
         "//src/v/container:chunked_hash_map",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:partition_key",
@@ -238,24 +238,27 @@ redpanda_cc_library(
         "table_definition.cc",
     ],
     hdrs = [
+        "schema_descriptor.h",
         "table_definition.h",
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/iceberg:datatypes",
         "//src/v/iceberg:schema",
+        "//src/v/iceberg:values",
+        "//src/v/model",
+        "@seastar",
     ],
 )
 
 redpanda_cc_library(
     name = "base_types",
-    srcs = [
-        "base_types.cc",
-    ],
     hdrs = [
         "base_types.h",
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/base",
         "//src/v/utils:named_type",
         "@fmt",
     ],
@@ -293,13 +296,14 @@ redpanda_cc_library(
     hdrs = ["schema_registry.h"],
     implementation_deps = [
         ":logger",
-        "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/base",
         "//src/v/pandaproxy/schema_registry:types",
+        "@fmt",
     ],
 )
 
@@ -455,15 +459,13 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "table_creator",
-    srcs = [
-        "table_creator.cc",
-    ],
     hdrs = [
         "table_creator.h",
     ],
     visibility = [":__subpackages__"],
     deps = [
         ":schema_identifier",
+        "//src/v/base",
     ],
 )
 

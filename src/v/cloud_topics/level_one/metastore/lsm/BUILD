@@ -18,6 +18,7 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//proto/redpanda/core/admin/internal/cloud_topics/v1:metastore_redpanda_proto",
+        "//src/v/base",
         "//src/v/utils:detailed_error",
         "@fmt",
         "@seastar",
@@ -177,6 +178,7 @@ redpanda_cc_library(
     deps = [
         ":lsm_update",
         ":state",
+        "//src/v/base",
         "//src/v/cluster:state_machine_registry",
         "//src/v/config",
         "//src/v/model",
@@ -223,7 +225,7 @@ redpanda_cc_library(
         "//src/v/cloud_topics:logger",
         "//src/v/cloud_topics/level_one/metastore:domain_uuid",
         "//src/v/config",
-        "//src/v/lsm/io:cloud_persistence",
+        "//src/v/lsm/io:cloud_cache_persistence",
         "//src/v/model:batch_builder",
         "//src/v/serde",
         "//src/v/ssx:clock",
@@ -234,6 +236,7 @@ redpanda_cc_library(
         ":lsm_update",
         ":stm",
         ":write_batch_row",
+        "//src/v/cloud_io:cache",
         "//src/v/cloud_io:remote",
         "//src/v/cloud_storage_clients",
         "//src/v/container:chunked_vector",
@@ -257,7 +260,7 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         "//src/v/lsm",
-        "//src/v/lsm/io:cloud_persistence",
+        "//src/v/lsm/io:cloud_cache_persistence",
         "//src/v/model:batch_builder",
         "//src/v/serde",
     ],

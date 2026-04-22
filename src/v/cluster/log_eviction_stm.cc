@@ -9,6 +9,7 @@
 
 #include "cluster/log_eviction_stm.h"
 
+#include "base/format_to.h"
 #include "cluster/errc.h"
 #include "cluster/logger.h"
 #include "cluster/prefix_truncate_record.h"
@@ -16,9 +17,6 @@
 #include "raft/consensus.h"
 #include "serde/envelope.h"
 #include "ssx/future-util.h"
-
-#include <seastar/core/future-util.hh>
-#include <seastar/core/sleep.hh>
 
 namespace cluster {
 
@@ -29,10 +27,9 @@ struct snapshot_data
 
     auto serde_fields() { return std::tie(effective_start_offset); }
 
-    friend std::ostream& operator<<(std::ostream& os, const snapshot_data& d) {
-        fmt::print(
-          os, "{{ effective_start_offset: {} }}", d.effective_start_offset);
-        return os;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, "{{effective_start_offset: {}}}", effective_start_offset);
     }
 };
 
@@ -224,8 +221,8 @@ ss::future<log_eviction_stm::offset_result> log_eviction_stm::truncate(
       "Replicating prefix_truncate command, redpanda start offset: {}, kafka "
       "start offset: {} "
       "current last snapshot offset: {}, current last visible offset: {}",
-      val.rp_start_offset,
-      val.kafka_start_offset,
+      rp_start_offset,
+      kafka_start_offset,
       _raft->last_snapshot_index(),
       _raft->last_visible_index());
 

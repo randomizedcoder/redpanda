@@ -8,18 +8,16 @@
 // by the Apache License, Version 2.0
 #include "absl/container/flat_hash_set.h"
 #include "config/mock_property.h"
+#include "kafka/protocol/types.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "random/generators.h"
 #include "security/acl.h"
 #include "security/authorizer.h"
 #include "security/role.h"
 #include "security/role_store.h"
-#include "utils/base64.h"
 
 #include <seastar/util/defer.hh>
 
-#include <boost/algorithm/string.hpp>
-#include <fmt/ostream.h>
 #include <gtest/gtest.h>
 
 namespace security {

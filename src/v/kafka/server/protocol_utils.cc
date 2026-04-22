@@ -10,14 +10,10 @@
 #include "kafka/server/protocol_utils.h"
 
 #include "bytes/iobuf.h"
-#include "bytes/iobuf_parser.h"
 #include "kafka/protocol/flex_versions.h"
 #include "strings/utf8.h"
 
 #include <seastar/core/temporary_buffer.hh>
-
-#include <stdexcept>
-#include <vector>
 
 namespace kafka {
 
@@ -98,7 +94,7 @@ parse_v1_header(ss::input_stream<char>& src) {
 }
 
 ss::future<std::optional<request_header>>
-parse_header(ss::input_stream<char>& src) {
+parse_header(ss::input_stream<char>& src, size_t request_size) {
     auto header = co_await parse_v1_header(src);
     if (header) {
         /// Conditionally handle v1 (flex) header
@@ -108,7 +104,7 @@ parse_header(ss::input_stream<char>& src) {
             /// reaches the request router
         } else if (
           flex_versions::is_flexible_request(header->key, header->version)) {
-            auto [tags, bytes_read] = co_await parse_tags(src);
+            auto [tags, bytes_read] = co_await parse_tags(src, request_size);
             header->tags = std::move(tags);
             header->tags_size_bytes = bytes_read;
         }

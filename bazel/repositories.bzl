@@ -25,7 +25,10 @@ def data_dependency():
         sha256 = "791d9f163f458d0ba4c94251f58ef5af9157952a9569ce0968d89aeb585af34f",
         strip_prefix = "avro-46fe1e36f680d75219cba46368de38321f1810ed",
         url = "https://github.com/redpanda-data/avro/archive/46fe1e36f680d75219cba46368de38321f1810ed.tar.gz",
-        patches = ["//bazel/thirdparty:avro-snappy-includes.patch"],
+        patches = [
+            "//bazel/thirdparty:avro-snappy-includes.patch",
+            "//bazel/thirdparty:avro-fmt-const.patch",
+        ],
         patch_args = ["-p1"],
     )
 
@@ -95,14 +98,6 @@ def data_dependency():
         sha256 = "0847a2ee65552a92643131e934b50164e8b79fadc7be24b180a1c8d6dbb05952",
         strip_prefix = "libprotobuf-mutator-dc4ced337a9fb4047e2dc727268fbac55ca82f73",
         url = "https://github.com/google/libprotobuf-mutator/archive/dc4ced337a9fb4047e2dc727268fbac55ca82f73.zip",
-    )
-
-    http_archive(
-        name = "libxml2",
-        build_file = "//bazel/thirdparty:libxml2.BUILD",
-        sha256 = "2769234c4fe2fab9b0b043e891c2af0f1ae51c8d4b94799472981e676ed8009e",
-        strip_prefix = "libxml2-2.15.2",
-        url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/libxml2-v2.15.2.tar.gz",
     )
 
     http_archive(

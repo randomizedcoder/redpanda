@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "config/convert.h"
 #include "config/endpoint_tls_config.h"
 #include "config/from_string_view.h"
@@ -36,6 +37,7 @@ enum class broker_authn_method {
 };
 
 std::string_view to_string_view(broker_authn_method m);
+fmt::iterator format_to(broker_authn_method m, fmt::iterator);
 
 template<>
 std::optional<broker_authn_method>
@@ -60,8 +62,7 @@ struct broker_authn_endpoint {
     operator==(const broker_authn_endpoint&, const broker_authn_endpoint&)
       = default;
 
-    friend std::ostream&
-    operator<<(std::ostream& os, const broker_authn_endpoint& ep);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /// Maximum length of a Unix domain socket path (sockaddr_un::sun_path is 108
