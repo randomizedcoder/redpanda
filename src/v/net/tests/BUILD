@@ -1,6 +1,19 @@
 load("//bazel:build.bzl", "redpanda_cc_library")
 load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest")
 
+cc_binary(
+    name = "uds_sustained_bench",
+    testonly = True,
+    srcs = ["uds_sustained_bench.cc"],
+    deps = [
+        ":uds_bench_common",
+        "//src/v/base",
+        "@boost//:program_options",
+        "@fmt",
+        "@seastar",
+    ],
+)
+
 redpanda_cc_btest(
     name = "connection_rate_test",
     timeout = "short",
