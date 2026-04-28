@@ -1,4 +1,4 @@
-{ pkgs, mkApp }:
+{ pkgs, mkApp, ... }:
 
 let
   lib = pkgs.lib;

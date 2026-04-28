@@ -16,6 +16,12 @@ let
   singleNode = import ./single-node.nix { inherit pkgs redpandaDrv rpkDrv; };
   lifecycle = import ./lifecycle.nix { inherit pkgs redpandaDrv rpkDrv; };
   uds = import ./uds.nix { inherit pkgs redpandaDrv rpkDrv; };
+  udsPerf = import ./uds-perf.nix { inherit pkgs redpandaDrv rpkDrv; };
+  udsPerfQuick = import ./uds-perf.nix {
+    inherit pkgs redpandaDrv rpkDrv;
+    duration = 10;
+    warmup = 5;
+  };
   containers = import ./containers.nix { inherit pkgs mkApp; };
 
   # Run-all: smoke + single-node + lifecycle in sequence.
@@ -112,6 +118,8 @@ in
     test-single-node = singleNode;
     test-lifecycle = lifecycle;
     test-uds = uds;
+    bench-uds-perf = udsPerf;
+    bench-uds-perf-quick = udsPerfQuick;
     test-all = testAll;
   };
 

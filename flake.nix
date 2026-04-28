@@ -226,6 +226,8 @@
             test-single-node-cached = testsCached.packages.test-single-node;
             test-lifecycle-cached = testsCached.packages.test-lifecycle;
             test-uds-cached = testsCached.packages.test-uds;
+            bench-uds-perf-cached = testsCached.packages.bench-uds-perf;
+            bench-uds-perf-quick-cached = testsCached.packages.bench-uds-perf-quick;
             inherit (tests.packages) test-all;
             test-all-cached = testsCached.packages.test-all;
           };

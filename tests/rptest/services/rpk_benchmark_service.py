@@ -58,6 +58,7 @@ class RpkBenchmarkService(Service):
         warmup_s: int = 5,
         duration_s: int = 30,
         wait_for_stable_leadership: bool = True,
+        brokers_override: str | None = None,
     ):
         super().__init__(context, num_nodes=1)
         if mode != "produce":
@@ -72,11 +73,13 @@ class RpkBenchmarkService(Service):
         self._warmup_s = warmup_s
         self._duration_s = duration_s
         self._wait_for_stable_leadership = wait_for_stable_leadership
+        self._brokers_override = brokers_override
         self._pids: dict[str, int] = {}
 
     def _build_cmd(self) -> str:
+        brokers = self._brokers_override or self._redpanda.brokers()
         return (
-            f"{self._redpanda.find_binary('rpk')} -X brokers={self._redpanda.brokers()} benchmark {self._mode} "
+            f"{self._redpanda.find_binary('rpk')} -X brokers={brokers} benchmark {self._mode} "
             f"--topic {self._topic} --partitions {self._partitions} --replicas {self._replicas} "
             f"--clients {self._clients} --record-size {self._record_size} "
             f"--warmup {self._warmup_s} --duration {self._duration_s} "

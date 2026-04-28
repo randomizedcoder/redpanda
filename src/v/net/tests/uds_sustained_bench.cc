@@ -186,8 +186,10 @@ ss::future<cell_result> run_cell_rr(bench_cell cell) {
     auto echo = uds_bench::run_echo(server_in, server_out);
 
     ss::sstring filler(cell.message_size, 'x');
-    const double bytes_per_sec
-      = cell.target_rate_bps > 0 ? static_cast<double>(cell.target_rate_bps) / 8.0 : 0;
+    const double bytes_per_sec = cell.target_rate_bps > 0
+                                   ? static_cast<double>(cell.target_rate_bps)
+                                       / 8.0
+                                   : 0;
 
     // Warmup phase
     auto warmup_end = bench_clock::now()
@@ -196,20 +198,24 @@ ss::future<cell_result> run_cell_rr(bench_cell cell) {
     while (bench_clock::now() < warmup_end) {
         co_await client_out.write(filler.data(), cell.message_size);
         co_await client_out.flush();
-        auto resp = co_await client_in.read_exactly(cell.message_size);
+        co_await client_in.read_exactly(cell.message_size);
         warmup_bytes += cell.message_size;
 
         // Rate limit during warmup too
         if (bytes_per_sec > 0) {
-            auto elapsed = std::chrono::duration<double>(
-                             bench_clock::now() - (warmup_end - std::chrono::seconds(cell.warmup_sec)))
-                             .count();
+            auto elapsed
+              = std::chrono::duration<double>(
+                  bench_clock::now()
+                  - (warmup_end - std::chrono::seconds(cell.warmup_sec)))
+                  .count();
             double allowed = elapsed * bytes_per_sec;
             if (static_cast<double>(warmup_bytes) >= allowed) {
-                double wait = (static_cast<double>(warmup_bytes) - allowed) / bytes_per_sec;
+                double wait = (static_cast<double>(warmup_bytes) - allowed)
+                              / bytes_per_sec;
                 if (wait > 0.0001) {
                     co_await ss::sleep(
-                      std::chrono::microseconds(static_cast<int64_t>(wait * 1e6)));
+                      std::chrono::microseconds(
+                        static_cast<int64_t>(wait * 1e6)));
                 }
             }
         }
@@ -244,8 +250,9 @@ ss::future<cell_result> run_cell_rr(bench_cell cell) {
                 double wait = (static_cast<double>(total_bytes) - allowed)
                               / bytes_per_sec;
                 if (wait > 0.0001) {
-                    co_await ss::sleep(std::chrono::microseconds(
-                      static_cast<int64_t>(wait * 1e6)));
+                    co_await ss::sleep(
+                      std::chrono::microseconds(
+                        static_cast<int64_t>(wait * 1e6)));
                 }
                 continue;
             }
@@ -254,7 +261,7 @@ ss::future<cell_result> run_cell_rr(bench_cell cell) {
         auto msg_start = bench_clock::now();
         co_await client_out.write(filler.data(), cell.message_size);
         co_await client_out.flush();
-        auto resp = co_await client_in.read_exactly(cell.message_size);
+        co_await client_in.read_exactly(cell.message_size);
         auto msg_end = bench_clock::now();
 
         latencies_us.push_back(
@@ -276,8 +283,7 @@ ss::future<cell_result> run_cell_rr(bench_cell cell) {
     co_await server_in.close();
     pair.listener.abort_accept();
 
-    double elapsed
-      = std::chrono::duration<double>(end - start).count();
+    double elapsed = std::chrono::duration<double>(end - start).count();
     std::sort(latencies_us.begin(), latencies_us.end());
 
     cell_result result;
@@ -285,12 +291,12 @@ ss::future<cell_result> run_cell_rr(bench_cell cell) {
     result.messages_sent = total_msgs;
     result.bytes_sent = total_bytes;
     result.elapsed_sec = elapsed;
-    result.achieved_mbps = elapsed > 0
-                             ? static_cast<double>(total_bytes) / (1024.0 * 1024.0 * elapsed)
-                             : 0;
-    result.achieved_mbits = elapsed > 0
-                              ? static_cast<double>(total_bytes) * 8.0 / (1e6 * elapsed)
-                              : 0;
+    result.achieved_mbps = elapsed > 0 ? static_cast<double>(total_bytes)
+                                           / (1024.0 * 1024.0 * elapsed)
+                                       : 0;
+    result.achieved_mbits = elapsed > 0 ? static_cast<double>(total_bytes) * 8.0
+                                            / (1e6 * elapsed)
+                                        : 0;
     result.cpu_delta = r1 - r0;
     result.lat_p50_us = percentile(latencies_us, 0.50);
     result.lat_p99_us = percentile(latencies_us, 0.99);
@@ -321,8 +327,10 @@ ss::future<cell_result> run_cell_uni(bench_cell cell) {
     auto drain = drain_stream(server_in);
 
     ss::sstring filler(cell.message_size, 'x');
-    const double bytes_per_sec
-      = cell.target_rate_bps > 0 ? static_cast<double>(cell.target_rate_bps) / 8.0 : 0;
+    const double bytes_per_sec = cell.target_rate_bps > 0
+                                   ? static_cast<double>(cell.target_rate_bps)
+                                       / 8.0
+                                   : 0;
 
     // Warmup
     auto warmup_start = bench_clock::now();
@@ -340,10 +348,12 @@ ss::future<cell_result> run_cell_uni(bench_cell cell) {
                              .count();
             double allowed = elapsed * bytes_per_sec;
             if (static_cast<double>(warmup_bytes) >= allowed) {
-                double wait = (static_cast<double>(warmup_bytes) - allowed) / bytes_per_sec;
+                double wait = (static_cast<double>(warmup_bytes) - allowed)
+                              / bytes_per_sec;
                 if (wait > 0.0001) {
-                    co_await ss::sleep(std::chrono::microseconds(
-                      static_cast<int64_t>(wait * 1e6)));
+                    co_await ss::sleep(
+                      std::chrono::microseconds(
+                        static_cast<int64_t>(wait * 1e6)));
                 }
             }
         }
@@ -367,8 +377,9 @@ ss::future<cell_result> run_cell_uni(bench_cell cell) {
                 double wait = (static_cast<double>(total_bytes) - allowed)
                               / bytes_per_sec;
                 if (wait > 0.0001) {
-                    co_await ss::sleep(std::chrono::microseconds(
-                      static_cast<int64_t>(wait * 1e6)));
+                    co_await ss::sleep(
+                      std::chrono::microseconds(
+                        static_cast<int64_t>(wait * 1e6)));
                 }
                 continue;
             }
@@ -401,12 +412,12 @@ ss::future<cell_result> run_cell_uni(bench_cell cell) {
     result.messages_sent = total_msgs;
     result.bytes_sent = total_bytes;
     result.elapsed_sec = elapsed;
-    result.achieved_mbps = elapsed > 0
-                             ? static_cast<double>(total_bytes) / (1024.0 * 1024.0 * elapsed)
-                             : 0;
-    result.achieved_mbits = elapsed > 0
-                              ? static_cast<double>(total_bytes) * 8.0 / (1e6 * elapsed)
-                              : 0;
+    result.achieved_mbps = elapsed > 0 ? static_cast<double>(total_bytes)
+                                           / (1024.0 * 1024.0 * elapsed)
+                                       : 0;
+    result.achieved_mbits = elapsed > 0 ? static_cast<double>(total_bytes) * 8.0
+                                            / (1e6 * elapsed)
+                                        : 0;
     result.cpu_delta = r1 - r0;
     co_return result;
 }
@@ -454,10 +465,10 @@ run_cell_concurrent(bench_cell cell, uint32_t concurrency) {
     }
 
     ss::sstring filler(cell.message_size, 'x');
-    const double bytes_per_sec
-      = cell.target_rate_bps > 0
-          ? static_cast<double>(cell.target_rate_bps) / 8.0
-          : 0;
+    const double bytes_per_sec = cell.target_rate_bps > 0
+                                   ? static_cast<double>(cell.target_rate_bps)
+                                       / 8.0
+                                   : 0;
 
     // Warmup
     auto warmup_end = bench_clock::now()
@@ -466,8 +477,7 @@ run_cell_concurrent(bench_cell cell, uint32_t concurrency) {
         for (auto& cs : conns) {
             co_await cs.client_out.write(filler.data(), cell.message_size);
             co_await cs.client_out.flush();
-            auto resp = co_await cs.client_in.read_exactly(
-              cell.message_size);
+            co_await cs.client_in.read_exactly(cell.message_size);
         }
     }
 
@@ -500,14 +510,14 @@ run_cell_concurrent(bench_cell cell, uint32_t concurrency) {
             co_await conns[c].client_out.write(
               filler.data(), cell.message_size);
             co_await conns[c].client_out.flush();
-            auto resp = co_await conns[c].client_in.read_exactly(
-              cell.message_size);
+            co_await conns[c].client_in.read_exactly(cell.message_size);
             auto msg_end = bench_clock::now();
 
-            all_latencies.push_back(static_cast<uint64_t>(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                msg_end - msg_start)
-                .count()));
+            all_latencies.push_back(
+              static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                  msg_end - msg_start)
+                  .count()));
             per_conn_bytes[c] += cell.message_size;
             total_bytes += cell.message_size;
             total_msgs++;
@@ -516,9 +526,9 @@ run_cell_concurrent(bench_cell cell, uint32_t concurrency) {
         // If all connections are ahead of schedule, sleep briefly
         if (bytes_per_sec > 0) {
             bool all_ahead = true;
-            auto elapsed
-              = std::chrono::duration<double>(bench_clock::now() - start)
-                  .count();
+            auto elapsed = std::chrono::duration<double>(
+                             bench_clock::now() - start)
+                             .count();
             double allowed = elapsed * bytes_per_sec;
             for (uint32_t c = 0; c < concurrency; ++c) {
                 if (static_cast<double>(per_conn_bytes[c]) < allowed) {
@@ -548,8 +558,7 @@ run_cell_concurrent(bench_cell cell, uint32_t concurrency) {
         cs.pair.listener.abort_accept();
     }
 
-    double elapsed
-      = std::chrono::duration<double>(end - start).count();
+    double elapsed = std::chrono::duration<double>(end - start).count();
     std::sort(all_latencies.begin(), all_latencies.end());
 
     cell_result result;
@@ -557,14 +566,12 @@ run_cell_concurrent(bench_cell cell, uint32_t concurrency) {
     result.messages_sent = total_msgs;
     result.bytes_sent = total_bytes;
     result.elapsed_sec = elapsed;
-    result.achieved_mbps
-      = elapsed > 0
-          ? static_cast<double>(total_bytes) / (1024.0 * 1024.0 * elapsed)
-          : 0;
-    result.achieved_mbits
-      = elapsed > 0
-          ? static_cast<double>(total_bytes) * 8.0 / (1e6 * elapsed)
-          : 0;
+    result.achieved_mbps = elapsed > 0 ? static_cast<double>(total_bytes)
+                                           / (1024.0 * 1024.0 * elapsed)
+                                       : 0;
+    result.achieved_mbits = elapsed > 0 ? static_cast<double>(total_bytes) * 8.0
+                                            / (1e6 * elapsed)
+                                        : 0;
     result.cpu_delta = r1 - r0;
     result.lat_p50_us = percentile(all_latencies, 0.50);
     result.lat_p99_us = percentile(all_latencies, 0.99);
@@ -680,18 +687,17 @@ void print_results(
             }
             auto sz = format_size(results[i].cell.message_size);
             auto rate = format_rate(results[i].cell.target_rate_bps);
-            double tput_ratio
-              = results[j].achieved_mbps > 0
-                  ? results[i].achieved_mbps / results[j].achieved_mbps
-                  : 0;
+            double tput_ratio = results[j].achieved_mbps > 0
+                                  ? results[i].achieved_mbps
+                                      / results[j].achieved_mbps
+                                  : 0;
             auto tcp_cpu = results[j].cpu_delta.user_us
                            + results[j].cpu_delta.sys_us;
             auto uds_cpu = results[i].cpu_delta.user_us
                            + results[i].cpu_delta.sys_us;
-            double cpu_ratio = tcp_cpu > 0
-                                 ? static_cast<double>(uds_cpu)
-                                     / static_cast<double>(tcp_cpu)
-                                 : 0;
+            double cpu_ratio = tcp_cpu > 0 ? static_cast<double>(uds_cpu)
+                                               / static_cast<double>(tcp_cpu)
+                                           : 0;
 
             if (is_rr) {
                 double lat_ratio
@@ -729,13 +735,14 @@ std::vector<bench_cell> build_matrix(const bench_config& cfg) {
     for (auto sz : sizes) {
         for (auto rate : rates) {
             for (auto t : transports) {
-                cells.push_back(bench_cell{
-                  .transport = t,
-                  .message_size = sz,
-                  .target_rate_bps = rate,
-                  .duration_sec = cfg.duration_sec,
-                  .warmup_sec = cfg.warmup_sec,
-                });
+                cells.push_back(
+                  bench_cell{
+                    .transport = t,
+                    .message_size = sz,
+                    .target_rate_bps = rate,
+                    .duration_sec = cfg.duration_sec,
+                    .warmup_sec = cfg.warmup_sec,
+                  });
             }
         }
     }
@@ -795,9 +802,7 @@ ss::future<> run_all(bench_config cfg) {
           result.messages_sent);
         if (is_rr) {
             fmt::print(
-              ", p50={}us p99={}us",
-              result.lat_p50_us,
-              result.lat_p99_us);
+              ", p50={}us p99={}us", result.lat_p50_us, result.lat_p99_us);
         }
         fmt::print("\n");
 
@@ -818,8 +823,7 @@ int main(int ac, char* av[]) {
 
     app.add_options()(
       "duration",
-      po::value<uint32_t>(&cfg.duration_sec)
-        ->default_value(cfg.duration_sec),
+      po::value<uint32_t>(&cfg.duration_sec)->default_value(cfg.duration_sec),
       "Measurement duration per cell in seconds")(
       "warmup",
       po::value<uint32_t>(&cfg.warmup_sec)->default_value(cfg.warmup_sec),
@@ -839,8 +843,7 @@ int main(int ac, char* av[]) {
       "Benchmark mode: rr (request-response), uni (unidirectional), "
       "or concurrent (N parallel connections)")(
       "concurrency",
-      po::value<uint32_t>(&cfg.concurrency)
-        ->default_value(cfg.concurrency),
+      po::value<uint32_t>(&cfg.concurrency)->default_value(cfg.concurrency),
       "Number of parallel connections in concurrent mode");
 
     return app.run(ac, av, [&cfg]() mutable {

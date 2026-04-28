@@ -16,12 +16,13 @@ Extensions REMOVED (pip replaced with nixpkgs):
 Extensions KEPT:
   - go_sdk (dev, provides Go toolchain via host())
   - go_deps (non-dev, provides @org_golang_google_protobuf for pbgen)
-  - rust (dev, compiles wasmtime_c)
+  - rust (dev, MODIFIED: remove rust.toolchain() download, use nix toolchain)
   - crate (non-dev, provides wasmtime_c source)
   - python (dev, toolchain for code gen)
 
 Other patches:
   - go_sdk.download() → go_sdk.host() (use Go from PATH)
+  - rust.toolchain() → register_toolchains("//nix_rust:nix_rust_toolchain")
   - Remove go_sdk_with_systemcrypto block
   - Add rules_buf override (stub downloads)
   - Add rules_cc override (fix shebangs)
@@ -158,6 +159,36 @@ def main():
                 i += 1
             continue
 
+        # ── Replace rust.toolchain() download with nix-provided toolchain ──
+        # Keep the rust extension (needed for rust_host_tools by crate_universe)
+        # but remove the toolchain download and its registration.
+        # The nix build provides //nix_rust:nix_rust_toolchain instead.
+        if 'rust = use_extension(' in line and 'rust:extensions.bzl' in line:
+            output.append(line)
+            i += 1
+            # Skip rust.toolchain(...), use_repo(rust, ...), and
+            # register_toolchains("@rust_toolchains//:all", ...) blocks
+            while i < len(lines):
+                stripped = lines[i].strip()
+                if stripped.startswith('rust.toolchain('):
+                    i = skip_block(i)
+                elif stripped.startswith('use_repo(rust'):
+                    i = skip_block(i)
+                elif stripped.startswith('register_toolchains('):
+                    block_text, j = peek_block(i)
+                    if 'rust_toolchains' in block_text:
+                        i = j
+                    else:
+                        break
+                elif stripped == '':
+                    i += 1
+                else:
+                    break
+            # Register our local nix toolchain instead
+            output.append('register_toolchains("//nix_rust:nix_rust_toolchain", dev_dependency = True)')
+            output.append('')
+            continue
+
         # ── Remove OCI section ──
         if is_section_header(i, 'oci base images'):
             i += 2
@@ -215,6 +246,17 @@ def main():
 
     # Clean up multiple blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # ── Add lockfile to crate.from_cargo() for reproducible evaluation ──
+    # Without this, rules_rust marks the crate extension as non-reproducible
+    # and Bazel always re-evaluates it (running cargo-bazel splice, which
+    # needs network access unavailable in the Nix sandbox).
+    if 'cargo-bazel-lock.json' not in text:
+        text = text.replace(
+            'crate.from_cargo(\n    name = "crates",',
+            'crate.from_cargo(\n    name = "crates",\n    lockfile = "//bazel/thirdparty:cargo-bazel-lock.json",',
+            1,
+        )
 
     # ── Add Nix-specific overrides ──
     if 'module_name = "rules_buf"' not in text:
@@ -288,6 +330,26 @@ single_version_override(
             'module(\n    name = "redpanda",\n    repo_name = "com_github_redpanda_data_redpanda",\n)\n\nregister_toolchains("//nix_protoc:nix_protoc_toolchain")',
             1,
         )
+
+    # ── Skip cargo-bazel query in determine_repin ──
+    # The crate extension's determine_repin() runs `cargo-bazel query` which
+    # calls rustc to check versions. In the Nix sandbox, rustc (from
+    # rust_host_tools) isn't patched yet during the first fetch, so it fails.
+    # Since we provide a pre-generated cargo-bazel-lock.json, we can safely
+    # skip the repin check and always trust the lockfile.
+    if 'module_name = "rules_rust"' not in text:
+        text += '''
+# Nix: skip cargo-bazel query in determine_repin.
+# We provide a pre-generated cargo-bazel-lock.json, so the repin check
+# (which runs rustc) is unnecessary and fails before ELF patching.
+# Replace the "Run the binary to check" block with "return False".
+single_version_override(
+    module_name = "rules_rust",
+    patch_cmds = [
+        "sed -i 's/# Run the binary to check if a repin is needed/return False  # Nix: trust pre-generated lockfile/' crate_universe/private/generate_utils.bzl",
+    ],
+)
+'''
 
     # Fix liburing: with --spawn_strategy=local, the generate_headers genrule
     # runs ./configure in the source tree, creating config-host.h there. The

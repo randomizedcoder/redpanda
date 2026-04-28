@@ -1,5 +1,5 @@
---- a/BUILD.bazel	2026-04-01 10:22:09.813888242 -0300
-+++ b/BUILD.bazel	2026-04-01 11:13:26.423352671 -0300
+--- a/BUILD.bazel	2026-04-28 12:59:32.876900793 -0700
++++ b/BUILD.bazel	2026-04-28 12:59:42.620948015 -0700
 @@ -20,20 +20,33 @@
          "src/include/liburing/io_uring_version.h",
      ],
@@ -11,7 +11,7 @@
 +            # exposed by bazel, system ld gets used, which can't
 +            # resolve sysroot linker scripts in the sandbox.
 +            export LDFLAGS="-c"
-
+ 
 -            # switch to the package dir to execute "configure" right there
 -            pushd $$(dirname $(location configure))
 -              mkdir -p src/include/liburing
@@ -27,7 +27,7 @@
 +            ln -sf $$pkg_dir/liburing.spec liburing.spec
 +            mkdir -p src/include/liburing
 +            $$pkg_dir/configure --use-libc
-
+ 
              # collect the outputs
              for out in $(OUTS); do
 -              cp $$(realpath --relative-to=$(BINDIR) $$out) $$out
@@ -41,12 +41,16 @@
 +    ],
      tools = ["configure"],
  )
-
-@@ -76,6 +89,7 @@
+ 
+@@ -64,9 +77,10 @@
          "-Wall",
          "-Wextra",
          "-fno-stack-protector",
 +        "-Wno-unused-parameter",
          "-include config-host.h",
      ],
-     includes = ["src/include"],
+-    includes = ["src/include"],
++    includes = [".", "src/include"],
+     visibility = ["//visibility:public"],
+ )
+ 

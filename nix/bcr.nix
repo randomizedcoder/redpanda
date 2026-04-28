@@ -2,10 +2,10 @@
 
 # Pinned snapshot of the Bazel Central Registry.
 # Must contain all module versions referenced in MODULE.bazel.
-# Newest BCR-sourced dep: abseil-cpp 20250814.0, googleapis 0.0.0-20250703-f9d6fe4a
+# Newest BCR-sourced dep: libxml2 2.15.2, fmt 12.1.0, rules_cc 0.2.17
 fetchFromGitHub {
   owner = "bazelbuild";
   repo = "bazel-central-registry";
-  rev = "4184a02089170a2f4868f4f84fcb8b802481fb31";
-  hash = "sha256-mdYDmnvxLvxhTUE1nRkWowDsRtnbQ1OsfyimFIcok5o=";
+  rev = "feb92cfcd0c0e9fba525aceb8fbfbf9518517674";
+  hash = "sha256-yTuLz896B+4YSjvcAvpzjXIXX4bOQ4FvvzMF/NdDEO0=";
 }

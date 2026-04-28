@@ -73,6 +73,7 @@ let
   adaStatic = callPackage ./ada-static.nix { };
   croaringStatic = callPackage ./croaring-static.nix { };
   lksctpStatic = callPackage ./lksctp-static.nix { };
+  rustToolchain = callPackage ./rust-toolchain.nix { };
 
   gccLib = stdenv.cc.cc.lib;
 
@@ -484,9 +485,91 @@ cc_library(
 )
 LKSCTP_BUILD
 
+    # Create nix_rust/ — pre-built Rust toolchain from nixpkgs.
+    # rules_rust has no rust.host() equivalent, so we assemble a
+    # Bazel-compatible toolchain directory and register it via
+    # register_toolchains("//nix_rust:nix_rust_toolchain").
+    # Eliminates 7 Rust toolchain downloads from static.rust-lang.org.
+    mkdir -p $out/nix_rust/{bin,lib}
+    for item in ${rustToolchain}/bin/*; do
+      ln -s "$item" $out/nix_rust/bin/
+    done
+    for item in ${rustToolchain}/lib/*; do
+      ln -s "$item" $out/nix_rust/lib/
+    done
+
+    cat > $out/nix_rust/BUILD.bazel <<'RUST_BUILD'
+load("@rules_rust//rust:toolchain.bzl", "rust_stdlib_filegroup", "rust_toolchain")
+
+filegroup(name = "rustc", srcs = ["bin/rustc"], visibility = ["//visibility:public"])
+filegroup(name = "rustdoc", srcs = ["bin/rustdoc"], visibility = ["//visibility:public"])
+filegroup(name = "cargo", srcs = ["bin/cargo"], visibility = ["//visibility:public"])
+filegroup(name = "clippy_driver_bin", srcs = ["bin/clippy-driver"], visibility = ["//visibility:public"])
+filegroup(name = "cargo_clippy_bin", srcs = ["bin/cargo-clippy"], visibility = ["//visibility:public"])
+filegroup(name = "rustfmt_bin", srcs = ["bin/rustfmt"], visibility = ["//visibility:public"])
+
+filegroup(
+    name = "rustc_lib",
+    srcs = glob(
+        [
+            "lib/*.so*",
+            "lib/rustlib/x86_64-unknown-linux-gnu/codegen-backends/*.so",
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/*.so*",
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/*.rmeta",
+        ],
+        allow_empty = True,
+    ),
+    visibility = ["//visibility:public"],
+)
+
+rust_stdlib_filegroup(
+    name = "rust_std",
+    srcs = glob(
+        [
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/*.rlib",
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/*.so*",
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/*.a",
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/self-contained/**",
+        ],
+        allow_empty = True,
+    ),
+    visibility = ["//visibility:public"],
+)
+
+rust_toolchain(
+    name = "nix_rust_toolchain_impl",
+    rustc = ":rustc",
+    rust_doc = ":rustdoc",
+    rust_std = ":rust_std",
+    cargo = ":cargo",
+    clippy_driver = ":clippy_driver_bin",
+    cargo_clippy = ":cargo_clippy_bin",
+    rustfmt = ":rustfmt_bin",
+    rustc_lib = ":rustc_lib",
+    allocator_library = "@rules_rust//ffi/cc/allocator_library",
+    global_allocator_library = "@rules_rust//ffi/cc/global_allocator_library",
+    binary_ext = "",
+    staticlib_ext = ".a",
+    dylib_ext = ".so",
+    stdlib_linkflags = ["-ldl", "-lpthread"],
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_triple = "x86_64-unknown-linux-gnu",
+    visibility = ["//visibility:public"],
+)
+
+toolchain(
+    name = "nix_rust_toolchain",
+    toolchain = ":nix_rust_toolchain_impl",
+    toolchain_type = "@rules_rust//rust:toolchain_type",
+    exec_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    target_compatible_with = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+)
+RUST_BUILD
+
     # Apply MODULE.bazel patches for Nix sandbox:
     # - Remove unneeded dev extensions (toolchains_llvm, rules_oci, buildifier, rules_shell)
     # - Replace go_sdk.download() with go_sdk.host()
+    # - Replace rust.toolchain() download with //nix_rust:nix_rust_toolchain
     # - Replace pip extension with nixpkgs stub
     # - Add rules_buf and rules_cc overrides (fix shebangs, stub downloads)
     ${pythonWithDeps}/bin/python3 ${./patch-module-bazel.py} $out/MODULE.bazel
@@ -899,6 +982,7 @@ REPOS_PATCH
     build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib:${zlib}/lib
     build --linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
     build --linkopt=-Wl,-rpath,${gccLib}/lib
+    build --host_linkopt=-stdlib=libc++
     build --host_linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
     build --host_linkopt=-Wl,-rpath,${gccLib}/lib
     build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
@@ -963,6 +1047,13 @@ stdenv.mkDerivation {
     # so the nixbld group can share the persistent cache.
     # Restored to 022 before installPhase (Nix rejects group-writable outputs).
     umask 002
+
+    # Fix permissions on existing cache from previous builds by different
+    # nixbld users. Without this, a new nixbld user can't write to dirs/files
+    # created by a previous one, causing "Permission denied" on server/ etc.
+    if [ -d "${bazelCacheDir}/output_base" ]; then
+      chmod -R g+rwx "${bazelCacheDir}/output_base" 2>/dev/null || true
+    fi
 
     # ── Sanitize Nix stdenv env vars for Bazel cache stability ──
     # Nix injects derivation-hash-dependent values into these env vars:
@@ -1060,6 +1151,21 @@ stdenv.mkDerivation {
     # Final nixify pass before build
     echo "=== Final nixify pass ==="
     ${patchBazelDirs}
+
+    # ── Replace rules_rust allocator_library for Rust 1.89+ ──
+    # Rust 1.89+ moved allocator symbols into the __rustc:: namespace
+    # (rust-lang/rust#128135). The rules_rust 0.60.0 allocator_library.cc
+    # calls __rdl_* symbols with plain C linkage, but Rust 1.93's stdlib
+    # only provides them with Rust v0 mangled names. Replace the entire
+    # file with a version that calls the system allocator directly.
+    echo "=== Replacing rules_rust allocator_library for Rust 1.93 ==="
+    ALLOC_LIB_DIR="${bazelCacheDir}/output_base/external/rules_rust+/ffi/cc/allocator_library"
+    if [ -f "$ALLOC_LIB_DIR/allocator_library.cc" ]; then
+      cp ${./rust-allocator-shim-patch.cc} "$ALLOC_LIB_DIR/allocator_library.cc"
+      echo "Replaced allocator_library.cc with Rust 1.93-compatible version"
+    else
+      echo "WARNING: allocator_library.cc not found at $ALLOC_LIB_DIR"
+    fi
 
     # ── Phase D: Build ──
     bazelisk \
