@@ -151,6 +151,137 @@ multi-pass loop:
 The fixup rules are defined in `nixify-rules.nix`, separate from the build
 logic.
 
+### Rust Toolchain
+
+Redpanda depends on Rust (for wasmtime). In Bazel, `rules_rust` normally
+downloads a Rust toolchain, but those binaries fail in the Nix sandbox
+(wrong ELF interpreter). Instead, the build:
+
+1. **`rust-toolchain.nix`** — assembles a Bazel-compatible Rust toolchain
+   by symlinking nixpkgs' `rustc`, `cargo`, `clippy`, and `rustfmt` into
+   the directory layout `rules_rust` expects (`bin/`, `lib/`, `lib/rustlib/`).
+
+2. **`patch-module-bazel.py`** — removes the upstream `rust.toolchain()`
+   download and replaces it with
+   `register_toolchains("//nix_rust:nix_rust_toolchain")`, pointing to
+   the Nix-assembled toolchain.
+
+3. **`rust-allocator-shim-patch.cc`** — replaces the `rules_rust` allocator
+   library to support Rust 1.89+ where allocator symbols moved into the
+   `__rustc::` namespace (Itanium v0 mangling). Provides both old-style
+   (`__rust_alloc`) and new-style symbols.
+
+4. **`cargo-bazel-lock.json`** — pre-generated lockfile for `crate.from_cargo()`
+   so `rules_rust` treats the crate extension as reproducible and skips
+   `cargo-bazel splice` (which needs network access unavailable in the sandbox).
+
+### MODULE.bazel Patching
+
+`patch-module-bazel.py` transforms `MODULE.bazel` for the Nix sandbox.
+It is table-driven and operates on the raw text:
+
+**Removed extensions** (not needed for the server build):
+- `buildifier_prebuilt`, `rules_shell`, `toolchains_llvm`, `rules_oci`, `pip`
+
+**Modified extensions:**
+- `go_sdk` — `go_sdk.download()` → `go_sdk.host()` (use Go from PATH)
+- `rust` — remove toolchain download, register nix toolchain
+- `crate` — add lockfile path for reproducible evaluation
+
+**Added overrides:**
+- `rules_buf` — stub out buf toolchain downloads
+- `rules_cc`, `rules_foreign_cc` — fix `#!/bin/bash` shebangs for Nix
+- `rules_rust` — skip `cargo-bazel query` (trust pre-generated lockfile)
+- `liburing` — clean up source-tree generated files that conflict with
+  genrule outputs under `--spawn_strategy=local`
+- Pre-built `nix_protoc` toolchain (saves ~240 protoc compilation actions)
+
+### PGO (Profile-Guided Optimization)
+
+Automated three-stage PGO pipeline:
+
+1. **Instrument** — build with `-fprofile-generate` via `pgoMode = "instrument"`
+2. **Train** (`pgo-train.nix`) — run a single-node Redpanda with rpk-based
+   produce/consume workloads (15,000 messages across 5 size tiers: 64B to
+   64KB) to generate LLVM raw profile data
+3. **Optimize** — merge profiles with `llvm-profdata`, rebuild with
+   `-fprofile-use` via `pgoMode = "optimize"`
+
+```bash
+# Fully automated (instrument → train → optimize):
+nix build .#redpanda-pgo
+
+# Manual: build instrumented, run your own workload, then optimize:
+nix build .#redpanda-pgo-instrument
+# ... run workload, collect .profraw files ...
+nix build .#redpanda-pgo --override-input pgo-profile ./merged.profdata
+```
+
+### Linting
+
+`nix/lint.nix` provides multi-language linting as both `nix run` apps and
+`nix flake check` derivations:
+
+| Language | Tools | Command |
+|----------|-------|---------|
+| Nix | statix, deadnix, nixfmt | `nix run .#lint-nix` |
+| Go | gofmt, go vet, golangci-lint | `nix run .#lint-go` |
+| Shell | shellcheck, shfmt | `nix run .#lint-shell` |
+| C++ | clang-format | `nix run .#lint-cpp` |
+| All | all of the above | `nix run .#lint` |
+
+Branch-scoped mode (only lint files changed vs `dev`):
+
+```bash
+nix run .#lint -- --branch
+```
+
+### Test Framework
+
+The `nix/tests/` directory provides a modular integration test framework
+that builds Redpanda, starts a single-node broker, and validates
+functionality end-to-end.
+
+#### Architecture
+
+```
+nix/tests/
+  default.nix              # Orchestrator: wires packages, apps, checks
+  lib.nix                  # Bash helpers: color output, timing, counters
+  constants.nix            # Ports, timeouts, YAML config templates
+  containers.nix           # OCI container image tests (requires Docker)
+  smoke.nix                # Minimal broker start/stop test
+  single-node.nix          # Full single-node validation (Kafka, admin, rpk)
+  lifecycle.nix            # Broker restart, config changes, crash recovery
+  uds.nix                  # Unix Domain Socket listener tests
+  uds-perf.nix             # UDS vs TCP performance benchmark harness
+  checks/                  # Modular check libraries
+    kafka-checks.nix       #   Produce/consume, topics, offsets
+    admin-checks.nix       #   Admin API health, config, metrics
+    rpk-checks.nix         #   rpk CLI commands
+    schema-checks.nix      #   Schema Registry CRUD
+    proxy-checks.nix       #   HTTP Proxy produce/consume
+    resilience-checks.nix  #   Crash recovery, signal handling
+    uds-checks.nix         #   UDS listener functionality
+    uds-perf-checks.nix    #   UDS benchmark helpers and result tables
+```
+
+#### Running Tests
+
+| Target | Command | Description |
+|--------|---------|-------------|
+| `test-single-node` | `nix run .#test-single-node` | Full single-node validation |
+| `test-single-node-cached` | `nix run .#test-single-node-cached` | Same, with Bazel cache |
+| `test-lifecycle` | `nix run .#test-lifecycle` | Broker lifecycle tests |
+| `test-lifecycle-cached` | `nix run .#test-lifecycle-cached` | Same, with Bazel cache |
+| `test-uds` | `nix run .#test-uds` | UDS listener tests |
+| `test-uds-cached` | `nix run .#test-uds-cached` | Same, with Bazel cache |
+| `test-all` | `nix run .#test-all` | Run all tests |
+| `test-all-cached` | `nix run .#test-all-cached` | All tests with Bazel cache |
+
+Tests are also registered as `nix flake check` derivations, so
+`nix flake check` runs both lints and integration tests.
+
 ## Cache Management
 
 ### Clearing Caches
@@ -191,9 +322,17 @@ date > nix/entropy                     # Nix cache (changes derivation hash)
 
 | Target | Command | Description |
 |--------|---------|-------------|
-| `redpanda` | `nix build .#redpanda` | Build without persistent cache |
-| `redpanda-cached` | `nix build .#redpanda-cached` | Build with persistent Bazel cache |
-| `rpk` | `nix build .#rpk` | Build the rpk Go CLI only |
+| `redpanda` | `nix build .#redpanda` | Fastbuild (no optimizations, fastest compile) |
+| `redpanda-cached` | `nix build .#redpanda-cached` | Fastbuild with persistent Bazel cache |
+| `redpanda-release` | `nix build .#redpanda-release` | `-O2`, security-hardened, stripped |
+| `redpanda-release-cached` | `nix build .#redpanda-release-cached` | Release with Bazel cache |
+| `redpanda-lto` | `nix build .#redpanda-lto` | ThinLTO cross-module optimization |
+| `redpanda-lto-cached` | `nix build .#redpanda-lto-cached` | LTO with Bazel cache |
+| `redpanda-pgo` | `nix build .#redpanda-pgo` | Automated PGO (instrument → train → optimize) |
+| `redpanda-pgo-cached` | `nix build .#redpanda-pgo-cached` | PGO with Bazel cache |
+| `redpanda-pgo-instrument` | `nix build .#redpanda-pgo-instrument` | Instrumented binary for external profiling |
+| `rpk` | `nix build .#rpk` | Build the rpk Go CLI from local source |
+| `uds-bench-cached` | `nix build .#uds-bench-cached` | Seastar UDS vs TCP micro-benchmarks |
 
 ### OCI Container Images
 
@@ -333,23 +472,61 @@ Key findings:
 | File | Description |
 |------|-------------|
 | `flake.nix` | Flake entry point; defines packages, apps, dev shell, checks |
-| `nix/redpanda.nix` | Main C++ server build derivation (~1100 lines) |
-| `nix/rpk.nix` | Go CLI package (`buildGoModule`, stripped with `-s -w` ldflags) |
+| `nix/redpanda.nix` | Main C++ server build derivation (fetch-nixify-build loop) |
+| `nix/rpk.nix` | Go CLI package (`buildGoModule` from local source) |
 | `nix/shell.nix` | Development shell with clang, LLVM, Python, JDK, autotools |
-| `nix/bench.nix` | Build benchmark and cache-clearing targets |
+
+### Rust Toolchain
+
+| File | Description |
+|------|-------------|
+| `nix/rust-toolchain.nix` | Assembles nixpkgs Rust into `rules_rust`-compatible layout |
+| `nix/rust-allocator-shim-patch.cc` | Allocator shim for Rust 1.89+ `__rustc::` namespace |
+| `bazel/thirdparty/cargo-bazel-lock.json` | Pre-generated crate lockfile for offline builds |
+
+### PGO and Optimization
+
+| File | Description |
+|------|-------------|
+| `nix/pgo-train.nix` | PGO training: instrument → rpk workload → profile merge |
+
+### Testing
+
+| File | Description |
+|------|-------------|
+| `nix/tests/default.nix` | Test orchestrator: wires packages, apps, checks |
+| `nix/tests/lib.nix` | Bash helpers: color output, timing, pass/fail counters |
+| `nix/tests/constants.nix` | Ports, timeouts, YAML config templates |
+| `nix/tests/smoke.nix` | Minimal broker start/stop |
+| `nix/tests/single-node.nix` | Full single-node validation (Kafka, admin, rpk, schema, proxy) |
+| `nix/tests/lifecycle.nix` | Broker restart, config changes, crash recovery |
+| `nix/tests/uds.nix` | UDS Kafka listener functional tests |
 | `nix/tests/uds-perf.nix` | UDS vs TCP performance benchmark harness |
-| `nix/tests/checks/uds-perf-checks.nix` | Benchmark helpers, matrix, and result tables |
-| `nix/test-images.nix` | OCI container image smoke test (`nix run .#test-images`) |
+| `nix/tests/containers.nix` | OCI container image tests (requires Docker) |
+| `nix/tests/checks/*.nix` | Modular check libraries (kafka, admin, rpk, schema, proxy, resilience, uds, uds-perf) |
+
+### Benchmarking and Linting
+
+| File | Description |
+|------|-------------|
+| `nix/bench.nix` | Build benchmark and cache-clearing targets |
+| `nix/lint.nix` | Multi-language linting (Nix, Go, Shell, C++) |
+
+### OCI Container Images
+
+| File | Description |
+|------|-------------|
 | `nix/redpanda-image.nix` | OCI container image for the redpanda server |
 | `nix/rpk-image.nix` | OCI container image for the rpk CLI |
+| `nix/test-images.nix` | OCI container image smoke test |
 
 ### Dependency Management
 
 | File | Description |
 |------|-------------|
 | `nix/bazel-repo-cache.nix` | Builds content-addressed linkFarm from `fetchurl` derivations |
-| `nix/bazel-deps.nix` | Generated list of 365 archive URLs and sha256 hashes |
-| `nix/bcr.nix` | Pinned Bazel Central Registry snapshot (`fetchFromGitHub`) |
+| `nix/bazel-deps.nix` | Generated list of archive URLs and sha256 hashes |
+| `nix/bcr.nix` | Pinned Bazel Central Registry snapshot |
 | `nix/MODULE.bazel.lock.nix` | Pre-generated lockfile matching patched MODULE.bazel |
 
 ### Pre-built Dependency Overrides
@@ -371,9 +548,17 @@ Key findings:
 | File | Description |
 |------|-------------|
 | `nix/nixify-rules.nix` | Configurable ELF/shebang fixup rules for the nixify pipeline |
-| `nix/patch-module-bazel.py` | Patches MODULE.bazel for Nix sandbox compatibility |
+| `nix/patch-module-bazel.py` | Patches MODULE.bazel for Nix sandbox (table-driven) |
 | `nix/gen-bazel-deps.py` | Generates `bazel-deps.nix` from lockfile + BCR + MODULE.bazel |
 | `nix/extract-missing-deps.py` | Finds archives in Bazel cache not yet in `bazel-deps.nix` |
+
+### Bazel Patches
+
+| File | Description |
+|------|-------------|
+| `bazel/thirdparty/liburing.patch` | Out-of-source build fix for liburing in Nix sandbox |
+| `nix/patches/rules_buf-nix-no-download.patch` | Stub out buf toolchain downloads |
+| `nix/patches/rules_foreign_cc-nix-shebang.patch` | Fix bash shebangs for Nix |
 
 ## Design Documentation
 
@@ -387,3 +572,7 @@ Key findings:
   Architectural comparison of Nix and Bazel sandboxing
 - [nix-build-journey.md](nix-build-journey.md) — Historical evolution of
   the build system
+- [toolchains-llvm-local-toolchain.md](toolchains-llvm-local-toolchain.md) —
+  Using system LLVM/clang instead of downloaded toolchains
+- [rules-python-local-toolchain-patch.md](rules-python-local-toolchain-patch.md) —
+  Python toolchain Nix compatibility
