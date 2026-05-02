@@ -1055,6 +1055,14 @@ stdenv.mkDerivation {
       chmod -R g+rwx "${bazelCacheDir}/output_base" 2>/dev/null || true
     fi
 
+    # Wrapper that fixes server/ permissions before every bazelisk invocation.
+    # A concurrent build (e.g. IWYU analysis) may re-create server/ with
+    # restrictive permissions between our calls.
+    _bazelisk() {
+      chmod -R g+rwx "${bazelCacheDir}/output_base/server" 2>/dev/null || true
+      bazelisk "$@"
+    }
+
     # ── Sanitize Nix stdenv env vars for Bazel cache stability ──
     # Nix injects derivation-hash-dependent values into these env vars:
     #   NIX_CFLAGS_COMPILE: -frandom-seed=<output-hash-prefix>
@@ -1121,7 +1129,7 @@ stdenv.mkDerivation {
     # Will fail because downloaded ELF binaries (Rust, Go, etc.)
     # can't execute in the Nix sandbox without patching.
     echo "=== Fetch attempt 1 ==="
-    bazelisk \
+    _bazelisk \
       ${lib.escapeShellArgs bazelStartupArgs} \
       fetch \
       --keep_going \
@@ -1137,7 +1145,7 @@ stdenv.mkDerivation {
       ${patchBazelDirs}
 
       echo "=== Fetch attempt $attempt ==="
-      if bazelisk \
+      if _bazelisk \
         ${lib.escapeShellArgs bazelStartupArgs} \
         fetch \
         --keep_going \
@@ -1168,7 +1176,7 @@ stdenv.mkDerivation {
     fi
 
     # ── Phase D: Build ──
-    bazelisk \
+    _bazelisk \
       ${lib.escapeShellArgs bazelStartupArgs} \
       build \
       --verbose_failures \
@@ -1176,7 +1184,7 @@ stdenv.mkDerivation {
       ${lib.escapeShellArgs targets}
 
     # Shut down the persistent server
-    bazelisk ${lib.escapeShellArgs bazelStartupArgs} shutdown || true
+    _bazelisk ${lib.escapeShellArgs bazelStartupArgs} shutdown || true
 
     # Restore strict umask for installPhase outputs (Nix rejects group-writable).
     umask 022

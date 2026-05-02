@@ -355,19 +355,37 @@ single_version_override(
     # runs ./configure in the source tree, creating config-host.h there. The
     # cc_library then sees both the genrule output AND the source-tree copy.
     # Bazel flags the source-tree copy as "undeclared inclusion". Fix by
-    # cleaning up the source-tree copies after the genrule copies to output.
-    if 'module_name = "liburing"' not in text:
-        text += '''
-# Nix: fix liburing undeclared inclusion of config-host.h.
-# With --spawn_strategy=local, ./configure creates files in source tree.
-# Clean them up after copying to Bazel output to avoid include validation errors.
-single_version_override(
+    # adding patch_cmds to the existing single_version_override to clean up
+    # source-tree copies after the genrule.
+    if 'module_name = "liburing"' in text:
+        # Add patch_cmds to the existing single_version_override for liburing.
+        # The sed command inserts cleanup rm commands after the "done" line in
+        # the genrule's cmd, removing source-tree copies of generated files.
+        cleanup_sed = (
+            "sed -i '/^            done$/a\\\\"
+            "            rm -f config-host.h config-host.mak\\n"
+            "            rm -f src/include/liburing/compat.h\\n"
+            "            rm -f src/include/liburing/io_uring_version.h' BUILD.bazel"
+        )
+        text = text.replace(
+            '''single_version_override(
     module_name = "liburing",
-    patch_cmds = [
-        "sed -i '/^            done$/a\\\\            pushd $$(dirname $(location configure))\\\\n              rm -f config-host.h config-host.mak src/include/liburing/compat.h src/include/liburing/io_uring_version.h\\\\n            popd' BUILD.bazel",
+    patch_strip = 1,
+    patches = [
+        "//bazel/thirdparty:liburing.patch",
     ],
-)
-'''
+)''',
+            f'''single_version_override(
+    module_name = "liburing",
+    patch_strip = 1,
+    patches = [
+        "//bazel/thirdparty:liburing.patch",
+    ],
+    patch_cmds = [
+        "{cleanup_sed}",
+    ],
+)''',
+        )
 
     with open(path, 'w') as f:
         f.write(text)

@@ -165,7 +165,7 @@
 
           tests = import ./nix/tests {
             inherit pkgs mkApp;
-            redpandaDrv = redpanda;
+            redpandaDrv = redpanda-cached;
             rpkDrv = rpk;
           };
 

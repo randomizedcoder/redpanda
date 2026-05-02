@@ -251,6 +251,8 @@ Generates `.bazelrc.nix` with Nix-specific Bazel settings.
 
 ### Benchmarking
 
+#### Build Benchmarks
+
 | Target | Command | Description |
 |--------|---------|-------------|
 | `bench-warm` | `nix run .#bench-warm` | Both caches present |
@@ -260,6 +262,69 @@ Generates `.bazelrc.nix` with Nix-specific Bazel settings.
 | `bench-3x-warm` | `nix run .#bench-3x-warm` | 3x warm runs |
 | `bench-3x-cold-nix` | `nix run .#bench-3x-cold-nix` | 3x cold-nix runs |
 | `bench-matrix` | `nix run .#bench-matrix` | Full 9-build matrix |
+
+#### UDS vs TCP Performance Benchmarks
+
+End-to-end Kafka produce/consume benchmarks comparing Unix Domain Socket
+(UDS) and TCP loopback transports using `rpk benchmark`. The harness starts
+a single-node Redpanda broker with both TCP and UDS Kafka listeners, runs
+the same workloads through each transport, and prints comparison tables.
+
+| Target | Command | Description |
+|--------|---------|-------------|
+| `bench-uds-perf` | `nix run .#bench-uds-perf` | Full matrix (30s/cell, ~20 min) |
+| `bench-uds-perf-quick` | `nix run .#bench-uds-perf-quick` | Quick matrix (10s/cell, ~8 min) |
+| `bench-uds-perf-cached` | `nix run .#bench-uds-perf-cached` | Full matrix with Bazel cache |
+| `bench-uds-perf-quick-cached` | `nix run .#bench-uds-perf-quick-cached` | Quick matrix with Bazel cache |
+
+The benchmark runs three phases:
+
+1. **Produce + Consume** -- async produce through TCP and UDS, then consume
+   from the same topics. Sizes: 100 B, 1 kB, 10 kB. Clients: 1, 10, 50
+   (50 capped at 1 kB to avoid overwhelming a single-node broker). Topics
+   are deleted between pairs to reclaim disk.
+
+2. **Rate-limited produce** -- produce at fixed target rates (10, 50,
+   100 MB/s) with 1 kB and 10 kB records. Measures p99 latency and CPU
+   usage at controlled throughput levels.
+
+**Results (quick mode, single-node, 2026-05-02):**
+
+Produce throughput (async, batched):
+
+| MsgSize | Clients | TCP req/s | UDS req/s | Ratio |
+|---------|---------|-----------|-----------|-------|
+| 100 B | 1 | 765,942 | 753,374 | 0.98x |
+| 100 B | 10 | 730,718 | 1,042,771 | **1.43x** |
+| 100 B | 50 | 1,250,576 | 1,256,862 | 1.00x |
+| 1 kB | 1 | 131,806 | 136,084 | 1.03x |
+| 10 kB | 1 | 13,188 | 15,632 | **1.19x** |
+
+Consume throughput:
+
+| MsgSize | Clients | TCP MB/s | UDS MB/s | Ratio | TCP p99 | UDS p99 |
+|---------|---------|----------|----------|-------|---------|---------|
+| 100 B | 10 | 631 | 737 | **1.17x** | 1.02M us | 1.05M us |
+| 1 kB | 1 | 188 | 196 | 1.04x | 609K us | **165K us** |
+| 10 kB | 1 | 179 | 209 | **1.16x** | 534K us | **249K us** |
+
+Rate-limited produce (p99 latency -- lower is better):
+
+| MsgSize | Rate | TCP p99 | UDS p99 | Ratio |
+|---------|------|---------|---------|-------|
+| 1 kB | 10 MB/s | 14.4M us | 1.1M us | **0.08x** |
+| 1 kB | 50 MB/s | 2.3M us | 518K us | **0.22x** |
+| 10 kB | 10 MB/s | 1.3M us | 202K us | **0.15x** |
+| 10 kB | 50 MB/s | 621K us | 148K us | **0.24x** |
+
+Key findings:
+- **Latency**: UDS p99 is 4-13x lower than TCP at controlled throughput
+  (rate-limited tests). This is where UDS provides the clearest advantage.
+- **Throughput**: UDS wins at moderate concurrency (10 clients, +17-43%)
+  and with single clients on larger messages (+16-19%).
+- **Consume**: UDS delivers 2-4x lower p99 latency on single-client reads.
+- **High concurrency**: TCP can edge ahead at 50 clients with larger
+  messages due to kernel-level connection pooling.
 
 ## File Reference
 
@@ -271,7 +336,9 @@ Generates `.bazelrc.nix` with Nix-specific Bazel settings.
 | `nix/redpanda.nix` | Main C++ server build derivation (~1100 lines) |
 | `nix/rpk.nix` | Go CLI package (`buildGoModule`, stripped with `-s -w` ldflags) |
 | `nix/shell.nix` | Development shell with clang, LLVM, Python, JDK, autotools |
-| `nix/bench.nix` | Benchmark and cache-clearing targets |
+| `nix/bench.nix` | Build benchmark and cache-clearing targets |
+| `nix/tests/uds-perf.nix` | UDS vs TCP performance benchmark harness |
+| `nix/tests/checks/uds-perf-checks.nix` | Benchmark helpers, matrix, and result tables |
 | `nix/test-images.nix` | OCI container image smoke test (`nix run .#test-images`) |
 | `nix/redpanda-image.nix` | OCI container image for the redpanda server |
 | `nix/rpk-image.nix` | OCI container image for the rpk CLI |

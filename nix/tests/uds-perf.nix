@@ -1,15 +1,18 @@
 # nix/tests/uds-perf.nix
 #
-# End-to-end UDS vs TCP produce performance benchmark.
+# End-to-end UDS vs TCP performance benchmark (produce, consume, rate-limited).
 #
 # Starts a single-node Redpanda with dual Kafka listeners (TCP + UDS),
-# then runs `rpk benchmark produce` through each transport at several
-# message sizes and client counts. Prints a comparison table showing
-# where UDS gains are largest.
+# then runs rpk benchmark through each transport. Three phases:
+#   1. Produce — 3 sizes × 2 client counts × 2 transports = 12 cells
+#   2. Consume — reads from topics populated in phase 1 = 12 cells
+#   3. Rate-limited produce — 2 sizes × 2 rates × 2 transports = 8 cells
+#
+# Prints comparison tables with throughput, latency, and CPU metrics.
 #
 # Run with:
-#   nix run .#bench-uds-perf           # 30s per cell (~7 min total)
-#   nix run .#bench-uds-perf-quick     # 10s per cell (~3 min total)
+#   nix run .#bench-uds-perf           # 30s per cell (~21 min total)
+#   nix run .#bench-uds-perf-quick     # 10s per cell (~8 min total)
 {
   pkgs,
   redpandaDrv,
@@ -72,13 +75,13 @@ pkgs.writeShellApplication {
     sed -i "s|DATA_DIR_PLACEHOLDER|$DATA_DIR|g" "$CONFIG"
     sed -i "s|SOCK_PATH_PLACEHOLDER|$SOCK_PATH|g" "$CONFIG"
 
-    bold "╔═══════════════════════════════════════════╗"
-    bold "║  UDS vs TCP Produce Performance Benchmark ║"
-    bold "╚═══════════════════════════════════════════╝"
+    bold "╔═══════════════════════════════════════════════════════╗"
+    bold "║  UDS vs TCP Performance Benchmark (produce/consume) ║"
+    bold "╚═══════════════════════════════════════════════════════╝"
     echo ""
     info "Duration per cell: ${toString duration}s (warmup: ${toString warmup}s)"
-    info "Message sizes: 100 B, 1 kB, 10 kB"
-    info "Client counts: 1, 10"
+    info "Phase 1+2: Produce & consume — sizes: 100 B, 1 kB, 10 kB × clients: 1, 10, 50 (50 capped at ≤1kB)"
+    info "Phase 3: Rated    — sizes: 1 kB, 10 kB × rates: 10, 50, 100 MB/s"
     info "Transports: tcp, uds"
     echo ""
 
@@ -106,7 +109,7 @@ pkgs.writeShellApplication {
     fi
 
     # --- Run benchmark matrix ---
-    phase_header 2 "Benchmark Matrix" 600
+    phase_header 2 "Benchmark Matrix" 1200
 
     ${perfChecks.mkBenchHelpers}
     ${perfChecks.mkPerfMatrix { inherit duration warmup; }}

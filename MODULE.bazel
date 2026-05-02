@@ -60,6 +60,7 @@ local_path_override(
     module_name = "rules_python",
     path = "/home/das/Downloads/rules_python",
 )
+
 bazel_dep(name = "rules_rust", version = "0.60.0")
 bazel_dep(name = "snappy", version = "1.2.1")
 bazel_dep(name = "yaml-cpp", version = "0.8.0")
@@ -88,10 +89,11 @@ python.toolchain(
     python_version = "3.12",
 )
 python.local_toolchain(
-    python_version = "3.12",
     interpreter_path = "python3",
+    python_version = "3.12",
 )
 use_repo(python, "local_python_3_12", "local_python_3_12_toolchains")
+
 register_toolchains("@local_python_3_12_toolchains//:all")
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
