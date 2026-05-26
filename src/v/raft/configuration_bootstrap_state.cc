@@ -13,16 +13,13 @@
 #include "bytes/iobuf_parser.h"
 #include "model/record.h"
 #include "raft/consensus_utils.h"
-#include "raft/types.h"
-#include "reflection/adl.h"
-
-#include <fmt/format.h>
 
 namespace raft {
 void configuration_bootstrap_state::process_configuration(
   model::record_batch b) {
-    if (unlikely(
-          b.header().type != model::record_batch_type::raft_configuration)) {
+    if (
+      unlikely(
+        b.header().type != model::record_batch_type::raft_configuration)) {
         throw std::runtime_error(
           fmt::format(
             "Logic error. Asked a configuration tracker to process an unknown "
@@ -45,8 +42,9 @@ void configuration_bootstrap_state::process_configuration(
 void configuration_bootstrap_state::process_data_offsets(
   model::record_batch b) {
     _data_batches_seen++;
-    if (unlikely(
-          b.header().type == model::record_batch_type::raft_configuration)) {
+    if (
+      unlikely(
+        b.header().type == model::record_batch_type::raft_configuration)) {
         throw std::runtime_error(
           fmt::format(
             "Logic error. Asked a data tracker to process "

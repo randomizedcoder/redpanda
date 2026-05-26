@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "base/vassert.h"
 #include "pandaproxy/schema_registry/types.h"
 
@@ -38,6 +39,25 @@ enum class avro_incompatibility_type {
     unknown,
 };
 
+inline fmt::iterator format_to(avro_incompatibility_type t, fmt::iterator out) {
+    switch (t) {
+    case avro_incompatibility_type::name_mismatch:
+        return fmt::format_to(out, "NAME_MISMATCH");
+    case avro_incompatibility_type::fixed_size_mismatch:
+        return fmt::format_to(out, "FIXED_SIZE_MISMATCH");
+    case avro_incompatibility_type::missing_enum_symbols:
+        return fmt::format_to(out, "MISSING_ENUM_SYMBOLS");
+    case avro_incompatibility_type::reader_field_missing_default_value:
+        return fmt::format_to(out, "READER_FIELD_MISSING_DEFAULT_VALUE");
+    case avro_incompatibility_type::type_mismatch:
+        return fmt::format_to(out, "TYPE_MISMATCH");
+    case avro_incompatibility_type::missing_union_branch:
+        return fmt::format_to(out, "MISSING_UNION_BRANCH");
+    case avro_incompatibility_type::unknown:
+        return fmt::format_to(out, "UNKNOWN");
+    }
+}
+
 /**
  * avro_incompatibility - A single incompatibility between Avro schemas.
  *
@@ -64,14 +84,19 @@ public:
 
     ss::sstring describe() const;
 
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{errorType:'{}', description:'{}', additionalInfo:'{}'}}",
+          _type,
+          describe(),
+          _additional_info);
+    }
+
+    friend bool operator==(
+      const avro_incompatibility&, const avro_incompatibility&) = default;
+
 private:
-    friend std::ostream&
-    operator<<(std::ostream& os, const avro_incompatibility& v);
-
-    friend bool
-    operator==(const avro_incompatibility&, const avro_incompatibility&)
-      = default;
-
     // Useful for unit testing
     template<typename H>
     friend H AbslHashValue(H h, const avro_incompatibility& e) {
@@ -96,6 +121,30 @@ enum class proto_incompatibility_type {
     unknown,
 };
 
+inline fmt::iterator
+format_to(proto_incompatibility_type t, fmt::iterator out) {
+    switch (t) {
+    case proto_incompatibility_type::message_removed:
+        return fmt::format_to(out, "MESSAGE_REMOVED");
+    case proto_incompatibility_type::field_kind_changed:
+        return fmt::format_to(out, "FIELD_KIND_CHANGED");
+    case proto_incompatibility_type::field_scalar_kind_changed:
+        return fmt::format_to(out, "FIELD_SCALAR_KIND_CHANGED");
+    case proto_incompatibility_type::field_named_type_changed:
+        return fmt::format_to(out, "FIELD_NAMED_TYPE_CHANGED");
+    case proto_incompatibility_type::required_field_added:
+        return fmt::format_to(out, "REQUIRED_FIELD_ADDED");
+    case proto_incompatibility_type::required_field_removed:
+        return fmt::format_to(out, "REQUIRED_FIELD_REMOVED");
+    case proto_incompatibility_type::oneof_field_removed:
+        return fmt::format_to(out, "ONEOF_FIELD_REMOVED");
+    case proto_incompatibility_type::multiple_fields_moved_to_oneof:
+        return fmt::format_to(out, "MULTIPLE_FIELDS_MOVED_TO_ONEOF");
+    case proto_incompatibility_type::unknown:
+        return fmt::format_to(out, "UNKNOWN");
+    }
+}
+
 /**
  * proto_incompatibility - A single incompatibility between Protobuf schemas.
  *
@@ -117,14 +166,15 @@ public:
     ss::sstring describe() const;
     Type type() const { return _type; }
 
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, R"({{errorType:"{}", description:"{}"}})", _type, describe());
+    }
+
+    friend bool operator==(
+      const proto_incompatibility&, const proto_incompatibility&) = default;
+
 private:
-    friend std::ostream&
-    operator<<(std::ostream& os, const proto_incompatibility& v);
-
-    friend bool
-    operator==(const proto_incompatibility&, const proto_incompatibility&)
-      = default;
-
     // Helpful for unit testing
     template<typename H>
     friend H AbslHashValue(H h, const proto_incompatibility& e) {
@@ -195,6 +245,8 @@ enum class json_incompatibility_type {
     unknown,
 };
 
+fmt::iterator format_to(json_incompatibility_type t, fmt::iterator);
+
 /**
  * json_incompatibility - A single incompatibility between JSON schemas.
  *
@@ -216,12 +268,13 @@ public:
     ss::sstring describe() const;
     Type type() const { return _type; }
 
-    friend std::ostream&
-    operator<<(std::ostream& os, const json_incompatibility& v);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, R"({{errorType:"{}", description:"{}"}})", _type, describe());
+    }
 
-    friend bool
-    operator==(const json_incompatibility&, const json_incompatibility&)
-      = default;
+    friend bool operator==(
+      const json_incompatibility&, const json_incompatibility&) = default;
 
     // Helpful for unit testing
     template<typename H>

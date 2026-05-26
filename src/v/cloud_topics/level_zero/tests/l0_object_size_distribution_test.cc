@@ -10,25 +10,20 @@
 
 #include "cloud_io/remote_api.h"
 #include "cloud_topics/level_zero/batcher/batcher.h"
-#include "cloud_topics/level_zero/pipeline/event_filter.h"
 #include "cloud_topics/level_zero/write_request_scheduler/write_request_scheduler.h"
-#include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/record.h"
 #include "model/tests/random_batch.h"
+#include "test_utils/async.h"
 #include "test_utils/test.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/manual_clock.hh>
 #include <seastar/core/sharded.hh>
-#include <seastar/coroutine/as_future.hh>
 
 #include <gmock/gmock.h>
-
-#include <limits>
 
 using namespace std::chrono_literals;
 using namespace cloud_topics;
@@ -103,6 +98,9 @@ public:
     seastar::future<cloud_topics::cluster_epoch>
     current_epoch(seastar::abort_source*) override {
         return seastar::make_ready_future<cloud_topics::cluster_epoch>(0);
+    }
+    seastar::future<> invalidate_epoch_below(cluster_epoch) override {
+        return ss::now();
     }
 };
 
@@ -195,7 +193,7 @@ TEST_F(L0ObjectSizeDistFixture, ThreeToOne) {
      * cores and then expects that these are eventually grouped together and
      * uploaded as a single object by the scheduler/batcher.
      */
-    ASSERT_EQ(seastar::smp::count, 3);
+    ASSERT_EQ(seastar::this_smp_shard_count(), 3);
     start(false).get();
 
     const auto timeout = 1s;
@@ -204,7 +202,7 @@ TEST_F(L0ObjectSizeDistFixture, ThreeToOne) {
     // build batches to upload to each core
     size_t total_size{0};
     std::vector<chunked_vector<model::record_batch>> batches;
-    for (unsigned i = 0; i < seastar::smp::count; ++i) {
+    for (unsigned i = 0; i < seastar::this_smp_shard_count(); ++i) {
         batches.emplace_back();
         auto buf = model::test::make_random_batches().get();
         for (auto& b : buf) {
@@ -221,8 +219,18 @@ TEST_F(L0ObjectSizeDistFixture, ThreeToOne) {
           .discard_result();
     });
 
-    // Allow requests to be propagated to the scheduler
-    ss::sleep(5ms).get();
+    // Wait until every shard has registered its write_request in the first
+    // pipeline stage.
+    RPTEST_REQUIRE_EVENTUALLY(5s, [&](this auto) -> ss::future<bool> {
+        size_t bytes = co_await pipeline.map_reduce0(
+          [](auto& p) {
+              const auto* counter = p.stage_bytes_ref_by_index(0);
+              return counter ? counter->load() : size_t{0};
+          },
+          size_t{0},
+          std::plus<>{});
+        co_return bytes >= total_size;
+    });
 
     // Advance time to trigger the scheduler
     ss::manual_clock::advance(300ms);

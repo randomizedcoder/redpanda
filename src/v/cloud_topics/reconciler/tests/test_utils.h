@@ -23,6 +23,7 @@
 #include <seastar/util/log.hh>
 
 #include <expected>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 
@@ -48,6 +49,20 @@ public:
         _source_log.push_back(std::move(batch));
     }
 
+    bool has_pending_data() override { return true; }
+
+    int64_t pending_offset_lag() override {
+        if (_source_log.empty()) {
+            return 0;
+        }
+        auto lso = kafka::offset(_source_log.back().last_offset()() + 1);
+        auto next = kafka::next_offset(_lro);
+        if (lso <= next) {
+            return 0;
+        }
+        return (lso - next)();
+    }
+
     kafka::offset last_reconciled_offset() override { return _lro; }
 
     ss::future<std::expected<void, errc>>
@@ -61,6 +76,9 @@ public:
 
     ss::future<model::record_batch_reader>
     make_reader(source::reader_config cfg) override {
+        if (_on_make_reader) {
+            _on_make_reader();
+        }
         if (_fail_make_reader) {
             throw std::runtime_error("Failed to make reader");
         }
@@ -85,12 +103,16 @@ public:
 
     void fail_set_lro(bool fail) { _fail_set_lro = fail; }
     void fail_make_reader(bool fail) { _fail_make_reader = fail; }
+    void set_on_make_reader(std::function<void()> cb) {
+        _on_make_reader = std::move(cb);
+    }
 
 private:
     kafka::offset _lro;
     chunked_vector<model::record_batch> _source_log;
     bool _fail_set_lro = false;
     bool _fail_make_reader = false;
+    std::function<void()> _on_make_reader;
 };
 
 class unreliable_metastore : public l1::simple_metastore {

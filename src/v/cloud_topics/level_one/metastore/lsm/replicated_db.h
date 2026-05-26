@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "cloud_io/cache_service.h"
 #include "cloud_io/remote.h"
 #include "cloud_storage_clients/types.h"
 #include "cloud_topics/level_one/metastore/lsm/stm.h"
@@ -19,6 +20,8 @@
 #include "lsm/proto/manifest.proto.h"
 #include "model/fundamental.h"
 #include "utils/detailed_error.h"
+
+#include <seastar/core/scheduling.hh>
 
 #include <expected>
 #include <filesystem>
@@ -60,10 +63,11 @@ public:
     open(
       model::term_id expected_term,
       stm* s,
-      const std::filesystem::path& staging_directory,
+      cloud_io::cache* cache,
       cloud_io::remote* remote,
       const cloud_storage_clients::bucket_name& bucket,
-      ss::abort_source& as);
+      ss::abort_source& as,
+      ss::scheduling_group sg);
 
     replicated_database(replicated_database&&) = delete;
     ~replicated_database() = default;
@@ -99,12 +103,14 @@ private:
       domain_uuid domain_uuid,
       stm* s,
       lsm::database db,
-      ss::abort_source& as)
+      ss::abort_source& as,
+      ss::scheduling_group sg)
       : term_(term)
       , expected_domain_uuid_(domain_uuid)
       , stm_(s)
       , db_(std::move(db))
-      , as_(as) {}
+      , as_(as)
+      , sg_(sg) {}
 
     ss::future<> apply_loop();
 
@@ -133,6 +139,7 @@ private:
 
     ss::gate gate_;
     ss::abort_source& as_;
+    ss::scheduling_group sg_;
 };
 
 } // namespace cloud_topics::l1

@@ -9,13 +9,10 @@
 
 #include "storage/segment_utils.h"
 
-#include "absl/container/btree_map.h"
-#include "absl/container/flat_hash_map.h"
 #include "base/likely.h"
 #include "base/units.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
-#include "bytes/iobuf_parser.h"
 #include "config/configuration.h"
 #include "container/chunked_vector.h"
 #include "model/adl_serde.h"
@@ -25,7 +22,6 @@
 #include "reflection/adl.h"
 #include "ssx/future-util.h"
 #include "ssx/when_all.h"
-#include "storage/chunk_cache.h"
 #include "storage/compacted_index.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/compaction_reducers.h"
@@ -34,32 +30,28 @@
 #include "storage/fs_utils.h"
 #include "storage/fwd.h"
 #include "storage/index_state.h"
-#include "storage/kvstore.h"
 #include "storage/lock_manager.h"
 #include "storage/log_reader.h"
 #include "storage/logger.h"
-#include "storage/ntp_config.h"
 #include "storage/scoped_file_tracker.h"
 #include "storage/segment.h"
 #include "storage/types.h"
 #include "utils/file_io.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/file-types.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/core/reactor.hh>
+#include <seastar/core/reactor.hh> // NOLINT(misc-include-cleaner) ss::open_file_dma, ss::file_stat
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
-#include <seastar/util/defer.hh>
+#include <seastar/coroutine/exception.hh>
 
 #include <fmt/core.h>
-#include <fmt/format.h>
 #include <roaring/roaring.hh>
 
 #include <optional>
@@ -230,7 +222,7 @@ ss::future<size_t> copy_filtered_entries(
     co_await writer->close();
 
     if (eptr) {
-        std::rethrow_exception(eptr);
+        co_await ss::coroutine::return_exception_ptr(std::move(eptr));
     }
 
     co_return writer->size_bytes();
@@ -273,7 +265,7 @@ ss::future<size_t> write_clean_compacted_index(
     }
 
     if (fut.failed()) {
-        std::rethrow_exception(fut.get_exception());
+        co_await ss::coroutine::return_exception_ptr(fut.get_exception());
     }
 
     co_return fut.get();
@@ -352,7 +344,7 @@ ss::future<size_t> do_compact_segment_index(
 ss::future<storage::index_state> do_copy_segment_data(
   ss::lw_shared_ptr<segment> seg,
   compaction::compaction_config cfg,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   storage::probe& pb,
   ss::rwlock::holder rw_lock_holder,
   storage_resources& resources,
@@ -460,7 +452,7 @@ ss::future<storage::index_state> do_copy_segment_data(
       segment_last_offset,
       compaction_placeholder_enabled,
       tx_batch_compaction_enabled,
-      stm_manager,
+      stm_hookset,
       /*cidx=*/nullptr,
       /*inject_failure=*/false,
       cfg.asrc);
@@ -581,7 +573,7 @@ ss::future<> do_swap_data_file_handles(
 ss::future<compaction_result> do_self_compact_segment(
   ss::lw_shared_ptr<segment> s,
   compaction::compaction_config cfg,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   storage::probe& pb,
   storage::readers_cache& readers_cache,
   storage_resources& resources,
@@ -599,7 +591,7 @@ ss::future<compaction_result> do_self_compact_segment(
     auto segment_generation = s->get_generation_id();
 
     if (s->is_closed()) {
-        throw segment_closed_exception();
+        co_await ss::coroutine::return_exception(segment_closed_exception());
     }
 
     // broker_timestamp is used for retention.ms, but it's only in the index,
@@ -617,7 +609,7 @@ ss::future<compaction_result> do_self_compact_segment(
     auto idx = co_await do_copy_segment_data(
       s,
       cfg,
-      stm_manager,
+      stm_hookset,
       pb,
       std::move(read_holder),
       resources,
@@ -641,7 +633,7 @@ ss::future<compaction_result> do_self_compact_segment(
     }
 
     if (s->is_closed()) {
-        throw segment_closed_exception();
+        co_await ss::coroutine::return_exception(segment_closed_exception());
     }
 
     co_await s->index().drop_all_data();
@@ -662,17 +654,19 @@ ss::future<compaction_result> do_self_compact_segment(
 
 ss::future<> build_compaction_index(
   model::record_batch_reader rdr,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   chunked_vector<model::tx_range> aborted_txs,
   const segment_full_path& p,
   compaction::compaction_config cfg,
   storage_resources& resources,
   bool tx_batch_compaction_enabled) {
+    auto transactional_stm_type = stm_hookset->transactional_stm_type();
     auto w = storage::make_file_backed_compacted_index(
       p, false, resources, cfg.sanitizer_config);
     auto reducer = tx_reducer(
       p.get_ntp(),
-      stm_manager,
+      stm_hookset,
+      transactional_stm_type,
       std::move(aborted_txs),
       w.get(),
       tx_batch_compaction_enabled);
@@ -682,8 +676,10 @@ ss::future<> build_compaction_index(
         .finally([&w] { return w->close(); }));
     if (index_builder.failed()) {
         auto exception = index_builder.get_exception();
-        vlog(
-          gclog.error,
+        vlogl(
+          gclog,
+          ssx::is_shutdown_exception(exception) ? ss::log_level::debug
+                                                : ss::log_level::error,
           "Error rebuilding index: {}, {}",
           w->filename(),
           exception);
@@ -710,7 +706,7 @@ bool compacted_index_needs_rebuild(compacted_index::recovery_state state) {
 
 ss::future<> rebuild_compaction_index(
   ss::lw_shared_ptr<segment> s,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   compaction::compaction_config cfg,
   storage::probe& pb,
   storage_resources& resources,
@@ -720,14 +716,14 @@ ss::future<> rebuild_compaction_index(
     pb.corrupted_compaction_index();
     auto h = co_await s->read_lock();
     if (s->is_closed()) {
-        throw segment_closed_exception();
+        co_await ss::coroutine::return_exception(segment_closed_exception());
     }
     // TODO: Improve memory management here, eg: ton of aborted txs?
-    auto aborted_txs = co_await stm_manager->aborted_tx_ranges(
+    auto aborted_txs = co_await stm_hookset->aborted_tx_ranges(
       s->offsets().get_base_offset(), s->offsets().get_stable_offset());
     co_await build_compaction_index(
       create_segment_full_reader(s, cfg, pb, std::move(h)),
-      stm_manager,
+      stm_hookset,
       std::move(aborted_txs),
       idx_path,
       cfg,
@@ -739,7 +735,7 @@ ss::future<> rebuild_compaction_index(
 
 ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
   ss::lw_shared_ptr<segment> s,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   const compaction::compaction_config& cfg,
   ss::rwlock::holder& read_holder,
   storage_resources& resources,
@@ -756,7 +752,8 @@ ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
               gclog.debug,
               "Stopping in maybe_rebuild_compaction_index, segment closed: {}",
               s->filename());
-            throw segment_closed_exception();
+            co_await ss::coroutine::return_exception(
+              segment_closed_exception());
         }
         // Check the index state while the read lock is held, preventing e.g.
         // concurrent truncations, which removes the index.
@@ -778,7 +775,7 @@ ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
         }
 
         co_await rebuild_compaction_index(
-          s, stm_manager, cfg, pb, resources, tx_batch_compaction_enabled);
+          s, stm_hookset, cfg, pb, resources, tx_batch_compaction_enabled);
 
         // Take the lock again before proceeding.
         read_holder = co_await s->read_lock();
@@ -794,7 +791,7 @@ ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
 
 ss::future<compaction_result> self_compact_segment(
   ss::lw_shared_ptr<segment> s,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   const compaction::compaction_config& cfg,
   storage::probe& pb,
   storage::readers_cache& readers_cache,
@@ -828,7 +825,7 @@ ss::future<compaction_result> self_compact_segment(
     compacted_index::recovery_state state
       = co_await maybe_rebuild_compaction_index(
         s,
-        stm_manager,
+        stm_hookset,
         cfg,
         read_holder,
         resources,
@@ -844,7 +841,7 @@ ss::future<compaction_result> self_compact_segment(
     auto res = co_await do_self_compact_segment(
       s,
       cfg,
-      stm_manager,
+      stm_hookset,
       pb,
       readers_cache,
       resources,
@@ -884,7 +881,8 @@ make_concatenated_segment(
     // happened to be racing with an operation like truncation or shutdown.
     for (const auto& segment : segments) {
         if (unlikely(segment->is_closed())) {
-            throw segment_closed_exception();
+            co_await ss::coroutine::return_exception(
+              segment_closed_exception());
         }
     }
 
@@ -1105,8 +1103,9 @@ ss::future<> do_write_concatenated_compacted_index(
             std::move(readers),
             [cfg, target_path = std::move(target_path), &resources](
               chunked_vector<compacted_index_reader>& readers) mutable {
-                return ss::parallel_for_each(
+                return ss::max_concurrent_for_each(
                          readers,
+                         32,
                          [](compacted_index_reader& reader) {
                              return reader.verify_integrity();
                          })
@@ -1137,9 +1136,10 @@ ss::future<> do_write_concatenated_compacted_index(
                         std::move(writer), readers);
                   })
                   .finally([&readers] {
-                      return ss::parallel_for_each(
-                        readers,
-                        [](compacted_index_reader& r) { return r.close(); });
+                      return ss::max_concurrent_for_each(
+                        readers, 32, [](compacted_index_reader& r) {
+                            return r.close();
+                        });
                   });
             });
       });
@@ -1199,7 +1199,7 @@ ss::future<chunked_vector<ss::rwlock::holder>> transfer_segment(
 ss::future<compaction_result> concatenate_and_rebuild_target_segment(
   ss::lw_shared_ptr<segment> target,
   chunked_vector<ss::lw_shared_ptr<segment>>& segments,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   compaction::compaction_config cfg,
   storage::probe& pb,
   storage::readers_cache& readers_cache,
@@ -1241,7 +1241,7 @@ ss::future<compaction_result> concatenate_and_rebuild_target_segment(
     // index state.
     compaction_result ret = co_await self_compact_segment(
       replacement,
-      stm_manager,
+      stm_hookset,
       cfg,
       pb,
       readers_cache,
@@ -1285,15 +1285,18 @@ ss::future<compaction_result> concatenate_and_rebuild_target_segment(
     for (const auto& segment : segments) {
         // check generation id under write lock
         if (unlikely(segment->get_generation_id() != *gen_it)) {
-            throw generation_id_mismatch_exception(
-              fmt::format(
-                "Aborting compaction of a segment: {}. Generation id mismatch, "
-                "previous generation: {}",
-                *segment,
-                *gen_it));
+            co_await ss::coroutine::return_exception(
+              generation_id_mismatch_exception(
+                fmt::format(
+                  "Aborting compaction of a segment: {}. Generation id "
+                  "mismatch, "
+                  "previous generation: {}",
+                  *segment,
+                  *gen_it)));
         }
         if (unlikely(segment->is_closed())) {
-            throw segment_closed_exception();
+            co_await ss::coroutine::return_exception(
+              segment_closed_exception());
         }
         ++gen_it;
     }

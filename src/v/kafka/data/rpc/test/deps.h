@@ -7,6 +7,12 @@
 #include "model/record.h"
 #include "model/tests/random_batch.h"
 
+#include <seastar/core/condition-variable.hh>
+
+namespace rpc {
+class rpc_server;
+} // namespace rpc
+
 namespace kafka::data::rpc::test {
 
 // A small helper struct to allow copies for easier to read tests and
@@ -43,7 +49,7 @@ struct record_batches {
     }
 
     friend std::ostream& operator<<(std::ostream& os, const record_batches& b) {
-        return os << ss::format("{}", b.underlying);
+        return os << "record_batches{size=" << b.underlying.size() << "}";
     }
 
     bool empty() const { return underlying.empty(); }
@@ -91,9 +97,11 @@ public:
     model::offset start_offset() const final {
         throw std::runtime_error("unimplemented");
     }
-    model::offset high_watermark() const final { return model::offset(102); }
+    model::offset high_watermark() const final {
+        return model::next_offset(latest_offset());
+    }
     checked<model::offset, kafka::error_code> last_stable_offset() const final {
-        return model::offset(101);
+        return latest_offset();
     }
     kafka::leader_epoch leader_epoch() const final {
         throw std::runtime_error("unimplemented");
@@ -129,8 +137,8 @@ public:
                 break;
             }
         }
-        co_return model::make_memory_record_batch_reader(
-          std::move(read_batches));
+        co_return storage::translating_reader(
+          model::make_memory_record_batch_reader(std::move(read_batches)));
     }
     ss::future<std::optional<storage::timequery_result>>
     timequery(storage::timequery_config) final {
@@ -150,7 +158,7 @@ public:
     ss::future<result<model::offset>> replicate(
       chunked_vector<model::record_batch> batches,
       raft::replicate_options) final {
-        auto offset = latest_offset();
+        auto offset = model::next_offset(latest_offset());
         for (const auto& batch : batches) {
             auto b = batch.copy();
             b.header().base_offset = offset++;
@@ -185,10 +193,18 @@ public:
     model::offset offset_lag() const override {
         throw std::runtime_error("unimplemented");
     }
+    ss::future<cluster::partition_cloud_storage_status>
+    get_cloud_storage_status() const override {
+        throw std::runtime_error("unimplemented");
+    }
+    std::unique_ptr<kafka::exact_offset_replicator>
+      make_exact_offset_replicator() && final {
+        return nullptr;
+    }
 
 private:
-    model::offset latest_offset() {
-        auto o = model::offset(0);
+    model::offset latest_offset() const {
+        auto o = model::offset(-1);
         for (const auto& b : *_produced_batches) {
             if (b.ntp == _ntp) {
                 o = b.batch.last_offset();
@@ -444,6 +460,9 @@ public:
             --_errors_to_inject;
             co_return cluster::errc::timeout;
         }
+        if (_stalled) {
+            co_await _stall_cv.wait([this] { return !_stalled; });
+        }
         auto pp = kafka::partition_proxy(
           std::make_unique<in_memory_proxy>(ntp, &_produced_batches));
         co_return co_await fn(&pp);
@@ -455,6 +474,8 @@ public:
 
 private:
     int _errors_to_inject = 0;
+    bool _stalled{false};
+    ss::condition_variable _stall_cv;
     ss::chunked_fifo<produced_batch> _produced_batches;
     model::ntp_map_type<ss::shard_id> _shard_locations;
 };
@@ -553,8 +574,9 @@ public:
 
     void wire_up_and_start();
 
-    void
-    register_services(std::vector<std::unique_ptr<::rpc::service>>& services);
+    void register_services(
+      std::vector<std::unique_ptr<::rpc::service>>& services,
+      ::rpc::rpc_server* server = nullptr);
 
     fake_topic_metadata_cache* remote_metadata_cache() { return _remote_ftmc; }
     fake_partition_manager* remote_partition_manager() { return _remote_fpm; }

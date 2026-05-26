@@ -16,6 +16,8 @@
 #include "model/fundamental.h"
 #include "serde/envelope.h"
 
+#include <seastar/core/future.hh>
+
 #include <deque>
 
 namespace cloud_topics::l1 {
@@ -58,6 +60,7 @@ struct lsm_state
           persisted_manifest);
     }
     lsm_state share();
+    ss::future<> serde_async_write(iobuf& out);
 
     // Conversion between Redpanda space and LSM DB space.
     model::term_id to_term(lsm::internal::database_epoch) const;
@@ -108,9 +111,8 @@ struct lsm_state
         auto serde_fields() {
             return std::tie(buf, last_seqno, database_epoch);
         }
-        friend bool
-        operator==(const serialized_manifest&, const serialized_manifest&)
-          = default;
+        friend bool operator==(
+          const serialized_manifest&, const serialized_manifest&) = default;
         serialized_manifest share();
         lsm::sequence_number get_last_seqno() const { return last_seqno; }
         lsm::internal::database_epoch get_database_epoch() const {
@@ -129,6 +131,7 @@ struct lsm_stm_snapshot
       envelope<lsm_stm_snapshot, serde::version<0>, serde::compat_version<0>> {
     auto serde_fields() { return std::tie(state); }
     lsm_state state;
+    ss::future<> serde_async_write(iobuf& out);
 };
 
 } // namespace cloud_topics::l1

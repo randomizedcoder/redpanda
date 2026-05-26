@@ -10,9 +10,8 @@
  */
 #include "cluster/data_migrated_resources.h"
 
-#include "absl/container/flat_hash_set.h"
+#include "cluster/data_migration_types.h"
 #include "container/chunked_hash_map.h"
-#include "data_migration_types.h"
 
 #include <seastar/util/variant_utils.hh>
 

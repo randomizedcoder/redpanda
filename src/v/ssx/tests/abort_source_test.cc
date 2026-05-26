@@ -9,7 +9,6 @@
 
 #include "ssx/abort_source.h"
 
-#include <seastar/core/sstring.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/later.hh>
 
@@ -65,7 +64,7 @@ struct fixture {
 };
 
 SEASTAR_THREAD_TEST_CASE(ssx_sharded_abort_source_test_abort_parent) {
-    BOOST_REQUIRE(ss::smp::count > 1);
+    BOOST_REQUIRE(ss::this_smp_shard_count() > 1);
 
     fixture f;
     f.start().get();
@@ -89,7 +88,7 @@ SEASTAR_THREAD_TEST_CASE(ssx_sharded_abort_source_test_abort_parent) {
 }
 
 SEASTAR_THREAD_TEST_CASE(ssx_sharded_abort_source_test_no_abort_parent) {
-    BOOST_REQUIRE(ss::smp::count > 1);
+    BOOST_REQUIRE(ss::this_smp_shard_count() > 1);
 
     fixture f;
     f.start().get();

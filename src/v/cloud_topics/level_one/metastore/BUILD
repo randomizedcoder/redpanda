@@ -17,6 +17,22 @@ redpanda_cc_library(
     deps = [
         "//src/v/utils:named_type",
         "//src/v/utils:uuid",
+        "@fmt",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "leveling_range_builder",
+    hdrs = [
+        "leveling_range_builder.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/container:chunked_vector",
+        "//src/v/model",
+        "//src/v/serde",
+        "@fmt",
     ],
 )
 
@@ -101,6 +117,7 @@ redpanda_cc_library(
         "//src/v/cloud_topics/level_one/domain:domain_supervisor",
         "//src/v/config",
         "//src/v/hashing:murmur",
+        "//src/v/resource_mgmt:cpu_scheduling",
         "@fmt",
     ],
     visibility = ["//visibility:public"],
@@ -110,6 +127,11 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/cloud_storage:remote_label",
         "//src/v/cluster",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:members_table",
+        "//src/v/cluster:partition_leaders_table",
+        "//src/v/cluster:shard_table",
+        "//src/v/cluster:topic_table",
         "//src/v/metrics",
         "//src/v/model",
         "//src/v/rpc",
@@ -125,6 +147,7 @@ redpanda_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":leveling_range_builder",
         ":metastore_manifest",
         ":offset_interval_set",
         "//src/v/base",
@@ -170,6 +193,7 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/cloud_io:remote",
         "//src/v/cloud_storage_clients",
+        "//src/v/cluster:fwd",
         "//src/v/model",
         "//src/v/storage",
         "@seastar",
@@ -184,6 +208,7 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":domain_uuid",
+        ":leveling_range_builder",
         ":offset_interval_set",
         ":state_update",
         "//src/v/cloud_topics/level_one/common:object_id",
@@ -202,6 +227,7 @@ redpanda_cc_library(
         "simple_metastore.h",
     ],
     implementation_deps = [
+        ":leveling_range_builder",
         ":state_update",
         "//src/v/cloud_topics:logger",
     ],
@@ -338,7 +364,7 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":metastore",
-        "//src/v/base",
+        ":retry",
         "//src/v/cloud_topics:logger",
         "//src/v/cluster",
         "//src/v/model",
@@ -348,6 +374,8 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
+        "//src/v/cluster:scheduling_allocation",
+        "//src/v/cluster:topic_table",
         "//src/v/ssx:work_queue",
         "//src/v/utils:named_type",
         "@seastar",
@@ -364,7 +392,6 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":metastore",
-        "//src/v/base",
         "//src/v/cloud_topics:logger",
         "//src/v/config",
         "//src/v/ssx:semaphore",
@@ -374,6 +401,34 @@ redpanda_cc_library(
     deps = [
         "//src/v/base",
         "//src/v/ssx:actor",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "partition_validator",
+    srcs = [
+        "partition_validator.cc",
+    ],
+    hdrs = [
+        "partition_validator.h",
+    ],
+    implementation_deps = [
+        "//src/v/cloud_io:remote",
+        "//src/v/cloud_topics/level_one/common:object_utils",
+        "//src/v/cloud_topics/level_one/metastore/lsm:keys",
+        "//src/v/utils:retry_chain_node",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/cloud_storage_clients",
+        "//src/v/cloud_topics/level_one/metastore/lsm:state_reader",
+        "//src/v/cloud_topics/level_one/metastore/lsm:values",
+        "//src/v/container:chunked_hash_map",
+        "//src/v/container:chunked_vector",
+        "//src/v/model",
+        "//src/v/utils:detailed_error",
         "@seastar",
     ],
 )

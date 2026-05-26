@@ -21,10 +21,13 @@
 #include "model/timestamp.h"
 #include "storage/file_sanitizer_types.h"
 #include "storage/fwd.h"
+#include "storage/logger.h"
 #include "storage/scoped_file_tracker.h"
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/file.hh> //io_priority
+#include <seastar/core/gate.hh>
 #include <seastar/core/rwlock.hh>
 #include <seastar/util/bool_class.hh>
 
@@ -52,7 +55,7 @@ public:
     // create a snapshot at given offset unless a snapshot with given or newer
     // offset already exists
     virtual ss::future<> ensure_local_snapshot_exists(model::offset) = 0;
-    // hints stm_manager that now it's a good time to make a snapshot
+    // hints stm_hookset that now it's a good time to make a snapshot
     virtual void write_local_snapshot_in_background() = 0;
 
     // Lets the STM control snapshotting and local data removal by limiting
@@ -99,7 +102,7 @@ public:
 };
 
 /**
- * stm_manager is an interface responsible for the coordination of state
+ * stm_hookset is an interface responsible for the coordination of state
  * machines  snapshotting and the log operations such as eviction and
  * compaction. We use  snapshots for two purposes:
  *
@@ -115,17 +118,40 @@ public:
  * to a situation when the state exists only in RAM which makes the system
  * vulnerable to power outages.
  *
- * We pass stm_manager to log.h and eviction_stm.h to give them a way to make
+ * We pass stm_hookset to log.h and eviction_stm.h to give them a way to make
  * sure that a snapshot with given or newer offset exists before removing the
- * prior events. When a snapshot doesn't exist stm_manager makes the snapshot
+ * prior events. When a snapshot doesn't exist stm_hookset makes the snapshot
  * and returns control flow.
  *
  * make_snapshot lets log to hint when it's good time to make a snapshot e.g.
  * after a segment roll. It's up to a state machine to decide whether to make
  * it now or on its own pace.
  */
-class stm_manager {
+class stm_hookset {
 public:
+    ~stm_hookset() {
+        vassert(
+          _status != status::running,
+          "stm_hookset is destructed without shutting down");
+    }
+
+    void start() {
+        vassert(
+          _status == status::not_started, "Invalid status transition on start");
+        _status = status::running;
+        _status_running_cv.broadcast();
+    }
+
+    void stop() {
+        vassert(
+          _status != status::shutting_down,
+          "Invalid status transition on stop");
+        if (_status == status::not_started) {
+            _status_running_cv.broadcast();
+        }
+        _status = status::shutting_down;
+    }
+
     void add_stm(ss::shared_ptr<snapshotable_stm> stm) {
         if (
           stm->type() == stm_type::user_topic_transactional
@@ -137,7 +163,7 @@ public:
     }
 
     ss::future<> ensure_snapshot_exists(model::offset offset) {
-        auto f = ss::now();
+        auto f = await_start();
         for (auto stm : _stms) {
             f = f.then([stm, offset]() {
                 return stm->ensure_local_snapshot_exists(offset);
@@ -146,10 +172,18 @@ public:
         return f;
     }
 
-    void make_snapshot_in_background() {
+    bool request_make_snapshot_in_background() {
+        if (_status != status::running) {
+            vlog(
+              stlog.warn,
+              "request to make snapshot in background is ignored because stm "
+              "manager is not running");
+            return false;
+        }
         for (auto& stm : _stms) {
             stm->write_local_snapshot_in_background();
         }
+        return true;
     }
 
     model::offset max_removable_local_log_offset();
@@ -161,6 +195,7 @@ public:
 
     ss::future<chunked_vector<model::tx_range>>
     aborted_tx_ranges(model::offset to, model::offset from) {
+        co_await await_start();
         chunked_vector<model::tx_range> r;
         if (_tx_stm) {
             r = co_await _tx_stm->aborted_tx_ranges(to, from);
@@ -170,6 +205,7 @@ public:
 
     model::control_record_type
     parse_tx_control_batch(const model::record_batch& b) {
+        check_status("parse_tx_control_batch");
         if (!_tx_stm) {
             return model::control_record_type::unknown;
         }
@@ -177,10 +213,12 @@ public:
     }
 
     const std::vector<ss::shared_ptr<snapshotable_stm>>& stms() const {
+        check_status("stms");
         return _stms;
     }
 
     std::optional<storage::stm_type> transactional_stm_type() const {
+        check_status("transactional_stm_type");
         if (_tx_stm) {
             return _tx_stm->type();
         }
@@ -188,6 +226,7 @@ public:
     }
 
     const ss::shared_ptr<snapshotable_stm> transactional_stm() const {
+        check_status("transactional_stm");
         return _tx_stm;
     }
 
@@ -200,10 +239,45 @@ public:
     bool is_batch_in_idempotent_window(const model::record_batch_header&) const;
 
 private:
+    void check_status(std::string_view operation) const {
+        switch (_status) {
+        case status::not_started: {
+            vassert(
+              false, "stm_hookset has not started for operation {}", operation);
+        }
+        case status::running:
+            [[likely]] return;
+        case status::shutting_down:
+            throw ss::gate_closed_exception();
+        }
+    }
+
+    bool has_started() const {
+        if (_status == status::not_started) {
+            return false;
+        }
+        check_status("has_started");
+        return true;
+    }
+
+    ss::future<> await_start() const {
+        if (_status == status::not_started) {
+            vlog(
+              stlog.error,
+              "attempt to list STMs before stm_hookset is started");
+            co_await _status_running_cv.wait();
+        }
+        check_status("await_start");
+    }
+
+    enum class status : uint8_t { not_started, running, shutting_down };
+
     ss::shared_ptr<snapshotable_stm> _tx_stm;
     std::vector<ss::shared_ptr<snapshotable_stm>> _stms;
     model::offset _max_tombstone_remove_offset{};
     model::offset _max_tx_end_remove_offset{};
+    status _status{status::not_started};
+    mutable ss::condition_variable _status_running_cv;
 };
 
 /// returns base_offset's from batches. Not max_offsets
@@ -216,7 +290,7 @@ struct offset_stats {
     model::offset dirty_offset;
     model::term_id dirty_offset_term;
 
-    friend std::ostream& operator<<(std::ostream&, const offset_stats&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct log_append_config {
@@ -231,7 +305,7 @@ struct append_result {
     size_t byte_size;
     model::term_id last_term;
 
-    friend std::ostream& operator<<(std::ostream& o, const append_result&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /// A timequery configuration specifies the range of offsets to search for a
@@ -257,7 +331,7 @@ struct timequery_config {
     model::opt_abort_source_t abort_source;
     model::opt_client_address_t client_address;
 
-    friend std::ostream& operator<<(std::ostream& o, const timequery_config&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 struct timequery_result {
     timequery_result(
@@ -272,7 +346,7 @@ struct timequery_result {
 
     bool operator==(const timequery_result& other) const = default;
 
-    friend std::ostream& operator<<(std::ostream& o, const timequery_result&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct truncate_config {
@@ -280,7 +354,8 @@ struct truncate_config {
       : base_offset(o) {}
     // Lowest offset to remove.
     model::offset base_offset;
-    friend std::ostream& operator<<(std::ostream&, const truncate_config&);
+
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /**
@@ -308,8 +383,7 @@ struct truncate_prefix_config {
     // an error.
     std::optional<model::offset_delta> force_truncate_delta;
 
-    friend std::ostream&
-    operator<<(std::ostream&, const truncate_prefix_config&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /**
@@ -455,7 +529,7 @@ struct gc_config {
     // remove one segment if log is > max_bytes
     std::optional<size_t> max_bytes;
 
-    friend std::ostream& operator<<(std::ostream&, const gc_config&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /*
@@ -520,7 +594,7 @@ struct housekeeping_config {
         return cfg;
     }
 
-    friend std::ostream& operator<<(std::ostream&, const housekeeping_config&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct compaction_result {
@@ -550,7 +624,8 @@ struct compaction_result {
     size_t size_after;
     // The size of the new compacted index, if one was made.
     std::optional<size_t> cmp_idx_size_after{std::nullopt};
-    friend std::ostream& operator<<(std::ostream&, const compaction_result&);
+
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /*

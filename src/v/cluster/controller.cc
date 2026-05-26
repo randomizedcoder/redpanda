@@ -9,7 +9,6 @@
 
 #include "cluster/controller.h"
 
-#include "base/likely.h"
 #include "cloud_storage/topic_mount_handler.h"
 #include "cluster/bootstrap_backend.h"
 #include "cluster/client_quota_backend.h"
@@ -26,7 +25,6 @@
 #include "cluster/cluster_link/frontend.h"
 #include "cluster/cluster_link/table.h"
 #include "cluster/cluster_recovery_table.h"
-#include "cluster/cluster_utils.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller_api.h"
 #include "cluster/controller_backend.h"
@@ -34,6 +32,7 @@
 #include "cluster/controller_log_limiter.h"
 #include "cluster/controller_service.h"
 #include "cluster/controller_stm.h"
+#include "cluster/controller_utils.h"
 #include "cluster/data_migrated_resources.h"
 #include "cluster/data_migration_backend.h"
 #include "cluster/data_migration_frontend.h"
@@ -42,6 +41,7 @@
 #include "cluster/data_migration_table.h"
 #include "cluster/data_migration_types.h"
 #include "cluster/data_migration_worker.h"
+#include "cluster/drain_manager.h"
 #include "cluster/ephemeral_credential_frontend.h"
 #include "cluster/feature_backend.h"
 #include "cluster/feature_manager.h"
@@ -54,7 +54,6 @@
 #include "cluster/members_frontend.h"
 #include "cluster/members_manager.h"
 #include "cluster/members_table.h"
-#include "cluster/metadata_dissemination_service.h"
 #include "cluster/metrics_reporter.h"
 #include "cluster/node_status_table.h"
 #include "cluster/partition_balancer_backend.h"
@@ -81,7 +80,6 @@
 #include "model/timeout_clock.h"
 #include "raft/fundamental.h"
 #include "raft/fwd.h"
-#include "security/acl.h"
 #include "security/authorizer.h"
 #include "security/credential_store.h"
 #include "security/ephemeral_credential_store.h"
@@ -93,9 +91,7 @@
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
-#include <seastar/core/thread.hh>
 #include <seastar/coroutine/switch_to.hh>
-#include <seastar/util/later.hh>
 
 #include <algorithm>
 #include <chrono>
@@ -201,6 +197,9 @@ ss::future<> controller::wire_up() {
             }),
             ss::sharded_parameter([] {
                 return config::shard_local_cfg().oidc_discovery_url.bind();
+            }),
+            ss::sharded_parameter([] {
+                return config::shard_local_cfg().oidc_http_proxy_url.bind();
             }),
             ss::sharded_parameter([] {
                 return config::shard_local_cfg().oidc_token_audience.bind();
@@ -337,7 +336,8 @@ ss::future<> controller::start(
       std::ref(_connections),
       std::ref(_partition_leaders),
       std::ref(_members_table),
-      std::ref(_as));
+      std::ref(_as),
+      std::ref(_recovery_table));
 
     if (auto bucket_opt = get_configured_bucket(); bucket_opt.has_value()) {
         co_await _topic_mount_handler.start(
@@ -668,12 +668,12 @@ ss::future<> controller::start(
           conf_invariants.core_count);
     }
 
-    if (conf_invariants.core_count > ss::smp::count) {
+    if (conf_invariants.core_count > ss::this_smp_shard_count()) {
         // Successfully starting shard_balancer with reduced core count means
         // that all partition info from extra kvstores has been copied and we
         // can finally update the configuration invariants.
         auto new_invariants = configuration_invariants(
-          *config::node().node_id(), ss::smp::count);
+          *config::node().node_id(), ss::this_smp_shard_count());
         co_await _storage.local().kvs().put(
           storage::kvstore::key_space::controller,
           invariants_key(),
@@ -827,7 +827,8 @@ ss::future<> controller::start(
         .partition_autobalancing_min_size_threshold.bind(),
       config::shard_local_cfg().node_status_interval.bind(),
       config::shard_local_cfg().raft_learner_recovery_rate.bind(),
-      config::shard_local_cfg().partition_autobalancing_topic_aware.bind());
+      config::shard_local_cfg().partition_autobalancing_topic_aware.bind(),
+      config::shard_local_cfg().health_monitor_max_metadata_age.bind());
     co_await _partition_balancer.invoke_on(
       partition_balancer_backend::shard, &partition_balancer_backend::start);
 
@@ -843,8 +844,8 @@ ss::future<> controller::start(
               _raft0,
               _tp_state.local(),
               offsets_uploader);
-            if (config::shard_local_cfg()
-                  .enable_cluster_metadata_upload_loop()) {
+            if (
+              config::shard_local_cfg().enable_cluster_metadata_upload_loop()) {
                 _metadata_uploader->start();
             }
             _recovery_backend
@@ -1302,7 +1303,7 @@ controller::validate_configuration_invariants() {
       "Node id must be set before checking configuration invariants");
 
     auto current = configuration_invariants(
-      *config::node().node_id(), ss::smp::count);
+      *config::node().node_id(), ss::this_smp_shard_count());
 
     if (!invariants_buf) {
         // store configuration invariants

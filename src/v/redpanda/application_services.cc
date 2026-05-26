@@ -280,7 +280,9 @@ void application::wire_up_redpanda_services(
     producer_manager.invoke_on_all(&cluster::tx::producer_state_manager::start)
       .get();
 
-    if (config::shard_local_cfg().cloud_topics_enabled()) {
+    if (
+      config::shard_local_cfg().cloud_storage_enabled()
+      && !ct_test_cfg.disable_cloud_topics) {
         vassert(
           archival_storage_enabled(),
           "cloud topics currently requires archival storage to be enabled");
@@ -695,7 +697,6 @@ void application::wire_up_redpanda_services(
     construct_single_service(
       space_manager,
       config::shard_local_cfg().space_management_enable.bind(),
-      config::shard_local_cfg().space_management_enable_override.bind(),
       config::shard_local_cfg().retention_local_target_capacity_bytes.bind(),
       config::shard_local_cfg().retention_local_target_capacity_percent.bind(),
       config::shard_local_cfg().disk_reservation_percent.bind(),

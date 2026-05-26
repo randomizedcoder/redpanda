@@ -16,8 +16,6 @@
 #include "cluster_link/model/types.h"
 #include "model/namespace.h"
 
-#include <fmt/ranges.h>
-
 namespace cluster_link {
 
 using properties_set = model::topic_metadata_mirroring_config::properties_set;
@@ -724,10 +722,11 @@ source_topic_syncer::find_candidate_topics_for_creation(
             continue;
         }
 
-        if (get_link()
-              ->topic_metadata_cache()
-              .find_topic_cfg({::model::kafka_namespace, topic})
-              .has_value()) {
+        if (
+          get_link()
+            ->topic_metadata_cache()
+            .find_topic_cfg({::model::kafka_namespace, topic})
+            .has_value()) {
             if (topic == ::model::schema_registry_internal_tp.topic) {
                 // It is possible that the _schemas topic already exists.  The
                 // Schema Registry service will create the topic if it doesn't

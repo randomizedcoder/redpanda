@@ -18,6 +18,7 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/config",
         "//src/v/ssx:future_util",
+        "//src/v/ssx:mutex",
         "//src/v/ssx:semaphore",
         "//src/v/utils:adjustable_semaphore",
         "//src/v/utils:token_bucket",
@@ -34,6 +35,9 @@ redpanda_cc_library(
         "io_result.h",
     ],
     visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+    ],
 )
 
 redpanda_cc_library(
@@ -76,8 +80,6 @@ redpanda_cc_library(
         "//src/v/bytes:iostream",
         "//src/v/cloud_io:logger",
         "//src/v/ssx:future_util",
-        "//src/v/ssx:semaphore",
-        "//src/v/ssx:watchdog",
         "//src/v/utils:retry_chain_node",
         "@boost//:beast",
         "@boost//:lexical_cast",
@@ -148,15 +150,18 @@ redpanda_cc_library(
         "cache_probe.cc",
         "cache_service.cc",
         "recursive_directory_walker.cc",
+        "staging_file.cc",
     ],
     hdrs = [
         "access_time_tracker.h",
         "cache_probe.h",
         "cache_service.h",
         "recursive_directory_walker.h",
+        "staging_file.h",
     ],
     implementation_deps = [
         ":logger",
+        "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
         "//src/v/container:chunked_vector",
         "//src/v/serde",

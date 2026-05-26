@@ -7,6 +7,7 @@ redpanda_cc_btest(
         "ocsf_schemas_test.cc",
     ],
     deps = [
+        "//src/v/cluster:fwd",
         "//src/v/json",
         "//src/v/security",
         "//src/v/security:request_auth",
@@ -14,6 +15,7 @@ redpanda_cc_btest(
         "//src/v/security/audit:types",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
+        "@fmt",
         "@rapidjson",
         "@seastar",
     ],
@@ -26,6 +28,7 @@ redpanda_cc_gtest(
         "utils_test.cc",
     ],
     deps = [
+        "//src/v/cluster:fwd",
         "//src/v/kafka/protocol:messages",
         "//src/v/security/audit",
         "//src/v/test_utils:gtest",

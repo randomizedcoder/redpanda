@@ -20,12 +20,14 @@
 #include "datalake/partition_spec_parser.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/fwd.h"
+#include "kafka/server/handlers/topics/sr_context_validator.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "security/acl.h"
 #include "serde/rw/chrono.h"
 
@@ -307,6 +309,18 @@ struct iceberg_partition_spec_validator {
     }
 };
 
+struct schema_registry_context_validator {
+    std::optional<ss::sstring> operator()(
+      model::topic_namespace_view /*tns*/,
+      const ss::sstring& raw,
+      const std::optional<pandaproxy::schema_registry::context>& value) {
+        if (!value) {
+            return std::nullopt;
+        }
+        return validate_sr_context(raw);
+    }
+};
+
 struct min_cleanable_dirty_ratio_validator {
     std::optional<ss::sstring>
     operator()(const ss::sstring&, const tristate<double>& value) {
@@ -357,6 +371,8 @@ struct batch_max_bytes_limits_validator {
 //   tiered -> local: Permitted (with caution)
 //   unset -> local: Permitted (with caution)
 //   unset -> tiered: Permitted
+//   cloud -> tiered_cloud: Permitted
+//   tiered_cloud -> cloud: Permitted
 // Not permitted:
 //   local -> unset: Not permitted
 //   local -> cloud: Not permitted
@@ -365,6 +381,11 @@ struct batch_max_bytes_limits_validator {
 //   cloud -> local: Not permitted
 //   cloud -> tiered: Not permitted
 //   unset <-> cloud: Not permitted (cloud requires explicit choice)
+//   local -> tiered_cloud: Not permitted
+//   tiered -> tiered_cloud: Not permitted
+//   tiered_cloud -> local: Not permitted
+//   tiered_cloud -> tiered: Not permitted
+//   unset <-> tiered_cloud: Not permitted
 inline bool is_storage_mode_transition_permitted(
   model::redpanda_storage_mode from, model::redpanda_storage_mode to) {
     using sm = model::redpanda_storage_mode;
@@ -389,6 +410,14 @@ inline bool is_storage_mode_transition_permitted(
         return true;
     }
     if (from == sm::unset && to == sm::tiered) {
+        return true;
+    }
+
+    // cloud <-> tiered_cloud: Permitted
+    if (from == sm::cloud && to == sm::tiered_cloud) {
+        return true;
+    }
+    if (from == sm::tiered_cloud && to == sm::cloud) {
         return true;
     }
 

@@ -9,8 +9,6 @@
 #include "test_utils/async.h"
 #include "test_utils/boost_fixture.h"
 
-#include <boost/test/tools/old/interface.hpp>
-
 #include <algorithm>
 
 absl::node_hash_map<model::node_id, size_t>
@@ -63,7 +61,7 @@ void wait_for_all_partition_moves_to_finish(
         auto topics = cache.all_topics();
         return ss::do_with(
           cache.all_topics(),
-          [&api](std::vector<model::topic_namespace>& topics) {
+          [&api](chunked_vector<model::topic_namespace>& topics) {
               return ssx::parallel_transform(
                        topics.begin(),
                        topics.end(),

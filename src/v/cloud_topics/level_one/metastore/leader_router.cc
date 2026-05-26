@@ -18,7 +18,10 @@
 #include "cluster/shard_table.h"
 #include "hashing/murmur.h"
 #include "model/namespace.h"
+#include "resource_mgmt/cpu_scheduling.h"
 #include "rpc/connection_cache.h"
+
+#include <seastar/coroutine/switch_to.hh>
 
 namespace cloud_topics::l1 {
 
@@ -44,6 +47,17 @@ ss::future<rpc::replace_objects_reply> do_replace_objects(
         co_return rpc::replace_objects_reply{.ec = rpc::errc::not_leader};
     }
     co_return co_await domain_mgr->replace_objects(std::move(req));
+}
+
+ss::future<rpc::compact_objects_reply> do_compact_objects(
+  domain_supervisor& domain_supervisor,
+  const model::ntp& ntp,
+  rpc::compact_objects_request req) {
+    auto domain_mgr = domain_supervisor.get(ntp);
+    if (!domain_mgr) {
+        co_return rpc::compact_objects_reply{.ec = rpc::errc::not_leader};
+    }
+    co_return co_await domain_mgr->compact_objects(std::move(req));
 }
 
 ss::future<rpc::get_first_offset_ge_reply> do_get_first_offset_ge(
@@ -171,6 +185,17 @@ ss::future<rpc::get_compaction_infos_reply> do_get_compaction_infos(
     co_return co_await domain_mgr->get_compaction_infos(std::move(req));
 }
 
+ss::future<rpc::get_leveling_infos_reply> do_get_leveling_infos(
+  domain_supervisor& domain_supervisor,
+  const model::ntp& ntp,
+  rpc::get_leveling_infos_request req) {
+    auto domain_mgr = domain_supervisor.get(ntp);
+    if (!domain_mgr) {
+        co_return rpc::get_leveling_infos_reply{.ec = rpc::errc::not_leader};
+    }
+    co_return co_await domain_mgr->get_leveling_infos(std::move(req));
+}
+
 ss::future<rpc::get_extent_metadata_reply> do_get_extent_metadata(
   domain_supervisor& domain_supervisor,
   const model::ntp& ntp,
@@ -202,6 +227,17 @@ ss::future<rpc::restore_domain_reply> do_restore_domain(
         co_return rpc::restore_domain_reply{.ec = rpc::errc::not_leader};
     }
     co_return co_await domain_mgr->restore_domain(std::move(req));
+}
+
+ss::future<rpc::preregister_objects_reply> do_preregister_objects(
+  domain_supervisor& domain_supervisor,
+  const model::ntp& ntp,
+  rpc::preregister_objects_request req) {
+    auto domain_mgr = domain_supervisor.get(ntp);
+    if (!domain_mgr) {
+        co_return rpc::preregister_objects_reply{.ec = rpc::errc::not_leader};
+    }
+    co_return co_await domain_mgr->preregister_objects(std::move(req));
 }
 
 } // namespace
@@ -248,6 +284,9 @@ requires requires(
 }
 ss::future<typename req_t::resp_t>
 leader_router::process(req_t req, bool local_only) {
+    co_await ss::coroutine::switch_to(
+      scheduling_groups::instance().cloud_topics_metastore_sg());
+
     static const auto req_name = ss::pretty_type_name(typeid(req_t));
     using resp_t = req_t::resp_t;
     auto exists = co_await ensure_topic_exists();
@@ -284,7 +323,7 @@ leader_router::process(req_t req, bool local_only) {
               req_name,
               l1_ntp);
             auto ret = co_await (this->*LocalFunc)(
-              std::move(req), std::move(l1_ntp), shard.value());
+              std::move(req), l1_ntp, shard.value());
             vlog(
               cd_log.debug,
               "Processed local request for {} as leader of {}",
@@ -320,12 +359,20 @@ template ss::future<rpc::add_objects_reply> leader_router::process<
   &leader_router::add_objects_locally,
   &leader_router::client::add_objects>(rpc::add_objects_request, bool);
 
-template ss::future<rpc::replace_objects_reply>
-  leader_router::remote_dispatch<&leader_router::client::replace_objects>(
-    rpc::replace_objects_request, model::node_id);
+template ss::future<rpc::compact_objects_reply>
+  leader_router::remote_dispatch<&leader_router::client::compact_objects>(
+    rpc::compact_objects_request, model::node_id);
+template ss::future<rpc::compact_objects_reply> leader_router::process<
+  &leader_router::compact_objects_locally,
+  &leader_router::client::compact_objects>(rpc::compact_objects_request, bool);
+
+template ss::future<rpc::replace_objects_reply> leader_router::remote_dispatch<
+  &leader_router::client::replace_objects_no_compact>(
+  rpc::replace_objects_request, model::node_id);
 template ss::future<rpc::replace_objects_reply> leader_router::process<
   &leader_router::replace_objects_locally,
-  &leader_router::client::replace_objects>(rpc::replace_objects_request, bool);
+  &leader_router::client::replace_objects_no_compact>(
+  rpc::replace_objects_request, bool);
 
 template ss::future<rpc::get_first_offset_ge_reply>
   leader_router::remote_dispatch<&leader_router::client::get_first_offset_ge>(
@@ -398,6 +445,14 @@ template ss::future<rpc::flush_domain_reply> leader_router::process<
   &leader_router::flush_domain_locally,
   &leader_router::client::flush_domain>(rpc::flush_domain_request, bool);
 
+template ss::future<rpc::preregister_objects_reply>
+  leader_router::remote_dispatch<&leader_router::client::preregister_objects>(
+    rpc::preregister_objects_request, model::node_id);
+template ss::future<rpc::preregister_objects_reply> leader_router::process<
+  &leader_router::preregister_objects_locally,
+  &leader_router::client::preregister_objects>(
+  rpc::preregister_objects_request, bool);
+
 leader_router::leader_router(
   model::node_id self,
   ss::sharded<cluster::metadata_cache>* metadata,
@@ -464,7 +519,7 @@ ss::future<rpc::add_objects_reply> leader_router::add_objects_locally(
     auto m = _probe.auto_measure_add_objects();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_add_objects(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -478,6 +533,27 @@ ss::future<rpc::add_objects_reply> leader_router::add_objects(
       &client::add_objects>(std::move(request), bool(local_only_exec));
 }
 
+ss::future<rpc::compact_objects_reply> leader_router::compact_objects_locally(
+  rpc::compact_objects_request request,
+  const model::ntp& metastore_ntp,
+  ss::shard_id shard) {
+    auto m = _probe.auto_measure_compact_objects();
+    co_return co_await container().invoke_on(
+      shard,
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+          return do_compact_objects(
+            *(fe._domain_supervisor), metastore_ntp, std::move(req));
+      });
+}
+
+ss::future<rpc::compact_objects_reply> leader_router::compact_objects(
+  rpc::compact_objects_request request, local_only local_only_exec) {
+    auto holder = _gate.hold();
+    co_return co_await process<
+      &leader_router::compact_objects_locally,
+      &client::compact_objects>(std::move(request), bool(local_only_exec));
+}
+
 ss::future<rpc::replace_objects_reply> leader_router::replace_objects_locally(
   rpc::replace_objects_request request,
   const model::ntp& metastore_ntp,
@@ -485,7 +561,7 @@ ss::future<rpc::replace_objects_reply> leader_router::replace_objects_locally(
     auto m = _probe.auto_measure_replace_objects();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_replace_objects(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -496,7 +572,8 @@ ss::future<rpc::replace_objects_reply> leader_router::replace_objects(
     auto holder = _gate.hold();
     co_return co_await process<
       &leader_router::replace_objects_locally,
-      &client::replace_objects>(std::move(request), bool(local_only_exec));
+      &client::replace_objects_no_compact>(
+      std::move(request), bool(local_only_exec));
 }
 
 ss::future<rpc::get_first_offset_ge_reply>
@@ -507,7 +584,7 @@ leader_router::get_first_offset_ge_locally(
     auto m = _probe.auto_measure_get_first_offset_ge();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_first_offset_ge(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -529,7 +606,7 @@ leader_router::get_first_timestamp_ge_locally(
     auto m = _probe.auto_measure_get_first_timestamp_ge();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_first_timestamp_ge(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -543,7 +620,7 @@ leader_router::get_first_offset_for_bytes_locally(
     auto m = _probe.auto_measure_get_first_offset_for_bytes();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_first_offset_for_bytes(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -576,7 +653,7 @@ ss::future<rpc::get_offsets_reply> leader_router::get_offsets_locally(
     auto m = _probe.auto_measure_get_offsets();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_offsets(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -597,7 +674,7 @@ ss::future<rpc::get_size_reply> leader_router::get_size_locally(
     auto m = _probe.auto_measure_get_size();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_size(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -619,7 +696,7 @@ leader_router::get_compaction_info_locally(
     auto m = _probe.auto_measure_get_compaction_info();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_compaction_info(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -641,7 +718,7 @@ leader_router::get_term_for_offset_locally(
     auto m = _probe.auto_measure_get_term_for_offset();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_term_for_offset(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -663,7 +740,7 @@ leader_router::get_end_offset_for_term_locally(
     auto m = _probe.auto_measure_get_end_offset_for_term();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_end_offset_for_term(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -686,7 +763,7 @@ ss::future<rpc::set_start_offset_reply> leader_router::set_start_offset_locally(
     auto m = _probe.auto_measure_set_start_offset();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_set_start_offset(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -707,7 +784,7 @@ ss::future<rpc::remove_topics_reply> leader_router::remove_topics_locally(
     auto m = _probe.auto_measure_remove_topics();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_remove_topics(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -729,7 +806,7 @@ leader_router::get_compaction_infos_locally(
     auto m = _probe.auto_measure_get_compaction_infos();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_compaction_infos(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -743,6 +820,27 @@ ss::future<rpc::get_compaction_infos_reply> leader_router::get_compaction_infos(
       &client::get_compaction_infos>(std::move(request), bool(local_only_exec));
 }
 
+ss::future<rpc::get_leveling_infos_reply>
+leader_router::get_leveling_infos_locally(
+  rpc::get_leveling_infos_request request,
+  const model::ntp& metastore_ntp,
+  ss::shard_id shard) {
+    co_return co_await container().invoke_on(
+      shard,
+      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+          return do_get_leveling_infos(
+            *(fe._domain_supervisor), metastore_ntp, std::move(req));
+      });
+}
+
+ss::future<rpc::get_leveling_infos_reply> leader_router::get_leveling_infos(
+  rpc::get_leveling_infos_request request, local_only local_only_exec) {
+    auto holder = _gate.hold();
+    co_return co_await process<
+      &leader_router::get_leveling_infos_locally,
+      &client::get_leveling_infos>(std::move(request), bool(local_only_exec));
+}
+
 ss::future<rpc::get_extent_metadata_reply>
 leader_router::get_extent_metadata_locally(
   rpc::get_extent_metadata_request request,
@@ -751,7 +849,7 @@ leader_router::get_extent_metadata_locally(
     auto m = _probe.auto_measure_get_extent_metadata();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_get_extent_metadata(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -772,7 +870,7 @@ ss::future<rpc::flush_domain_reply> leader_router::flush_domain_locally(
     auto m = _probe.auto_measure_flush_domain();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_flush_domain(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -793,7 +891,7 @@ ss::future<rpc::restore_domain_reply> leader_router::restore_domain_locally(
     auto m = _probe.auto_measure_restore_domain();
     co_return co_await container().invoke_on(
       shard,
-      [metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
           return do_restore_domain(
             *(fe._domain_supervisor), metastore_ntp, std::move(req));
       });
@@ -805,6 +903,28 @@ ss::future<rpc::restore_domain_reply> leader_router::restore_domain(
     co_return co_await process<
       &leader_router::restore_domain_locally,
       &client::restore_domain>(std::move(request), bool(local_only_exec));
+}
+
+ss::future<rpc::preregister_objects_reply>
+leader_router::preregister_objects_locally(
+  rpc::preregister_objects_request request,
+  const model::ntp& metastore_ntp,
+  ss::shard_id shard) {
+    auto m = _probe.auto_measure_preregister_objects();
+    co_return co_await container().invoke_on(
+      shard,
+      [&metastore_ntp, req = std::move(request)](leader_router& fe) mutable {
+          return do_preregister_objects(
+            *(fe._domain_supervisor), metastore_ntp, std::move(req));
+      });
+}
+
+ss::future<rpc::preregister_objects_reply> leader_router::preregister_objects(
+  rpc::preregister_objects_request request, local_only local_only_exec) {
+    auto holder = _gate.hold();
+    co_return co_await process<
+      &leader_router::preregister_objects_locally,
+      &client::preregister_objects>(std::move(request), bool(local_only_exec));
 }
 
 } // namespace cloud_topics::l1

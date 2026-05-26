@@ -22,5 +22,8 @@ class seq_writer;
 class service;
 class sharded_store;
 class store;
+class transport;
+class kafka_client_transport;
+class rpc_transport;
 
 } // namespace pandaproxy::schema_registry

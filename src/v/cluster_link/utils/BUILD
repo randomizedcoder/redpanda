@@ -11,7 +11,9 @@ redpanda_cc_library(
     visibility = ["//src/v/cluster_link:__subpackages__"],
     deps = [
         "//src/v/base",
+        "//src/v/cluster:types",
         "//src/v/kafka/server:topic_config_utils",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/reflection:type_traits",
     ],
 )

@@ -13,13 +13,10 @@
 
 #include "cluster/cluster_recovery_table.h"
 #include "cluster/topic_table.h"
-#include "config/config_store.h"
 #include "config/configuration.h"
 #include "container/chunked_hash_map.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
-#include "security/acl_store.h"
 #include "security/credential_store.h"
 
 namespace cluster::cloud_metadata {
@@ -165,8 +162,9 @@ controller_snapshot_reconciler::get_actions(
         }
     }
 
-    if (needs_actions(
-          cur_stage, recovery_stage::recovered_cloud_topics_metastore)) {
+    if (
+      needs_actions(
+        cur_stage, recovery_stage::recovered_cloud_topics_metastore)) {
         const auto& snap_tables = snap.topics.topics;
         auto snap_it = snap_tables.find(model::l1_metastore_nt);
         if (snap_it != snap_tables.end()) {

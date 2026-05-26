@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cluster/state_machine_registry.h"
 #include "container/chunked_vector.h"
 #include "model/fundamental.h"
@@ -73,9 +74,10 @@ private:
         auto serde_fields() {
             return std::tie(writes_disabled, writes_revision_id);
         }
+        fmt::iterator format_to(fmt::iterator it) const;
         friend bool operator==(
-          const update_writes_disabled_cmd&, const update_writes_disabled_cmd&)
-          = default;
+          const update_writes_disabled_cmd&,
+          const update_writes_disabled_cmd&) = default;
     };
 
     struct state_snapshot
@@ -92,8 +94,9 @@ private:
         auto serde_fields() {
             return std::tie(writes_disabled, update_offset, writes_revision_id);
         }
-        friend bool operator==(const state_snapshot&, const state_snapshot&)
-          = default;
+        fmt::iterator format_to(fmt::iterator it) const;
+        friend bool
+        operator==(const state_snapshot&, const state_snapshot&) = default;
     };
 
     struct raft_snapshot
@@ -105,9 +108,10 @@ private:
         auto serde_fields() {
             return std::tie(writes_disabled, writes_revision_id);
         }
+        fmt::iterator format_to(fmt::iterator it) const;
 
-        friend bool operator==(const raft_snapshot&, const raft_snapshot&)
-          = default;
+        friend bool
+        operator==(const raft_snapshot&, const raft_snapshot&) = default;
     };
 
     struct local_snapshot
@@ -125,13 +129,8 @@ private:
               lhs.state_updates.end(),
               rhs.state_updates.begin());
         }
+        fmt::iterator format_to(fmt::iterator it) const;
     };
-
-    friend std::ostream& operator<<(std::ostream&, const raft_snapshot&);
-    friend std::ostream&
-    operator<<(std::ostream&, const update_writes_disabled_cmd&);
-    friend std::ostream& operator<<(std::ostream&, const local_snapshot&);
-    friend std::ostream& operator<<(std::ostream&, const state_snapshot&);
 
     enum class operation_type {
         update_writes_disabled = 0,

@@ -11,9 +11,9 @@
 #include "cluster/data_migration_frontend.h"
 
 #include "cloud_storage/topic_mount_handler.h"
-#include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_stm.h"
+#include "cluster/controller_utils.h"
 #include "cluster/data_migration_rpc_service.h"
 #include "cluster/data_migration_table.h"
 #include "cluster/data_migration_types.h"
@@ -29,8 +29,6 @@
 #include "ssx/future-util.h"
 #include "ssx/single_sharded.h"
 #include "utils/retry_chain_node.h"
-
-#include <fmt/ostream.h>
 
 #include <exception>
 
@@ -258,9 +256,10 @@ ss::future<check_ntp_states_reply> frontend::check_ntp_states_on_foreign_node(
 ss::future<result<id>> frontend::do_create_migration(data_migration migration) {
     validate_migration_shard();
 
-    if (std::visit(
-          [](const auto& migration) { return !empty(migration.groups); },
-          migration)) {
+    if (
+      std::visit(
+        [](const auto& migration) { return !empty(migration.groups); },
+        migration)) {
         auto deadline = model::timeout_clock::now() + _operation_timeout;
         if (!co_await _group_proxy->assure_topic_exists(deadline)) {
             vlog(

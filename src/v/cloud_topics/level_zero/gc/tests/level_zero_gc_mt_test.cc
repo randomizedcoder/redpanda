@@ -57,7 +57,7 @@ struct shared_bucket_state {
  * Object storage mock that builds results locally on each shard.
  * Cross-shard calls are only used for tracking and atomic updates.
  */
-class mt_object_storage : public level_zero_gc::object_storage {
+class mt_object_storage : public l0::gc::object_storage {
 public:
     mt_object_storage(shared_bucket_state* bucket_state)
       : g_bucket_state(bucket_state) {}
@@ -135,7 +135,7 @@ public:
 /*
  * Epoch source that accesses the global shared state.
  */
-class mt_epoch_source : public level_zero_gc::epoch_source {
+class mt_epoch_source : public l0::gc::epoch_source {
 public:
     explicit mt_epoch_source(shared_bucket_state* bucket_state)
       : g_bucket_state(bucket_state) {}
@@ -165,10 +165,17 @@ public:
 /*
  * Node info that returns shard index based on the current Seastar shard.
  */
-class mt_node_info : public level_zero_gc::node_info {
+class mt_node_info : public l0::gc::node_info {
 public:
     size_t shard_index() const override { return ss::this_shard_id(); }
-    size_t total_shards() const override { return ss::smp::count; }
+    size_t total_shards() const override { return ss::this_smp_shard_count(); }
+};
+
+class safety_monitor_test_impl : public cloud_topics::l0::gc::safety_monitor {
+public:
+    result can_proceed() const override {
+        return {.ok = true, .reason = std::nullopt};
+    }
 };
 
 /*
@@ -177,7 +184,7 @@ public:
 struct level_zero_gc_mt_test : public seastar_test {
     ss::future<> SetUpAsync() override {
         vassert(ss::this_shard_id() == ss::shard_id{0}, "Setup on not shard 0");
-        vassert(ss::smp::count > 1, "Too few shards");
+        vassert(ss::this_smp_shard_count() > 1, "Too few shards");
         // Create shared state on shard 0
         g_bucket_state = std::make_unique<shared_bucket_state>();
 
@@ -200,7 +207,9 @@ struct level_zero_gc_mt_test : public seastar_test {
               return std::make_unique<mt_epoch_source>(g_bucket_state.get());
           }),
           ss::sharded_parameter(
-            [] { return std::make_unique<mt_node_info>(); }));
+            [] { return std::make_unique<mt_node_info>(); }),
+          ss::sharded_parameter(
+            [] { return std::make_unique<safety_monitor_test_impl>(); }));
     }
 
     ss::future<> TearDownAsync() override {
@@ -210,12 +219,13 @@ struct level_zero_gc_mt_test : public seastar_test {
     }
 
     // Add objects with various prefixes (call from shard 0 context)
-    void populate_objects(size_t count) {
+    void populate_objects(size_t count, bool dynamic_epoch = false) {
         g_bucket_state->objects.reserve(count);
         for (size_t i = 0; i < count; ++i) {
             auto prefix = static_cast<object_id::prefix_t>(i % 1000);
             auto id = object_id{
-              .epoch = cluster_epoch(1),
+              .epoch = cluster_epoch(
+                dynamic_epoch ? static_cast<int64_t>(i) : 1),
               .name = uuid_t::create(),
               .prefix = prefix,
             };
@@ -264,8 +274,8 @@ TEST_F_CORO(level_zero_gc_mt_test, objects_deleted_across_shards) {
     RPTEST_REQUIRE_EVENTUALLY_CORO(
       5s, [this] { return get_total_deleted() == num_objects; });
 
-    EXPECT_EQ(get_shards_that_deleted(), ss::smp::count);
-    EXPECT_EQ(get_shards_that_listed(), ss::smp::count);
+    EXPECT_EQ(get_shards_that_deleted(), ss::this_smp_shard_count());
+    EXPECT_EQ(get_shards_that_listed(), ss::this_smp_shard_count());
 }
 
 /*
@@ -281,7 +291,7 @@ TEST_F_CORO(level_zero_gc_mt_test, no_objects_no_crash) {
     co_await ss::sleep(500ms);
 
     // Should complete without crashing or trying to delete anything
-    EXPECT_EQ(get_shards_that_listed(), ss::smp::count)
+    EXPECT_EQ(get_shards_that_listed(), ss::this_smp_shard_count())
       << "No shards attempted to list";
     EXPECT_EQ(get_shards_that_deleted(), 0);
     EXPECT_EQ(get_total_deleted(), 0);
@@ -301,10 +311,42 @@ TEST_F_CORO(level_zero_gc_mt_test, no_eligible_epoch) {
     co_await ss::sleep(500ms);
 
     // Objects should not be deleted since there's no eligible epoch
-    EXPECT_EQ(get_shards_that_listed(), ss::smp::count)
+    EXPECT_EQ(get_shards_that_listed(), ss::this_smp_shard_count())
       << "No shards attempted to list";
     EXPECT_EQ(get_shards_that_deleted(), 0);
     EXPECT_EQ(get_total_deleted(), 0);
+}
+
+/*
+ * Concurrent reset/start/pause cycles don't crash or corrupt state.
+ */
+TEST_F_CORO(level_zero_gc_mt_test, concurrent_reset_start_pause) {
+    populate_objects(num_objects, true /* dynamic_epoch */);
+    set_max_epoch(num_objects / 2 - 1);
+
+    co_await gc_.invoke_on_all(&level_zero_gc::start);
+    co_await ss::sleep(100ms);
+
+    std::vector<ss::future<>> futs;
+
+    for (int i = 0; i < 10; ++i) {
+        futs.push_back(
+          gc_.invoke_on_all([](level_zero_gc& gc) { return gc.reset(); }));
+        futs.push_back(
+          gc_.invoke_on_all([](level_zero_gc& gc) { return gc.reset(); }));
+        futs.push_back(gc_.invoke_on_all(&level_zero_gc::start));
+        futs.push_back(gc_.invoke_on_all(&level_zero_gc::pause));
+        futs.push_back(gc_.invoke_on_all(&level_zero_gc::start));
+    }
+
+    co_await ss::when_all_succeed(std::move(futs));
+
+    co_await gc_.invoke_on_all(&level_zero_gc::start);
+
+    set_max_epoch(num_objects);
+
+    RPTEST_REQUIRE_EVENTUALLY_CORO(
+      5s, [this] { return get_total_deleted() == num_objects; });
 }
 
 /*

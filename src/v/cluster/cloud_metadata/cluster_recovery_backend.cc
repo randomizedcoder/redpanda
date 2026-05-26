@@ -13,7 +13,6 @@
 #include "cloud_io/cache_service.h"
 #include "cloud_storage/remote.h"
 #include "cloud_storage/remote_file.h"
-#include "cloud_storage/types.h"
 #include "cloud_topics/level_one/metastore/metastore.h"
 #include "cloud_topics/level_one/metastore/retry.h"
 #include "cloud_topics/state_accessors.h"
@@ -23,7 +22,6 @@
 #include "cluster/cloud_metadata/producer_id_recovery_manager.h"
 #include "cluster/cluster_recovery_reconciler.h"
 #include "cluster/cluster_recovery_table.h"
-#include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller_api.h"
@@ -31,10 +29,10 @@
 #include "cluster/feature_manager.h"
 #include "cluster/fwd.h"
 #include "cluster/logger.h"
+#include "cluster/members_table.h"
 #include "cluster/security_frontend.h"
 #include "cluster/topic_table.h"
 #include "cluster/topics_frontend.h"
-#include "config/configuration.h"
 #include "features/feature_table.h"
 #include "model/metadata.h"
 #include "raft/group_manager.h"
@@ -43,7 +41,6 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
@@ -221,7 +218,7 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
     case recovery_stage::recovered_acls: {
         retry_chain_node acls_retry(&parent_retry);
         // TODO: batch this up.
-        std::vector<security::acl_binding> acls;
+        chunked_vector<security::acl_binding> acls;
         for (size_t i = 0; i < actions.acls.size(); i++) {
             acls.emplace_back(std::move(actions.acls[i]));
         }
@@ -366,11 +363,13 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                 auto& topic_label = topic_cfg.properties.remote_label;
                 if (topic_cfg.properties.remote_label != metastore_label) {
                     vlog(
-                      clusterlog.error,
-                      "Cannot create a recovery cloud topic with label {} when "
-                      "metastore label is {}",
+                      clusterlog.warn,
+                      "Skipping cloud topic {} with label {} (metastore "
+                      "label is {})",
+                      topic_cfg.tp_ns,
                       topic_label,
                       metastore_label);
+                    continue;
                 }
 
                 // Query metastore for bootstrap params and set them before
@@ -389,8 +388,13 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                         // missing_ntp is expected for new partitions
                         // that haven't been flushed to the metastore
                         // yet - treat as empty partition.
-                        auto offsets_res = co_await metastore->get_offsets(
-                          tidp);
+                        retry_chain_node offsets_retry(60s, 1s, &parent_retry);
+                        auto offsets_res
+                          = co_await cloud_topics::l1::retry_metastore_op(
+                            [metastore, &tidp] {
+                                return metastore->get_offsets(tidp);
+                            },
+                            offsets_retry);
                         if (!offsets_res.has_value()) {
                             if (
                               offsets_res.error()
@@ -416,12 +420,18 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                         auto start_offset = offsets_res->start_offset;
                         auto next_offset = offsets_res->next_offset;
 
-                        // Get term for start offset.
-                        // missing_ntp and out_of_range are acceptable
-                        // - use term 0. Other errors are transient and
-                        // worth retrying.
-                        auto term_res = co_await metastore->get_term_for_offset(
-                          tidp, start_offset);
+                        // Fetch the term for the next offset so we can start
+                        // the restored Raft group where we left off, at a term
+                        // that continues monotonically with what is in the
+                        // metastore.
+                        retry_chain_node term_retry(60s, 1s, &parent_retry);
+                        auto term_res
+                          = co_await cloud_topics::l1::retry_metastore_op(
+                            [metastore, &tidp, next_offset] {
+                                return metastore->get_term_for_offset(
+                                  tidp, next_offset);
+                            },
+                            term_retry);
                         model::term_id initial_term{0};
                         if (term_res.has_value()) {
                             initial_term = term_res.value();
@@ -433,10 +443,10 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                                  out_of_range) {
                             vlog(
                               clusterlog.debug,
-                              "Term not found for {} offset {}: {}, using "
-                              "term 0",
+                              "Term not found for {} offset {}: {}, "
+                              "using term 0",
                               tidp,
-                              start_offset,
+                              next_offset,
                               term_res.error());
                         } else {
                             vlog(
@@ -444,7 +454,7 @@ ss::future<cluster::errc> cluster_recovery_backend::do_action(
                               "Failed to get term for {} offset {} from "
                               "metastore: {}",
                               tidp,
-                              start_offset,
+                              next_offset,
                               term_res.error());
                             co_return cluster::errc::replication_error;
                         }

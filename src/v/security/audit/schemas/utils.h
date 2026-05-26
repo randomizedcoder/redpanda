@@ -24,6 +24,7 @@
 #include <seastar/http/request.hh>
 
 #include <iterator>
+#include <ranges>
 #include <type_traits>
 
 namespace security::audit {
@@ -38,6 +39,24 @@ enum class audit_resource_type : int8_t {
     acl_binding,
     acl_binding_filter
 };
+
+inline fmt::iterator format_to(audit_resource_type type, fmt::iterator out) {
+    switch (type) {
+    case audit_resource_type::topic:
+        return fmt::format_to(out, "topic");
+    case audit_resource_type::group:
+        return fmt::format_to(out, "group");
+    case audit_resource_type::cluster:
+        return fmt::format_to(out, "cluster");
+    case audit_resource_type::transactional_id:
+        return fmt::format_to(out, "transactional_id");
+    case audit_resource_type::acl_binding:
+        return fmt::format_to(out, "acl_binding");
+    case audit_resource_type::acl_binding_filter:
+        return fmt::format_to(out, "acl_binding_filter");
+    }
+    return fmt::format_to(out, "");
+}
 
 template<typename Clock>
 timestamp_t create_timestamp_t(std::chrono::time_point<Clock> time_point) {
@@ -56,8 +75,6 @@ api_activity_unmapped unmapped_data();
 api_activity_unmapped unmapped_data(const security::auth_result& auth_result);
 
 actor result_to_actor(const security::auth_result& result);
-
-std::ostream& operator<<(std::ostream&, audit_resource_type);
 
 template<typename T>
 concept AuditableResource = std::is_same_v<T, model::topic>
@@ -139,9 +156,9 @@ resource_detail transform_to_resource_detail(const T& v) {
     };
 }
 
-template<AuditableResource T>
-std::vector<resource_detail>
-create_resource_details(const std::vector<T>& resources) {
+template<std::ranges::sized_range Range>
+requires AuditableResource<std::ranges::range_value_t<Range>>
+std::vector<resource_detail> create_resource_details(const Range& resources) {
     std::vector<resource_detail> resource_details;
     resource_details.reserve(resources.size());
     std::transform(
@@ -154,14 +171,11 @@ create_resource_details(const std::vector<T>& resources) {
 }
 
 template<typename Func>
-concept returns_auditable_resource_vector = requires(Func func) {
-    {
-        func()
-    } -> std::same_as<
-      std::vector<typename std::remove_cvref_t<decltype(func())>::value_type>>;
+concept returns_auditable_resources = requires(Func func) {
+    requires std::ranges::range<std::remove_cvref_t<decltype(func())>>;
 
     requires AuditableResource<
-      typename std::remove_cvref_t<decltype(func())>::value_type>;
+      std::ranges::range_value_t<std::remove_cvref_t<decltype(func())>>>;
 };
 
 } // namespace security::audit

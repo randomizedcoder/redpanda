@@ -9,10 +9,10 @@
 
 #include "cluster/types.h"
 #include "kafka/protocol/schemata/create_topics_request.h"
-#include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 
 #include <boost/test/unit_test.hpp>
 

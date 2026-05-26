@@ -45,7 +45,7 @@ redpanda_cc_btest(
     ],
 )
 
-redpanda_cc_btest(
+redpanda_cc_gtest(
     name = "config_store_test",
     timeout = "short",
     srcs = [
@@ -55,9 +55,9 @@ redpanda_cc_btest(
     deps = [
         "//src/v/config",
         "//src/v/json",
-        "//src/v/test_utils:seastar_boost",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
         "@seastar",
-        "@seastar//:testing",
     ],
 )
 
@@ -135,6 +135,7 @@ redpanda_cc_btest(
     cpu = 1,
     deps = [
         "//src/v/config",
+        "//src/v/test_utils:container_ostream",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:unresolved_address",
         "@seastar",
@@ -247,20 +248,7 @@ redpanda_cc_gtest(
     deps = [
         "//src/v/config",
         "//src/v/test_utils:gtest",
-        "@googletest//:gtest",
-    ],
-)
-
-redpanda_cc_gtest(
-    name = "startup_config_test",
-    timeout = "short",
-    srcs = [
-        "startup_config_test.cc",
-    ],
-    cpu = 1,
-    deps = [
-        "//src/v/config:startup_config",
-        "//src/v/test_utils:gtest",
+        "@fmt",
         "@googletest//:gtest",
     ],
 )

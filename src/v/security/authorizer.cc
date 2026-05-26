@@ -104,9 +104,10 @@ authorizer::authorizer(
     _superusers_conf.watch([this]() { update_superusers(); });
 }
 
-void authorizer::add_bindings(const std::vector<acl_binding>& bindings) {
-    if (unlikely(
-          seclog.is_shard_zero() && seclog.is_enabled(ss::log_level::debug))) {
+void authorizer::add_bindings(const chunked_vector<acl_binding>& bindings) {
+    if (
+      unlikely(
+        seclog.is_shard_zero() && seclog.is_enabled(ss::log_level::debug))) {
         for (const auto& binding : bindings) {
             vlog(seclog.debug, "Adding ACL binding: {}", binding);
         }
@@ -114,12 +115,12 @@ void authorizer::add_bindings(const std::vector<acl_binding>& bindings) {
     store().add_bindings(bindings);
 }
 
-std::vector<std::vector<acl_binding>> authorizer::remove_bindings(
-  const std::vector<acl_binding_filter>& filters, bool dry_run) {
+chunked_vector<chunked_vector<acl_binding>> authorizer::remove_bindings(
+  const chunked_vector<acl_binding_filter>& filters, bool dry_run) {
     return store().remove_bindings(filters, dry_run);
 }
 
-std::vector<acl_binding>
+chunked_vector<acl_binding>
 authorizer::acls(const acl_binding_filter& filter) const {
     return store().acls(filter);
 }
@@ -135,29 +136,6 @@ authorizer::reset_bindings(const chunked_vector<acl_binding>& bindings) {
 
 acl_store& authorizer::store() & { return *_store; }
 const acl_store& authorizer::store() const& { return *_store; }
-
-std::ostream& operator<<(std::ostream& os, const auth_result& a) {
-    fmt::print(
-      os,
-      "{{authorized:{}, authorization_disabled:{}, is_superuser:{}, "
-      "operation: {}, empty_matches:{}, principal:{}, role:{}, host:{}, "
-      "resource_type:{}, "
-      "resource_name:{}, resource_pattern:{}, acl:{}}}",
-      a.authorized,
-      a.authorization_disabled,
-      a.is_superuser,
-      a.operation,
-      a.empty_matches,
-      a.principal,
-      a.role,
-      a.host,
-      a.resource_type,
-      a.resource_name,
-      a.resource_pattern,
-      a.acl);
-
-    return os;
-}
 
 template<typename T>
 auth_result authorizer::authorized(
@@ -373,9 +351,10 @@ std::optional<security::acl_match> authorizer::acl_any_implied_ops_allowed(
                       auto begin,
                       auto end) -> std::optional<security::acl_match> {
         for (; begin != end; ++begin) {
-            if (auto entry = acls.find(
-                  *begin, principal, host, acl_permission::allow);
-                entry.has_value()) {
+            if (
+              auto entry = acls.find(
+                *begin, principal, host, acl_permission::allow);
+              entry.has_value()) {
                 return entry;
             }
         }

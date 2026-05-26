@@ -11,7 +11,6 @@
 
 #include "cluster/self_test/diskcheck.h"
 
-#include "base/vassert.h"
 #include "base/vlog.h"
 #include "cluster/logger.h"
 #include "cluster/self_test/metrics.h"
@@ -282,7 +281,7 @@ ss::future<std::vector<self_test_result>> diskcheck::run(diskcheck_opts opts) {
 ss::future<std::vector<self_test_result>>
 diskcheck::run_configured_benchmarks(ss::sstring basename) {
     auto active_shards = std::min<std::uint32_t>(
-      _opts.parallelism, ss::smp::count);
+      _opts.parallelism, ss::this_smp_shard_count());
     auto parallelism_per_shard = _opts.parallelism / active_shards;
     auto remainder = _opts.parallelism % active_shards;
 

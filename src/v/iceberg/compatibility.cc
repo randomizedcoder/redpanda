@@ -13,6 +13,8 @@
 #include "iceberg/compatibility_types.h"
 #include "iceberg/compatibility_utils.h"
 #include "iceberg/datatypes.h"
+#include "iceberg/field_name_comparison.h"
+#include "iceberg/unicode.h"
 
 #include <ranges>
 #include <stdexcept>
@@ -169,8 +171,10 @@ remove_field(const nested_field& f, const partition_spec& pspec) {
  */
 class annotate_schema_visitor {
 public:
-    explicit annotate_schema_visitor(const partition_spec& pspec)
-      : pspec_(&pspec) {}
+    explicit annotate_schema_visitor(
+      const partition_spec& pspec, field_name_comparison norm)
+      : pspec_(&pspec)
+      , norm_(norm) {}
     schema_transform_result
     visit(const struct_type& source_t, const struct_type& dest_t) && {
         return std::invoke(*this, source_t, dest_t);
@@ -184,8 +188,9 @@ public:
             if (f == nullptr) {
                 return schema_evolution_errc::null_nested_field;
             }
-            if (auto res = std::invoke(*this, source_struct, *f);
-                res.has_error()) {
+            if (
+              auto res = std::invoke(*this, source_struct, *f);
+              res.has_error()) {
                 return res.error();
             } else {
                 state += res.value();
@@ -196,19 +201,20 @@ public:
         // the dest struct, recursively mark that field and all nested fields
         // therein for removal. This is helpful for column ID accounting
         // downstream.
-        if (auto res = for_each_field(
-              source_struct,
-              [this, &state](const nested_field* f) {
-                  state += remove_field(*f, *pspec_);
-              },
-              [](const nested_field* f) {
-                  // visit only those fields that were not already marked (i.e.
-                  // mapped correctly into the destination struct). assume that
-                  // if a field is marked already then all fields nested under
-                  // it are also marked
-                  return !f->has_evolution_metadata();
-              });
-            res.has_error()) {
+        if (
+          auto res = for_each_field(
+            source_struct,
+            [this, &state](const nested_field* f) {
+                state += remove_field(*f, *pspec_);
+            },
+            [](const nested_field* f) {
+                // visit only those fields that were not already marked (i.e.
+                // mapped correctly into the destination struct). assume that
+                // if a field is marked already then all fields nested under
+                // it are also marked
+                return !f->has_evolution_metadata();
+            });
+          res.has_error()) {
             return res.error();
         }
 
@@ -220,9 +226,10 @@ public:
         // Note that column renaming is NOT supported
         auto matches = source_parent.fields
                        | std::views::filter(
-                         [&dest_field](const nested_field_ptr& nf) {
+                         [this, &dest_field](const nested_field_ptr& nf) {
                              return nf != nullptr
-                                    && nf->name == dest_field.name;
+                                    && names_equal(
+                                      nf->name, dest_field.name, norm_);
                          });
 
         auto match_it = matches.begin();
@@ -235,17 +242,19 @@ public:
             // context to push down into the recursion. Instead, visit the
             // destination field directly, with nesting, calling add_field
             // for each.
-            if (auto res = for_each_field(
-                  dest_field,
-                  [&state](const nested_field* f) { state += add_field(*f); });
-                res.has_error()) {
+            if (
+              auto res = for_each_field(
+                dest_field,
+                [&state](const nested_field* f) { state += add_field(*f); });
+              res.has_error()) {
                 return res.error();
             }
         } else if (n_matches == 1) {
             const auto& source_field = *match_it;
-            if (auto vt_res = std::visit(
-                  *this, source_field->type, dest_field.type);
-                vt_res.has_error()) {
+            if (
+              auto vt_res = std::visit(
+                *this, source_field->type, dest_field.type);
+              vt_res.has_error()) {
                 return vt_res.error();
             } else {
                 state += vt_res.value();
@@ -269,9 +278,10 @@ public:
 
         schema_transform_state state{};
 
-        if (auto ve_res = std::visit(
-              *this, source_element->type, dest_element->type);
-            ve_res.has_error()) {
+        if (
+          auto ve_res = std::visit(
+            *this, source_element->type, dest_element->type);
+          ve_res.has_error()) {
             return ve_res.error();
         } else {
             state += ve_res.value();
@@ -293,8 +303,9 @@ public:
 
         schema_transform_state state{};
 
-        if (auto vk_res = std::visit(*this, source_key->type, dest_key->type);
-            vk_res.has_error()) {
+        if (
+          auto vk_res = std::visit(*this, source_key->type, dest_key->type);
+          vk_res.has_error()) {
             return vk_res.error();
         } else if (vk_res.value().total() > 0) {
             return schema_evolution_errc::violates_map_key_invariant;
@@ -308,9 +319,9 @@ public:
           source_value != nullptr && dest_value != nullptr,
           "Map val fields are assumed to be non-NULL");
 
-        if (auto vv_res = std::visit(
-              *this, source_value->type, dest_value->type);
-            vv_res.has_error()) {
+        if (
+          auto vv_res = std::visit(*this, source_value->type, dest_value->type);
+          vv_res.has_error()) {
             return vv_res.error();
         } else {
             state += vv_res.value();
@@ -339,6 +350,7 @@ public:
 
 private:
     const partition_spec* pspec_;
+    field_name_comparison norm_;
 };
 
 /**
@@ -367,8 +379,9 @@ struct validate_transform_visitor {
     schema_errc_result operator()(const nested_field::src_info& src) {
         bool promoted = false;
         if (src.type.has_value()) {
-            if (auto ct_res = check_types(src.type.value(), f_->type);
-                ct_res.has_error()) {
+            if (
+              auto ct_res = check_types(src.type.value(), f_->type);
+              ct_res.has_error()) {
                 return schema_evolution_errc::type_mismatch;
             } else if (
               ct_res.value() == type_promoted::changes_partition
@@ -448,8 +461,9 @@ primitive_value promote_primitive_value_type(
 schema_transform_result annotate_schema_transform(
   const struct_type& source,
   const struct_type& dest,
-  const partition_spec& spec) {
-    return annotate_schema_visitor{spec}.visit(source, dest);
+  const partition_spec& spec,
+  field_name_comparison norm) {
+    return annotate_schema_visitor{spec, norm}.visit(source, dest);
 }
 
 schema_transform_result validate_schema_transform(
@@ -463,32 +477,59 @@ schema_transform_result validate_schema_transform(
         return schema_evolution_errc::partition_spec_conflict;
     }
     auto state = annotate_res.value();
-    if (auto res = for_each_field(
-          dest,
-          [&state, &spec](nested_field* f) {
-              vassert(
-                f->has_evolution_metadata(),
-                "Should have visited every destination field");
-              return std::visit(
-                validate_transform_visitor{f, state, spec}, f->meta);
-          });
-        res.has_error()) {
-        return res.error();
+
+    chunked_vector<nested_field*> stack;
+    reverse_field_collecting_visitor{stack}(dest);
+
+    while (!stack.empty()) {
+        auto* field = stack.back();
+        stack.pop_back();
+        if (field == nullptr) {
+            return schema_evolution_errc::null_nested_field;
+        }
+        vassert(
+          field->has_evolution_metadata(),
+          "Should have visited every destination field");
+        const bool is_new_field = std::holds_alternative<nested_field::is_new>(
+          field->meta);
+        if (
+          auto res = std::visit(
+            validate_transform_visitor{field, state, spec}, field->meta);
+          res.has_error()) {
+            return res.error();
+        }
+        if (is_new_field) {
+            // Treat a new field's substructure as part of the new type
+            // definition. Required descendants (map keys, list elements
+            // declared required, struct fields declared required) must not
+            // trigger new_required_field; that check applies only to
+            // top-level new columns.
+            continue;
+        }
+        std::visit(reverse_field_collecting_visitor(stack), field->type);
     }
+
     return state;
 }
 
 namespace {
 schema_transform_result do_visit_schemas(
-  const struct_type& source, struct_type& dest, const partition_spec& spec) {
-    auto annotate_res = annotate_schema_transform(source, dest, spec);
+  const struct_type& source,
+  struct_type& dest,
+  const partition_spec& spec,
+  field_name_comparison norm) {
+    auto annotate_res = annotate_schema_transform(source, dest, spec, norm);
     return validate_schema_transform(annotate_res, dest, spec);
 }
 } // namespace
 
 schema_evolution_result evolve_schema(
-  const struct_type& source, struct_type& dest, const partition_spec& spec) {
-    if (auto res = do_visit_schemas(source, dest, spec); res.has_error()) {
+  const struct_type& source,
+  struct_type& dest,
+  const partition_spec& spec,
+  field_name_comparison norm) {
+    if (
+      auto res = do_visit_schemas(source, dest, spec, norm); res.has_error()) {
         return res.error();
     } else {
         return schema_changed{res.value().total() > 0};
@@ -497,13 +538,12 @@ schema_evolution_result evolve_schema(
 
 namespace {
 
-nested_field*
-get_exactly_one_field_by_name(const struct_type& s, const ss::sstring& name) {
-    auto host_matches = s.fields
-                        | std::views::filter(
-                          [&name](const nested_field_ptr& f) {
-                              return f != nullptr && f->name == name;
-                          });
+nested_field* get_exactly_one_field_by_name(
+  const struct_type& s, const ss::sstring& name, field_name_comparison norm) {
+    auto host_matches
+      = s.fields | std::views::filter([&name, norm](const nested_field_ptr& f) {
+            return f != nullptr && names_equal(f->name, name, norm);
+        });
 
     auto host_match_it = host_matches.begin();
     auto n_matches = std::distance(host_match_it, host_matches.end());
@@ -540,11 +580,14 @@ namespace {
 /// IDs. On failure, writer struct is in an undefined state and should be
 /// thrown away.
 struct ids_filling_visitor {
+    explicit ids_filling_visitor(field_name_comparison norm)
+      : norm_(norm) {}
+
     ids_filled operator()(
       const struct_type& host_struct, const struct_type& writer_struct) const {
         for (const auto& writer_field : writer_struct.fields) {
             auto host_field = get_exactly_one_field_by_name(
-              host_struct, writer_field->name);
+              host_struct, writer_field->name, norm_);
 
             if (!host_field) {
                 return ids_filled::no;
@@ -605,11 +648,12 @@ struct ids_filling_visitor {
 
         // No changes allowed to map key type so check that before trying to
         // assign IDs.
-        if (auto vk_res = std::visit(
-              annotate_schema_visitor{partition_spec{}},
-              make_copy(host_key->type),
-              make_copy(writer_key->type));
-            vk_res.has_error() || vk_res.value().total() > 0) {
+        if (
+          auto vk_res = std::visit(
+            annotate_schema_visitor{partition_spec{}, norm_},
+            make_copy(host_key->type),
+            make_copy(writer_key->type));
+          vk_res.has_error() || vk_res.value().total() > 0) {
             return ids_filled::no;
         }
 
@@ -664,24 +708,32 @@ struct ids_filling_visitor {
     ids_filled operator()(const S&, const D&) const {
         return ids_filled::no;
     }
+
+private:
+    field_name_comparison norm_;
 };
 
 } // namespace
 
 ids_filled try_fill_field_ids(
-  const struct_type& host_struct_type, struct_type& writer_struct_type) {
+  const struct_type& host_struct_type,
+  struct_type& writer_struct_type,
+  field_name_comparison norm) {
     return std::invoke(
-      ids_filling_visitor{}, host_struct_type, writer_struct_type);
+      ids_filling_visitor{norm}, host_struct_type, writer_struct_type);
 }
 
 namespace {
 struct merging_schema_visitor {
+    explicit merging_schema_visitor(field_name_comparison norm)
+      : norm_(norm) {}
+
     schema_merge_result operator()(
       const struct_type& writer_struct_type,
       struct_type& host_struct_type) const {
         for (const auto& writer_field : writer_struct_type.fields) {
             auto host_field = get_exactly_one_field_by_name(
-              host_struct_type, writer_field->name);
+              host_struct_type, writer_field->name, norm_);
 
             if (!host_field) {
                 // Add the field to the host struct since no matching field was
@@ -780,9 +832,10 @@ struct merging_schema_visitor {
         vassert(
           writer_element != nullptr && host_element != nullptr,
           "List element fields assumed to be non-NULL");
-        if (auto ve_res = std::visit(
-              *this, writer_element->type, host_element->type);
-            ve_res.has_error()) {
+        if (
+          auto ve_res = std::visit(
+            *this, writer_element->type, host_element->type);
+          ve_res.has_error()) {
             return ve_res.error();
         }
         return outcome::success();
@@ -806,11 +859,12 @@ struct merging_schema_visitor {
         // equality. The limitation is not in the spec but is in all
         // implementations.
         // https://iceberg.apache.org/docs/1.9.0/evolution/#schema-evolution
-        if (auto vk_res = std::visit(
-              annotate_schema_visitor{partition_spec{}},
-              make_copy(writer_key->type),
-              make_copy(host_key->type));
-            vk_res.has_error()) {
+        if (
+          auto vk_res = std::visit(
+            annotate_schema_visitor{partition_spec{}, norm_},
+            make_copy(writer_key->type),
+            make_copy(host_key->type));
+          vk_res.has_error()) {
             return vk_res.error();
         } else if (vk_res.value().total() > 0) {
             return schema_evolution_errc::violates_map_key_invariant;
@@ -830,14 +884,19 @@ struct merging_schema_visitor {
     schema_merge_result operator()(const S&, const D&) const {
         return schema_evolution_errc::incompatible;
     }
+
+private:
+    field_name_comparison norm_;
 };
 
 } // namespace
 
 schema_merge_result merge_struct_types(
-  const struct_type& writer_struct_type, struct_type& host_struct_type) {
+  const struct_type& writer_struct_type,
+  struct_type& host_struct_type,
+  field_name_comparison norm) {
     return std::invoke(
-      merging_schema_visitor{}, writer_struct_type, host_struct_type);
+      merging_schema_visitor{norm}, writer_struct_type, host_struct_type);
 }
 
 } // namespace iceberg

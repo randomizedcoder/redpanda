@@ -9,18 +9,20 @@
 
 #include "cluster/members_manager.h"
 
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_service.h"
 #include "cluster/controller_snapshot.h"
 #include "cluster/controller_stm.h"
+#include "cluster/controller_utils.h"
 #include "cluster/drain_manager.h"
-#include "cluster/errc.h"
 #include "cluster/fwd.h"
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "cluster/partition_balancer_state.h"
+#include "cluster/rpc_utils.h"
 #include "cluster/scheduling/partition_allocator.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
@@ -30,19 +32,11 @@
 #include "raft/errc.h"
 #include "raft/group_configuration.h"
 #include "random/generators.h"
-#include "reflection/adl.h"
 #include "storage/api.h"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/do_with.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/core/smp.hh>
-
-#include <fmt/ranges.h>
 
 #include <chrono>
 #include <exception>
@@ -198,9 +192,10 @@ ss::future<> members_manager::handle_raft0_cfg_update(
     absl::flat_hash_set<model::node_id> fully_removed_nodes;
 
     // skip if configuration does not contain brokers
-    if (unlikely(
-          cfg.is_with_brokers()
-          && update_offset < _first_node_operation_command_offset)) {
+    if (
+      unlikely(
+        cfg.is_with_brokers()
+        && update_offset < _first_node_operation_command_offset)) {
         vlog(
           clusterlog.info,
           "processing raft-0 configuration at offset: {} with brokers: {}",
@@ -374,8 +369,9 @@ members_manager::apply_update(model::record_batch b) {
             update_offset,
             id);
 
-          if (auto it = _in_progress_updates.find(id);
-              it != _in_progress_updates.end()) {
+          if (
+            auto it = _in_progress_updates.find(id);
+            it != _in_progress_updates.end()) {
               auto update_type = it->second.type;
               // We could have started decommissioning the node while we
               // were finishing reallocations for node addition or
@@ -686,8 +682,9 @@ ss::future<> members_manager::apply_snapshot(
 
     std::optional<model::maintenance_state> old_self_maintenance_state;
     std::optional<model::maintenance_state> new_self_maintenance_state;
-    if (auto it = _members_table.local().nodes().find(_self.id());
-        it != _members_table.local().nodes().end()) {
+    if (
+      auto it = _members_table.local().nodes().find(_self.id());
+      it != _members_table.local().nodes().end()) {
         old_self_maintenance_state = it->second.state.get_maintenance_state();
     }
     if (auto it = snap.nodes.find(_self.id()); it != snap.nodes.end()) {
@@ -1337,9 +1334,10 @@ members_manager::handle_join_request(const join_node_request req) {
             }
             // if node was removed from the cluster doesn't allow it to rejoin
             // with the same UUID
-            if (_members_table.local()
-                  .get_removed_node_metadata_ref(it->second)
-                  .has_value()) {
+            if (
+              _members_table.local()
+                .get_removed_node_metadata_ref(it->second)
+                .has_value()) {
                 vlog(
                   clusterlog.warn,
                   "Preventing decommissioned node {} with UUID {} from joining "
@@ -1582,19 +1580,16 @@ members_manager::handle_configuration_update_request(
         co_return errc::join_request_dispatch_error;
     }
 }
-
-std::ostream&
-operator<<(std::ostream& o, const members_manager::node_update& u) {
-    fmt::print(
-      o,
+fmt::iterator members_manager::node_update::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{node_id: {}, type: {}, offset: {}, update_raft0: {}, "
       "decom_upd_revision: {}}}",
-      u.id,
-      u.type,
-      u.offset,
-      u.need_raft0_update,
-      u.decommission_update_revision);
-    return o;
+      id,
+      type,
+      offset,
+      need_raft0_update,
+      decommission_update_revision);
 }
 
 ss::future<>

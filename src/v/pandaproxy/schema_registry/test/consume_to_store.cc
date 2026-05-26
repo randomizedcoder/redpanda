@@ -23,15 +23,12 @@
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/storage.h"
 #include "pandaproxy/schema_registry/test/utils.h"
-#include "pandaproxy/schema_registry/util.h"
 
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
 
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
-
-#include <stdexcept>
 
 namespace pps = pandaproxy::schema_registry;
 
@@ -88,31 +85,21 @@ inline model::record_batch make_delete_subject_permanently_batch(
 }
 
 SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
-    pps::enable_qualified_subjects::set_local(true);
-    auto reset_flag = ss::defer(
-      [] { pps::enable_qualified_subjects::reset_local(); });
-
     pps::sharded_store s;
     s.start(pps::is_mutable::yes, ss::default_smp_service_group()).get();
     auto stop_store = ss::defer([&s]() { s.stop().get(); });
 
-    // This kafka client will not be used by the sequencer
+    // This transport will not be used by the sequencer
     // (which itself is only instantiated to receive consume_to_store's
-    //  offset updates), is just needed for constructor;
-    ss::sharded<kafka::client::client> dummy_kafka_client;
-    dummy_kafka_client
-      .start(
-        to_yaml(kafka::client::configuration{}, config::redact_secrets::no))
-      .get();
-    auto stop_kafka_client = ss::defer(
-      [&dummy_kafka_client]() { dummy_kafka_client.stop().get(); });
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
 
     ss::sharded<pps::seq_writer> seq;
     seq
       .start(
         model::node_id{0},
         ss::default_smp_service_group(),
-        std::reference_wrapper(dummy_kafka_client),
+        std::ref(dummy_transport),
         std::reference_wrapper(s),
         ss::sharded_parameter(
           [] { return std::make_unique<sequence_state_checker_test>(); }))
@@ -157,7 +144,8 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
     BOOST_REQUIRE_THROW(c(bad_schema_magic.copy()).get(), pps::exception);
 
     BOOST_REQUIRE(
-      s.get_compatibility(pps::default_context).get()
+      s.get_compatibility(pps::default_context, pps::default_to_global::yes)
+        .get()
       == pps::compatibility_level::backward);
     BOOST_REQUIRE(
       s.get_compatibility(subject0, pps::default_to_global::yes).get()
@@ -214,31 +202,21 @@ model::record_batch as_record_batch(Key key) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_consume_to_store_after_compaction) {
-    pps::enable_qualified_subjects::set_local(true);
-    auto reset_flag = ss::defer(
-      [] { pps::enable_qualified_subjects::reset_local(); });
-
     pps::sharded_store s;
     s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
     auto stop_store = ss::defer([&s]() { s.stop().get(); });
 
-    // This kafka client will not be used by the sequencer
+    // This transport will not be used by the sequencer
     // (which itself is only instantiated to receive consume_to_store's
-    //  offset updates), is just needed for constructor;
-    ss::sharded<kafka::client::client> dummy_kafka_client;
-    dummy_kafka_client
-      .start(
-        to_yaml(kafka::client::configuration{}, config::redact_secrets::no))
-      .get();
-    auto stop_kafka_client = ss::defer(
-      [&dummy_kafka_client]() { dummy_kafka_client.stop().get(); });
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
 
     ss::sharded<pps::seq_writer> seq;
     seq
       .start(
         model::node_id{0},
         ss::default_smp_service_group(),
-        std::reference_wrapper(dummy_kafka_client),
+        std::ref(dummy_transport),
         std::reference_wrapper(s),
         ss::sharded_parameter(
           [] { return std::make_unique<sequence_state_checker_test>(); }))
@@ -274,31 +252,21 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_after_compaction) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_writes_disabled) {
-    pps::enable_qualified_subjects::set_local(true);
-    auto reset_flag = ss::defer(
-      [] { pps::enable_qualified_subjects::reset_local(); });
-
     pps::sharded_store s;
     s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
     auto stop_store = ss::defer([&s]() { s.stop().get(); });
 
-    // This kafka client will not be used by the sequencer
+    // This transport will not be used by the sequencer
     // (which itself is only instantiated to receive consume_to_store's
-    //  offset updates), is just needed for constructor;
-    ss::sharded<kafka::client::client> dummy_kafka_client;
-    dummy_kafka_client
-      .start(
-        to_yaml(kafka::client::configuration{}, config::redact_secrets::no))
-      .get();
-    auto stop_kafka_client = ss::defer(
-      [&dummy_kafka_client]() { dummy_kafka_client.stop().get(); });
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
 
     ss::sharded<pps::seq_writer> seq;
     seq
       .start(
         model::node_id{0},
         ss::default_smp_service_group(),
-        std::reference_wrapper(dummy_kafka_client),
+        std::ref(dummy_transport),
         std::reference_wrapper(s),
         ss::sharded_parameter([] {
             return std::make_unique<sequence_state_checker_test>(

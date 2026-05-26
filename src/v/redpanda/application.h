@@ -215,11 +215,11 @@ public:
         return _datalake_coordinator_fe;
     }
 
-private:
     // Constructs and starts the services required to provide cryptographic
-    // algorithm support to Redpanda
+    // algorithm support to Redpanda. Public for test fixture access.
     void wire_up_and_start_crypto_services();
 
+private:
     // Constructs services across shards required to get bootstrap metadata.
     void wire_up_bootstrap_services();
 
@@ -254,7 +254,8 @@ private:
     // All methods are calleds from Seastar thread
     ss::app_template::config setup_app_config();
     void validate_arguments(const po::variables_map&);
-    void hydrate_config(const po::variables_map&);
+    YAML::Node hydrate_node_config(const po::variables_map&);
+    void hydrate_cluster_config(const YAML::Node& config);
 
     bool requires_cloud_io();
 
@@ -292,6 +293,7 @@ private:
     ss::sharded<scheduling_groups_probe> _scheduling_groups_probe;
 
     std::optional<config::binding<bool>> _abort_on_oom;
+    std::optional<config::binding<bool>> _code_hugepages_binding;
 
     ss::sharded<memory_sampling> _memory_sampling;
     ss::sharded<rpc::rpc_server> _rpc;

@@ -9,18 +9,19 @@
  * by the Apache License, Version 2.0
  */
 #pragma once
+#include "base/format_to.h"
 #include "cloud_storage/fwd.h"
 #include "cloud_storage/topic_manifest.h"
 #include "cloud_storage/topic_mount_handler.h"
 #include "cluster/data_migration_group_proxy.h"
 #include "cluster/data_migration_router.h"
 #include "cluster/data_migration_table.h"
+#include "cluster/data_migration_types.h"
 #include "cluster/errc.h"
+#include "cluster/fwd.h"
 #include "cluster/shard_table.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
-#include "data_migration_types.h"
-#include "fwd.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "ssx/mutex.h"
@@ -161,9 +162,9 @@ private:
               status);
             return *revision_id;
         }
-    };
 
-    friend std::ostream& operator<<(std::ostream&, const replica_work_state&);
+        fmt::iterator format_to(fmt::iterator it) const;
+    };
 
     struct topic_work_result {
         model::topic_namespace nt;
@@ -235,7 +236,7 @@ private:
     /* RPC and raft0 actions */
     ss::future<> send_rpc(model::node_id node_id);
     ss::future<check_ntp_states_reply>
-    check_ntp_states_locally(check_ntp_states_request&& req);
+    check_ntp_states_locally(check_ntp_states_request req);
     void to_advance_if_done(mrstate_cit_t it);
     ss::future<> advance(id migration_id, state sought_state);
     void spawn_advances();

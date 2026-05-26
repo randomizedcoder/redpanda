@@ -8,7 +8,6 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 #include "bytes/iobuf_parser.h"
-#include "gtest/gtest.h"
 #include "iceberg/avro_decimal.h"
 #include "iceberg/conversion/avro_utils.h"
 #include "iceberg/conversion/schema_avro.h"
@@ -787,7 +786,8 @@ AssertionResult value_matches(
 
 // convert iceberg decimal to vector of bytes, big endian
 std::vector<uint8_t> decimal_to_vector(absl::int128 decimal) {
-    auto array = iceberg::encode_avro_decimal(decimal);
+    auto array = iceberg::encode_avro_fixed_decimal(
+      decimal, iceberg::max_decimal_bytes);
     return {array.begin(), array.end()};
 }
 

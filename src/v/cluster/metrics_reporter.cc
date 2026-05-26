@@ -13,7 +13,6 @@
 
 #include "absl/container/node_hash_map.h"
 #include "bytes/iobuf.h"
-#include "bytes/iostream.h"
 #include "cluster/cluster_link/frontend.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller_stm.h"
@@ -23,16 +22,13 @@
 #include "cluster/logger.h"
 #include "cluster/members_table.h"
 #include "cluster/topic_table.h"
-#include "cluster/types.h"
 #include "config/configuration.h"
-#include "config/validators.h"
 #include "features/enterprise_features.h"
 #include "features/feature_table.h"
 #include "hashing/secure.h"
 #include "json/stringbuffer.h"
 #include "json/writer.h"
 #include "model/namespace.h"
-#include "model/record_batch_types.h"
 #include "model/timeout_clock.h"
 #include "net/tls.h"
 #include "net/tls_certificate_probe.h"
@@ -40,17 +36,14 @@
 #include "rpc/types.h"
 #include "security/authorizer.h"
 #include "security/role_store.h"
-#include "ssx/sformat.h"
 #include "utils/unresolved_address.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/tls.hh>
-#include <seastar/util/defer.hh>
 
 #include <boost/lexical_cast.hpp>
 #include <boost/random/seed_seq.hpp>
@@ -58,11 +51,8 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <fmt/core.h>
-#include <sys/socket.h>
 
 #include <algorithm>
-#include <climits>
-#include <netdb.h>
 #include <stdexcept>
 
 namespace {
@@ -104,8 +94,9 @@ std::optional<metrics_reporter::kubernetes_metrics> get_kubernetes_metrics() {
         km.chart_version.emplace(v);
         any = true;
     }
-    if (auto v = std::getenv("REDPANDA_METRICS_K8S_OPERATOR_IMAGE_VERSION");
-        v && *v) {
+    if (
+      auto v = std::getenv("REDPANDA_METRICS_K8S_OPERATOR_IMAGE_VERSION");
+      v && *v) {
         km.operator_image_version.emplace(v);
         any = true;
     }
@@ -354,6 +345,17 @@ metrics_reporter::build_metrics_snapshot() {
         case model::iceberg_mode::variant::value_schema_latest:
             ++snapshot.topics_with_iceberg_schema_latest;
             break;
+        }
+
+        if (md.get_configuration_properties().is_local_topic()) {
+            ++snapshot.local_topic_count;
+        }
+
+        if (
+          md.get_configuration().properties.storage_mode
+          == model::redpanda_storage_mode::cloud) {
+            // Count "pure" cloud topics and not the tiered cloud topics.
+            ++snapshot.cloud_topic_count;
         }
     }
 
@@ -716,6 +718,12 @@ void rjson_serialize(
     w.Uint64(snapshot.topics_with_iceberg_schema_id);
     w.Key("topics_with_iceberg_latest_protobuf_value");
     w.Uint64(snapshot.topics_with_iceberg_schema_latest);
+
+    w.Key("local_topic_count");
+    w.Uint(snapshot.local_topic_count);
+
+    w.Key("cloud_topic_count");
+    w.Uint(snapshot.cloud_topic_count);
 
     w.Key("partition_count");
     w.Uint64(snapshot.partition_count);

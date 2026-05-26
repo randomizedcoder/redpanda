@@ -30,6 +30,10 @@ void leader_router_probe::setup_metrics() {
           [this] { return _add_objects.internal_histogram_logform(); },
           sm::description("Latency of local add_objects requests")),
         sm::make_histogram(
+          "compact_objects_duration_microseconds",
+          [this] { return _compact_objects.internal_histogram_logform(); },
+          sm::description("Latency of local compact_objects requests")),
+        sm::make_histogram(
           "replace_objects_duration_microseconds",
           [this] { return _replace_objects.internal_histogram_logform(); },
           sm::description("Latency of local replace_objects requests")),
@@ -96,6 +100,10 @@ void leader_router_probe::setup_metrics() {
           "restore_domain_duration_microseconds",
           [this] { return _restore_domain.internal_histogram_logform(); },
           sm::description("Latency of local restore_domain requests")),
+        sm::make_histogram(
+          "preregister_objects_duration_microseconds",
+          [this] { return _preregister_objects.internal_histogram_logform(); },
+          sm::description("Latency of local preregister_objects requests")),
       });
 }
 

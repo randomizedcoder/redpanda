@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "bytes/iobuf.h"
 #include "model/metadata.h"
 #include "raft/fundamental.h"
@@ -223,9 +224,8 @@ struct heartbeat_request_data
           last_visible_index);
     }
 
-    friend bool
-    operator==(const heartbeat_request_data&, const heartbeat_request_data&)
-      = default;
+    friend bool operator==(
+      const heartbeat_request_data&, const heartbeat_request_data&) = default;
 };
 
 struct heartbeat_reply_data
@@ -254,17 +254,16 @@ struct heartbeat_reply_data
           may_recover);
     }
 
-    friend bool
-    operator==(const heartbeat_reply_data&, const heartbeat_reply_data&)
-      = default;
+    friend bool operator==(
+      const heartbeat_reply_data&, const heartbeat_reply_data&) = default;
 };
 
 struct group_heartbeat {
     raft::group_id group;
     std::optional<heartbeat_request_data> data;
 
-    friend bool operator==(const group_heartbeat&, const group_heartbeat&)
-      = default;
+    friend bool
+    operator==(const group_heartbeat&, const group_heartbeat&) = default;
 };
 
 struct full_heartbeat_reply {
@@ -289,17 +288,16 @@ struct full_heartbeat_reply {
         write(out, req.data);
     }
 
-    friend bool
-    operator==(const full_heartbeat_reply&, const full_heartbeat_reply&)
-      = default;
+    friend bool operator==(
+      const full_heartbeat_reply&, const full_heartbeat_reply&) = default;
 };
 
 struct full_heartbeat {
     raft::group_id group;
     heartbeat_request_data data;
 
-    friend bool operator==(const full_heartbeat&, const full_heartbeat&)
-      = default;
+    friend bool
+    operator==(const full_heartbeat&, const full_heartbeat&) = default;
 
     friend inline void read_nested(
       iobuf_parser& in, full_heartbeat& fh, const size_t bytes_left_limit) {
@@ -368,10 +366,17 @@ public:
     model::node_id target() const { return _target_node; }
     uint64_t lw_heartbeats_count() const { return _lw_cnt; }
 
-private:
-    friend std::ostream&
-    operator<<(std::ostream& o, const heartbeat_request_v2& r);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{source: {}, target: {}, lw_count: {}, full_count: {}}}",
+          _source_node,
+          _target_node,
+          _lw_cnt,
+          _full_heartbeats.size());
+    }
 
+private:
     uint64_t _lw_cnt{0};
     model::node_id _source_node;
     model::node_id _target_node;
@@ -412,8 +417,14 @@ public:
         return _full_replies;
     };
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const heartbeat_reply_v2& r);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{source: {}, target: {}, full_replies_count: {}}}",
+          _source_node,
+          _target_node,
+          _full_replies.size());
+    }
 
     friend bool
     operator==(const heartbeat_reply_v2& lhs, const heartbeat_reply_v2& rhs) {

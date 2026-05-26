@@ -27,7 +27,6 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/core/timer.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/httpd.hh>
@@ -36,7 +35,6 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
 
-#include <boost/algorithm/string.hpp>
 #include <boost/beast/http/field.hpp>
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
@@ -160,9 +158,9 @@ started_client_and_server(const net::base_transport::configuration& conf) {
     };
 }
 
-template<typename Header, typename Host>
-static void header_set_host(Header& header, Host& h) {
-    auto host = fmt::format("{}", h);
+template<typename Header>
+static void header_set_host(Header& header, const net::unresolved_address& h) {
+    auto host = fmt::format("{}:{}", h.host(), h.port());
     header.insert(boost::beast::http::field::host, host);
 }
 

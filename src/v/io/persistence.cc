@@ -10,8 +10,6 @@
  */
 #include "io/persistence.h"
 
-#include "base/units.h"
-
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
@@ -52,8 +50,9 @@ std::optional<seastar::future<size_t>> check_alignment(
     }
 
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    if (auto ptr = reinterpret_cast<std::uintptr_t>(data.data());
-        ptr % memory_alignment) {
+    if (
+      auto ptr = reinterpret_cast<std::uintptr_t>(data.data());
+      ptr % memory_alignment) {
         return make_alignment_error(name, "buf", ptr, memory_alignment);
     }
 
@@ -256,13 +255,14 @@ memory_persistence::memory_file::memory_file(memory_persistence* persistence)
 seastar::future<size_t> memory_persistence::memory_file::dma_read(
   uint64_t pos, char* buf, size_t len) noexcept {
     return maybe_fail_read().then([this, pos, buf, len] {
-        if (auto err = check_alignment(
-              "dma_read",
-              pos,
-              {buf, len},
-              memory_dma_alignment(),
-              disk_read_dma_alignment());
-            err.has_value()) {
+        if (
+          auto err = check_alignment(
+            "dma_read",
+            pos,
+            {buf, len},
+            memory_dma_alignment(),
+            disk_read_dma_alignment());
+          err.has_value()) {
             return std::move(err.value());
         }
         return read(pos, buf, len);
@@ -272,13 +272,14 @@ seastar::future<size_t> memory_persistence::memory_file::dma_read(
 seastar::future<size_t> memory_persistence::memory_file::dma_write(
   uint64_t pos, const char* buf, size_t len) noexcept {
     return maybe_fail_write().then([this, pos, buf, len] {
-        if (auto err = check_alignment(
-              "dma_write",
-              pos,
-              {buf, len},
-              memory_dma_alignment(),
-              disk_write_dma_alignment());
-            err.has_value()) {
+        if (
+          auto err = check_alignment(
+            "dma_write",
+            pos,
+            {buf, len},
+            memory_dma_alignment(),
+            disk_write_dma_alignment());
+          err.has_value()) {
             return std::move(err.value());
         }
         return write(pos, buf, len).then([this, pos](size_t written) {

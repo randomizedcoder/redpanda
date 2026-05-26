@@ -9,6 +9,7 @@
  */
 
 #include "base/units.h"
+#include "base/vassert.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
 #include "cache_test_fixture.h"
@@ -25,16 +26,20 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/util/file.hh>
 
 #include <boost/test/tools/old/interface.hpp>
 #include <boost/test/unit_test.hpp>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <system_error>
 
 using namespace cloud_io;
 
@@ -502,6 +507,44 @@ FIXTURE_TEST(test_clean_up_on_stream_exception, cache_test_fixture) {
 }
 
 /**
+ * Regression test for the ENOSPC handler in cache::put. The cache is sharded
+ * but trim() asserts shard 0 only; if put runs on a non-zero shard and the
+ * write fails with ENOSPC, the local trim_throttled() hop must route through
+ * shard 0 instead of executing on the calling shard.
+ */
+FIXTURE_TEST(test_put_enospc_on_non_zero_shard, cache_test_fixture) {
+    vassert(
+      ss::this_smp_shard_count() >= 2,
+      "Test requires at least 2 shards to exercise non-shard-0 put path");
+
+    BOOST_CHECK_EXCEPTION(
+      sharded_cache
+        .invoke_on(
+          ss::shard_id{1},
+          [](cloud_io::cache& c) -> ss::future<> {
+              auto reservation = co_await c.reserve_space(1, 1);
+              auto s = tests::make_throwing_stream(
+                std::filesystem::filesystem_error(
+                  "fake ENOSPC",
+                  std::error_code(ENOSPC, std::generic_category())));
+              std::filesystem::path key{
+                "shard1_topic/shard1_partition/shard1_segment.log"};
+              co_await c.put(key, s, reservation);
+          })
+        .get(),
+      std::filesystem::filesystem_error,
+      [](const std::filesystem::filesystem_error& e) {
+          return e.code() == std::errc::no_space_on_device;
+      });
+
+    // After ENOSPC, all shards must observe the block-puts flag, otherwise
+    // concurrent puts on other shards would keep racing into a full disk.
+    for (ss::shard_id s = 0; s < ss::this_smp_shard_count(); ++s) {
+        BOOST_CHECK(get_block_puts(s));
+    }
+}
+
+/**
  * Validate that .part files and empty directories are deleted if found during
  * the startup walk of the cache.
  */
@@ -823,4 +866,117 @@ FIXTURE_TEST(test_tracker_sync_add_remove, cache_test_fixture) {
     BOOST_REQUIRE(t.get(full_key_path.native()).has_value());
     BOOST_REQUIRE_EQUAL(cache.get_usage_bytes(), 1024);
     BOOST_REQUIRE_EQUAL(cache.get_usage_objects(), 1);
+}
+
+namespace {
+
+constexpr cloud_io::staging_file_options test_staging_opts{
+  .reservation_min_chunk_size = 4_KiB, .initial_reservation_bytes = 0};
+
+iobuf make_iobuf(char fill, size_t size) {
+    iobuf buf;
+    auto data = ss::sstring(size, fill);
+    buf.append(data.data(), data.size());
+    return buf;
+}
+} // namespace
+
+// Full staging write cycle: create staging_file, append data, commit,
+// verify the result via get().
+FIXTURE_TEST(staging_write_commit_read_cycle, cache_test_fixture) {
+    auto& cache = sharded_cache.local();
+
+    auto staging
+      = cache.create_staging_file(KEY, test_staging_opts, std::nullopt).get();
+
+    BOOST_CHECK(staging.path().native().ends_with(".part"));
+    BOOST_CHECK(staging.path().native().starts_with(CACHE_DIR.native()));
+
+    staging.append(make_iobuf('x', 4_KiB)).get();
+
+    BOOST_CHECK(!cache.get(KEY).get().has_value());
+
+    staging.commit().get();
+
+    auto item = cache.get(KEY).get();
+    BOOST_REQUIRE(item.has_value());
+    BOOST_CHECK_EQUAL(item->size, 4_KiB);
+    item->body.close().get();
+
+    BOOST_CHECK(ss::file_exists(cache.get_local_path(KEY).native()).get());
+}
+
+// Verify that .part staging files are not evicted by trims.
+FIXTURE_TEST(staging_files_survive_trim, cache_test_fixture) {
+    auto& cache = sharded_cache.local();
+
+    // Commit a regular file so the cache is non-empty.
+    auto data_string = create_data_string('z', 1_KiB);
+    put_into_cache(data_string, KEY);
+
+    // Create a staging file for a different key.
+    const std::filesystem::path staging_key{
+      "abc001/test_topic/staging_target.txt"};
+    auto staging
+      = cache.create_staging_file(staging_key, test_staging_opts, std::nullopt)
+          .get();
+    staging.append(make_iobuf('y', 1_KiB)).get();
+    staging.flush().get();
+    BOOST_REQUIRE(ss::file_exists(staging.path().native()).get());
+
+    // Trim the committed file. The limits must be generous enough to
+    // accommodate the outstanding reservation (which may overshoot due
+    // to chunking) so trim_fast handles everything and does not fall
+    // through to trim_exhaustive (which deletes .part files).
+    trim_cache(8_KiB, 4);
+
+    BOOST_CHECK(ss::file_exists(staging.path().native()).get());
+
+    staging.close().get();
+    ss::remove_file(staging.path().native()).get();
+}
+
+// Committing two staging files for the same key doesn't crash or corrupt.
+// The key remains readable and accounting reflects exactly one object.
+FIXTURE_TEST(double_commit_same_key_is_safe, cache_test_fixture) {
+    auto& cache = sharded_cache.local();
+
+    auto staging1
+      = cache.create_staging_file(KEY, test_staging_opts, std::nullopt).get();
+    staging1.append(make_iobuf('a', 4_KiB)).get();
+
+    auto staging2
+      = cache.create_staging_file(KEY, test_staging_opts, std::nullopt).get();
+    staging2.append(make_iobuf('b', 4_KiB)).get();
+
+    staging1.commit().get();
+    staging2.commit().get();
+
+    BOOST_CHECK_EQUAL(cache.get_usage_objects(), 1);
+    BOOST_CHECK_EQUAL(cache.get_usage_bytes(), 4_KiB);
+
+    auto item = cache.get(KEY).get();
+    BOOST_REQUIRE(item.has_value());
+    BOOST_CHECK_EQUAL(item->size, 4_KiB);
+    item->body.close().get();
+}
+
+// Destroying a staging_file without calling commit() releases the reservation.
+FIXTURE_TEST(staging_file_abandoned_releases_reservation, cache_test_fixture) {
+    auto& cache = sharded_cache.local();
+
+    auto pre_bytes = cache.get_usage_bytes();
+    auto pre_objects = cache.get_usage_objects();
+
+    {
+        auto staging
+          = cache.create_staging_file(KEY, test_staging_opts, std::nullopt)
+              .get();
+        staging.append(make_iobuf('z', 4_KiB)).get();
+        staging.close().get();
+    }
+
+    BOOST_CHECK_EQUAL(cache.get_usage_bytes(), pre_bytes);
+    BOOST_CHECK_EQUAL(cache.get_usage_objects(), pre_objects);
+    BOOST_CHECK(!cache.get(KEY).get().has_value());
 }

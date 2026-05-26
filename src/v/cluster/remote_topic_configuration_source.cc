@@ -15,9 +15,6 @@
 #include "cloud_storage/topic_manifest.h"
 #include "cloud_storage/topic_manifest_downloader.h"
 #include "cloud_storage/types.h"
-#include "cloud_storage_clients/configuration.h"
-#include "cluster/logger.h"
-#include "cluster/types.h"
 #include "config/configuration.h"
 #include "model/timeout_clock.h"
 
@@ -76,6 +73,8 @@ remote_topic_configuration_source::set_remote_properties_in_config(
         cfg.cfg.properties.remote_topic_properties = remote_topic_properties(
           manifest.get_revision(), dl_cfg->partition_count);
         cfg.cfg.properties.remote_label = dl_cfg->properties.remote_label;
+        cfg.cfg.properties.storage_mode = dl_cfg->properties.storage_mode;
+        cfg.cfg.tp_id = dl_cfg->tp_id;
     }
     co_return errc::success;
 }

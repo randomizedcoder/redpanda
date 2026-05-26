@@ -13,8 +13,6 @@
 #include "metrics/prometheus_sanitize.h"
 
 #include <seastar/core/metrics.hh>
-#include <seastar/core/metrics_types.hh>
-#include <seastar/core/shared_ptr.hh>
 
 namespace cloud_topics::l0 {
 
@@ -58,7 +56,7 @@ void pipeline_probe::setup_internal_metrics(bool disable, ss::sstring name) {
         sm::make_histogram(
           "request_processing_time_ms",
           [this] {
-              return _request_processing_time.public_histogram_logform();
+              return _request_processing_time.internal_histogram_logform();
           },
           sm::description("Request processing time histogram in milliseconds."),
           labels),
@@ -79,6 +77,13 @@ void pipeline_probe::setup_internal_metrics(bool disable, ss::sstring name) {
           [this] { return _memory_pressure_blocked; },
           sm::description(
             "Amount of memory (in bytes) blocked due to memory pressure."),
+          labels),
+        sm::make_counter(
+          "request_limit_waits",
+          [this] { return _request_limit_waits; },
+          sm::description(
+            "Number of times requests had to wait for an in-flight slot "
+            "due to the write inflight limit."),
           labels),
         sm::make_counter(
           "bytes_in",
@@ -252,8 +257,62 @@ void write_request_scheduler_probe::setup_internal_metrics(bool disable) {
          "active_groups",
          [this] { return _active_groups; },
          sm::description("Number of active upload groups in the scheduler."),
+         labels),
+
+       sm::make_gauge(
+         "next_stage_bytes",
+         [this] { return _next_stage_bytes; },
+         sm::description(
+           "Bytes buffered in the next pipeline stage, used for "
+           "group split/merge decisions."),
          labels)});
 }
+read_merge_probe::read_merge_probe(bool disable) {
+    setup_internal_metrics(disable);
+}
+
+void read_merge_probe::setup_internal_metrics(bool disable) {
+    if (disable) {
+        return;
+    }
+    namespace sm = ss::metrics;
+    std::vector<sm::label_instance> labels;
+
+    _metrics.add_group(
+      prometheus_sanitize::metrics_name("cloud_topics_read_merge"),
+      {
+        sm::make_counter(
+          "requests_in",
+          [this] { return _requests_in; },
+          sm::description(
+            "Number of read requests handled by the read merge component."),
+          labels),
+
+        sm::make_counter(
+          "bytes_in",
+          [this] { return _bytes_in; },
+          sm::description(
+            "Total bytes of read requests handled by the read merge "
+            "component."),
+          labels),
+
+        sm::make_counter(
+          "requests_out",
+          [this] { return _requests_out; },
+          sm::description(
+            "Number of proxy requests forwarded to the next pipeline stage."),
+          labels),
+
+        sm::make_counter(
+          "bytes_out",
+          [this] { return _bytes_out; },
+          sm::description(
+            "Total bytes of proxy requests forwarded to the next pipeline "
+            "stage."),
+          labels),
+      });
+}
+
 batcher_probe::batcher_probe(bool disable) { setup_internal_metrics(disable); }
 
 void batcher_probe::setup_internal_metrics(bool disable) {

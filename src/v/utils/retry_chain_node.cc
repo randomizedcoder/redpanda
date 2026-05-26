@@ -13,12 +13,10 @@
 
 #include "base/vassert.h"
 #include "random/generators.h"
-#include "ssx/sformat.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/manual_clock.hh>
-#include <seastar/core/ragel.hh>
 
 #include <fmt/chrono.h>
 #include <fmt/format.h>
@@ -336,8 +334,9 @@ basic_retry_chain_node<Clock>::basic_retry_chain_node(
       "Initial backoff {} is too large",
       backoff);
 
-    if (auto parent = get_parent();
-        parent != nullptr && parent->_deadline != time_point::min()) {
+    if (
+      auto parent = get_parent();
+      parent != nullptr && parent->_deadline != time_point::min()) {
         _deadline = std::min(_deadline, parent->_deadline);
     }
     auto len = get_len();

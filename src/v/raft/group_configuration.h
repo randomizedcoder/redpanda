@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "base/format_to.h"
 #include "model/metadata.h"
 #include "raft/fundamental.h"
 #include "reflection/adl.h"
@@ -60,7 +61,17 @@ inline constexpr model::revision_id no_revision{};
  */
 enum class configuration_state : uint8_t { simple, transitional, joint };
 
-std::ostream& operator<<(std::ostream& o, configuration_state t);
+inline fmt::iterator format_to(configuration_state t, fmt::iterator out) {
+    switch (t) {
+    case configuration_state::simple:
+        return fmt::format_to(out, "simple");
+    case configuration_state::joint:
+        return fmt::format_to(out, "joint");
+    case configuration_state::transitional:
+        return fmt::format_to(out, "transitional");
+    }
+    __builtin_unreachable();
+}
 
 struct group_nodes
   : serde::envelope<group_nodes, serde::version<0>, serde::compat_version<0>> {
@@ -71,7 +82,10 @@ struct group_nodes
 
     std::optional<vnode> find(model::node_id) const;
 
-    friend std::ostream& operator<<(std::ostream&, const group_nodes&);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, "{{voters: {}, learners: {}}}", voters, learners);
+    }
     friend bool operator==(const group_nodes&, const group_nodes&) = default;
 
     auto serde_fields() { return std::tie(voters, learners); }
@@ -93,16 +107,22 @@ struct configuration_update
     bool is_to_add(const vnode&) const;
     bool is_to_remove(const vnode&) const;
 
-    friend bool
-    operator==(const configuration_update&, const configuration_update&)
-      = default;
+    friend bool operator==(
+      const configuration_update&, const configuration_update&) = default;
 
     auto serde_fields() {
         return std::tie(
           replicas_to_add, replicas_to_remove, learner_start_offset);
     }
 
-    friend std::ostream& operator<<(std::ostream&, const configuration_update&);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{to_add: {}, to_remove: {}, learner_start_offset: {}}}",
+          replicas_to_add,
+          replicas_to_remove,
+          learner_start_offset);
+    }
 };
 
 class group_configuration
@@ -327,11 +347,10 @@ public:
 
     void set_version(version_t v) { _version = v; }
 
-    friend bool
-    operator==(const group_configuration&, const group_configuration&)
-      = default;
+    friend bool operator==(
+      const group_configuration&, const group_configuration&) = default;
 
-    friend std::ostream& operator<<(std::ostream&, const group_configuration&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     struct configuration_change_strategy {
         /**
@@ -342,17 +361,16 @@ public:
         // Deprecated: broker based manipulation methods
         virtual void add_broker(model::broker, model::revision_id) = 0;
         virtual void
-          replace_brokers(std::vector<broker_revision>, model::revision_id)
-          = 0;
+          replace_brokers(std::vector<broker_revision>, model::revision_id) = 0;
         virtual void remove_broker(model::node_id) = 0;
 
         virtual void
-          add(vnode, model::revision_id, std::optional<model::offset>)
-          = 0;
+          add(vnode, model::revision_id, std::optional<model::offset>) = 0;
         virtual void remove(vnode, model::revision_id) = 0;
         virtual void replace(
-          std::vector<vnode>, model::revision_id, std::optional<model::offset>)
-          = 0;
+          std::vector<vnode>,
+          model::revision_id,
+          std::optional<model::offset>) = 0;
 
         /**
          * Discards the old configuration, after this operation joint
@@ -533,7 +551,10 @@ struct offset_configuration {
 
     model::offset offset;
     group_configuration cfg;
-    friend std::ostream& operator<<(std::ostream&, const offset_configuration&);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, "{{offset: {}, group_configuration: {}}}", offset, cfg);
+    }
 };
 } // namespace raft
 

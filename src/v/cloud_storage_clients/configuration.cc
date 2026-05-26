@@ -111,10 +111,8 @@ ss::future<s3_configuration> s3_configuration::make_configuration(
     // discover if the backend is in `virtual_host` or `path mode`
     client_cfg.uri = access_point_uri(base_endpoint_uri);
 
-    if (overrides.disable_tls == false) {
-        client_cfg.tls_credentials_builder
-          = co_await make_tls_credentials_builder(overrides.trust_file);
-    }
+    client_cfg.disable_tls = overrides.disable_tls;
+    client_cfg.tls_truststore_path = overrides.trust_file;
 
     // When using virtual host addressing, the client must connect to
     // the s3 endpoint with the bucket name, e.g.
@@ -145,17 +143,19 @@ ss::shared_ptr<client_probe> s3_configuration::make_probe() const {
       endpoint_url{server_addr.host()});
 }
 
-std::ostream& operator<<(std::ostream& o, const s3_configuration& c) {
-    o << "{access_key:"
-      << c.access_key.value_or(cloud_roles::public_key_str{""})
-      << ",region:" << c.region() << ",service:" << c.service()
-      << ",secret_key:****"
-      << ",url_style:" << c.url_style << ",access_point_uri:" << c.uri()
-      << ",server_addr:" << c.server_addr << ",max_idle_time:"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(c.max_idle_time)
-           .count()
-      << "}";
-    return o;
+fmt::iterator s3_configuration::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{access_key:{},region:{},service:{},secret_key:****,url_style:{},"
+      "access_point_uri:{},server_addr:{},max_idle_time:{}}}",
+      access_key.value_or(cloud_roles::public_key_str{""}),
+      region(),
+      service(),
+      url_style,
+      uri(),
+      server_addr,
+      std::chrono::duration_cast<std::chrono::milliseconds>(max_idle_time)
+        .count());
 }
 
 ss::future<abs_configuration> abs_configuration::make_configuration(
@@ -186,10 +186,9 @@ ss::future<abs_configuration> abs_configuration::make_configuration(
     client_cfg.storage_account_name = storage_account_name;
     client_cfg.shared_key = shared_key;
     client_cfg.uri = access_point_uri{endpoint_uri};
-    if (overrides.disable_tls == false) {
-        client_cfg.tls_credentials_builder
-          = co_await make_tls_credentials_builder(overrides.trust_file);
-    }
+
+    client_cfg.disable_tls = overrides.disable_tls;
+    client_cfg.tls_truststore_path = overrides.trust_file;
 
     client_cfg.server_addr = net::unresolved_address(
       client_cfg.uri(),
@@ -238,40 +237,23 @@ void apply_self_configuration_result(
       });
 }
 
-std::ostream& operator<<(std::ostream& o, const abs_configuration& c) {
-    o << "{storage_account_name: " << c.storage_account_name()
-      << ", shared_key:" << (c.shared_key.has_value() ? "****" : "none")
-      << ", access_point_uri:" << c.uri() << ", server_addr:" << c.server_addr
-      << ", max_idle_time:"
-      << std::chrono::duration_cast<std::chrono::milliseconds>(c.max_idle_time)
-           .count()
-      << ", is_hns_enabled:" << c.is_hns_enabled << "}";
-    return o;
-}
-
-std::ostream&
-operator<<(std::ostream& o, const abs_self_configuration_result& r) {
-    o << "{is_hns_enabled: " << r.is_hns_enabled << "}";
-    return o;
-}
-
-std::ostream&
-operator<<(std::ostream& o, const s3_self_configuration_result& r) {
-    o << "{s3_url_style: " << r.url_style << "}";
-    return o;
+fmt::iterator abs_configuration::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{storage_account_name: {}, shared_key:{}, access_point_uri:{}, "
+      "server_addr:{}, max_idle_time:{}, is_hns_enabled:{}}}",
+      storage_account_name(),
+      (shared_key.has_value() ? "****" : "none"),
+      uri(),
+      server_addr,
+      std::chrono::duration_cast<std::chrono::milliseconds>(max_idle_time)
+        .count(),
+      is_hns_enabled);
 }
 
 std::ostream&
 operator<<(std::ostream& o, const client_self_configuration_output& r) {
-    ss::visit(
-      r,
-      [&o](const s3_self_configuration_result& self_cfg) {
-          o << "{s3_self_configuration_result: " << self_cfg << "}";
-      },
-      [&o](const abs_self_configuration_result& self_cfg) {
-          o << "{abs_self_configuration_result: " << self_cfg << "}";
-      });
-
+    fmt::print(o, "{}", r);
     return o;
 }
 
@@ -296,8 +278,9 @@ infer_backend_from_uri(const access_point_uri& uri) {
 model::cloud_storage_backend infer_backend_from_configuration(
   const client_configuration& client_config,
   model::cloud_credentials_source cloud_storage_credentials_source) {
-    if (auto v = config::shard_local_cfg().cloud_storage_backend.value();
-        v != model::cloud_storage_backend::unknown) {
+    if (
+      auto v = config::shard_local_cfg().cloud_storage_backend.value();
+      v != model::cloud_storage_backend::unknown) {
         vlog(
           client_config_log.info,
           "cloud_storage_backend is explicitly set to {}",
@@ -352,22 +335,15 @@ model::cloud_storage_backend infer_backend_from_configuration(
 }
 
 std::ostream& operator<<(std::ostream& o, const client_configuration& c) {
-    ss::visit(
-      c,
-      [&o](const s3_configuration& cfg) {
-          o << "{s3_configuration: " << cfg << "}";
-      },
-      [&o](const abs_configuration& cfg) {
-          o << "{abs_configuration: " << cfg << "}";
-      });
-
+    fmt::print(o, "{}", c);
     return o;
 }
 
 cloud_roles::auth_refresh_bg_op::credentials_source_config
 build_refresh_credentials_source(
   const client_configuration& config,
-  model::cloud_credentials_source cloud_credentials_source) {
+  model::cloud_credentials_source cloud_credentials_source,
+  std::optional<ss::sstring> host_override) {
     if (
       cloud_credentials_source
       == model::cloud_credentials_source::config_file) {
@@ -391,10 +367,12 @@ build_refresh_credentials_source(
     } else {
         return ss::visit(
           config,
-          [](const cloud_storage_clients::s3_configuration& s3_cfg)
+          [&](const cloud_storage_clients::s3_configuration& s3_cfg)
             -> cloud_roles::auth_refresh_bg_op::credentials_source_config {
               return cloud_roles::auth_refresh_bg_op::s3_compat_config{
-                .service = s3_cfg.service, .region = s3_cfg.region};
+                .service = s3_cfg.service,
+                .region = s3_cfg.region,
+                .host = host_override};
           },
           [](const cloud_storage_clients::abs_configuration&)
             -> cloud_roles::auth_refresh_bg_op::credentials_source_config {
@@ -406,10 +384,10 @@ build_refresh_credentials_source(
 namespace {
 ss::future<ss::shared_ptr<ss::tls::certificate_credentials>>
 build_tls_credentials(
-  ss::sstring name, const ss::tls::credentials_builder& cred_builder) {
+  ss::sstring name, ss::tls::credentials_builder cred_builder) {
     co_return co_await net::build_reloadable_credentials_with_probe<
       ss::tls::certificate_credentials>(
-      cred_builder, "cloud_storage_client", std::move(name));
+      std::move(cred_builder), "cloud_storage_client", std::move(name));
 }
 } // namespace
 
@@ -420,16 +398,20 @@ build_tls_credentials(const client_configuration& config) {
     return ss::visit(
       config,
       [](const s3_configuration& s3_cfg) {
-          if (s3_cfg.tls_credentials_builder) {
-              return build_tls_credentials(
-                "s3", *s3_cfg.tls_credentials_builder);
+          if (!s3_cfg.disable_tls) {
+              return make_tls_credentials_builder(s3_cfg.tls_truststore_path)
+                .then([](ss::tls::credentials_builder builder) {
+                    return build_tls_credentials("s3", std::move(builder));
+                });
           }
           return ss::make_ready_future<val_t>(nullptr);
       },
       [](const abs_configuration& abs_cfg) {
-          if (abs_cfg.tls_credentials_builder) {
-              return build_tls_credentials(
-                "abs", *abs_cfg.tls_credentials_builder);
+          if (!abs_cfg.disable_tls) {
+              return make_tls_credentials_builder(abs_cfg.tls_truststore_path)
+                .then([](ss::tls::credentials_builder builder) {
+                    return build_tls_credentials("abs", std::move(builder));
+                });
           }
           return ss::make_ready_future<val_t>(nullptr);
       });

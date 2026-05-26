@@ -11,7 +11,6 @@
 
 #include "base/vassert.h"
 #include "base/vlog.h"
-#include "kafka/client/client_fetch_batch_reader.h"
 #include "model/namespace.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/error.h"
@@ -19,13 +18,12 @@
 #include "pandaproxy/schema_registry/exceptions.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/storage.h"
+#include "pandaproxy/schema_registry/transport.h"
 #include "pandaproxy/schema_registry/types.h"
-#include "ssx/future-util.h"
 #include "storage/record_batch_builder.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/coroutine/as_future.hh>
 
 #include <exception>
 #include <optional>
@@ -108,17 +106,7 @@ struct batch_builder : public storage::record_batch_builder {
 /// a REST API endpoint that requires global knowledge of latest
 /// data (i.e. any listings)
 ss::future<> seq_writer::read_sync() {
-    auto offsets = co_await _client.local().list_offsets(
-      model::schema_registry_internal_tp);
-    if (
-      offsets.data.topics.size() != 1
-      || offsets.data.topics[0].partitions.size() != 1) {
-        throw kafka::exception(
-          kafka::error_code::unknown_server_error,
-          "Malformed ListOffsets Kafka response for internal topic");
-    }
-
-    auto max_offset = offsets.data.topics[0].partitions[0].offset;
+    auto max_offset = co_await _transport->get_high_watermark();
     co_await wait_for(max_offset - model::offset{1});
     co_await _store.process_marked_schemas();
 }
@@ -127,7 +115,7 @@ ss::future<> seq_writer::check_mutable(
   const context& ctx, const std::optional<subject>& sub) {
     auto mode = sub ? co_await _store.get_mode(
                         {ctx, *sub}, default_to_global::yes)
-                    : co_await _store.get_mode(ctx);
+                    : co_await _store.get_mode(ctx, default_to_global::yes);
     if (mode == mode::read_only) {
         throw as_exception(mode_is_readonly(ctx, sub));
     }
@@ -147,14 +135,10 @@ ss::future<> seq_writer::wait_for(model::offset offset) {
                     "wait_for dirty!  Reading {}..{}",
                     seq._loaded_offset,
                     offset);
-
-                  return kafka::client::make_client_fetch_batch_reader(
-                           seq._client.local(),
-                           model::schema_registry_internal_tp,
-                           seq._loaded_offset + model::offset{1},
-                           offset + model::offset{1})
-                    .consume(
-                      consume_to_store{seq._store, seq}, model::no_timeout);
+                  return seq._transport->consume_range(
+                    seq._loaded_offset + model::offset{1},
+                    offset + model::offset{1},
+                    consume_to_store{seq._store, seq});
               } else {
                   vlog(srlog.trace, "wait_for clean (offset  {})", offset);
                   return ss::make_ready_future<>();
@@ -176,29 +160,25 @@ ss::future<bool> seq_writer::produce_and_apply(
       write_at.value_or(batch.base_offset()) == batch.base_offset(),
       "Set the base_offset to the expected write_at");
 
-    kafka::partition_produce_response res
-      = co_await _client.local().produce_record_batch(
-        model::schema_registry_internal_tp, batch.copy());
+    auto result = co_await _transport->produce(batch.copy());
 
-    if (res.error_code != kafka::error_code::none) {
-        throw kafka::exception(res.error_code, res.error_message.value_or(""));
-    }
-
-    auto success = write_at.value_or(res.base_offset) == res.base_offset;
+    auto success = write_at.value_or(result.base_offset) == result.base_offset;
     if (success) {
         vlog(
-          srlog.debug, "seq_writer: Successful write at {}", res.base_offset);
+          srlog.debug,
+          "seq_writer: Successful write at {}",
+          result.base_offset);
         co_await consume_to_store(_store, *this)(std::move(batch));
         co_await _store.process_marked_schemas();
     } else {
         vlog(
           srlog.debug,
           "seq_writer: Failed write at {} (wrote at {})",
-          write_at,
-          res.base_offset);
+          write_at.value_or(model::offset{-1}),
+          result.base_offset);
     }
     co_return success;
-};
+}
 
 ss::future<> seq_writer::advance_offset(model::offset offset) {
     auto remote = [offset](seq_writer& s) { s.advance_offset_inner(offset); };
@@ -262,9 +242,10 @@ seq_writer::do_write_subject_version(
         auto record_offset = write_at;
 
         // If context isn't materialized yet, prepend CONTEXT record
-        if (auto is_materialized = co_await _store.is_context_materialized(
-              sub.ctx);
-            !is_materialized) {
+        if (
+          auto is_materialized = co_await _store.is_context_materialized(
+            sub.ctx);
+          !is_materialized) {
             vlog(srlog.debug, "Writing CONTEXT record for ctx={}", sub.ctx);
             auto ctx_key = context_key{
               .seq{record_offset}, .node{_node_id}, .ctx{sub.ctx}};
@@ -322,7 +303,8 @@ ss::future<std::optional<bool>> seq_writer::do_write_config(
             existing = co_await _store.get_compatibility(
               sub, default_to_global::no);
         } else {
-            existing = co_await _store.get_compatibility(sub.ctx);
+            existing = co_await _store.get_compatibility(
+              sub.ctx, default_to_global::no);
         }
         if (existing == compat) {
             co_return false;
@@ -361,26 +343,22 @@ seq_writer::do_delete_config(context_subject ctx_sub) {
                                              : std::make_optional(ctx_sub.sub);
     co_await check_mutable(ctx_sub.ctx, sub_opt);
 
+    chunked_vector<seq_marker> sequences;
     try {
-        if (ctx_sub.is_context_only()) {
-            co_await _store.get_compatibility(ctx_sub.ctx);
-        } else {
-            co_await _store.get_compatibility(ctx_sub, default_to_global::no);
-        }
-
+        sequences = ctx_sub.is_context_only()
+                      ? co_await _store.get_context_config_written_at(
+                          ctx_sub.ctx)
+                      : co_await _store.get_subject_config_written_at(ctx_sub);
     } catch (const exception&) {
-        // subject config already blank
+        co_return false;
+    }
+
+    if (sequences.empty()) {
         co_return false;
     }
 
     batch_builder rb{model::offset{0}};
-    if (ctx_sub.is_context_only()) {
-        rb.add_tombstones(
-          ctx_sub, co_await _store.get_context_config_written_at(ctx_sub.ctx));
-    } else {
-        rb.add_tombstones(
-          ctx_sub, co_await _store.get_subject_config_written_at(ctx_sub));
-    }
+    rb.add_tombstones(ctx_sub, sequences);
 
     if (co_await produce_and_apply(std::nullopt, std::move(rb).build())) {
         co_return true;
@@ -411,10 +389,10 @@ ss::future<std::optional<bool>> seq_writer::do_write_mode(
 
     try {
         // Check for no-op case
-        mode existing = !ctx_sub.is_context_only()
-                          ? co_await _store.get_mode(
-                              ctx_sub, default_to_global::no)
-                          : co_await _store.get_mode(ctx_sub.ctx);
+        mode existing
+          = !ctx_sub.is_context_only()
+              ? co_await _store.get_mode(ctx_sub, default_to_global::no)
+              : co_await _store.get_mode(ctx_sub.ctx, default_to_global::no);
         if (existing == m) {
             co_return false;
         }
@@ -484,22 +462,23 @@ seq_writer::write_mode(context_subject ctx_sub, mode mode, force f) {
 ss::future<std::optional<bool>>
 seq_writer::do_delete_mode(context_subject ctx_sub, model::offset write_at) {
     vlog(srlog.debug, "delete mode sub={} offset={}", ctx_sub, write_at);
-    // Report an error if the mode isn't registered
-    if (ctx_sub.is_context_only()) {
-        co_await _store.get_mode(ctx_sub.ctx);
-    } else {
-        co_await _store.get_mode(ctx_sub, default_to_global::no);
-    }
     _store.check_mode_mutability(force::no);
 
-    batch_builder rb{write_at};
-    if (ctx_sub.is_context_only()) {
-        rb.add_tombstones(
-          ctx_sub, co_await _store.get_context_mode_written_at(ctx_sub.ctx));
-    } else {
-        rb.add_tombstones(
-          ctx_sub, co_await _store.get_subject_mode_written_at(ctx_sub));
+    chunked_vector<seq_marker> sequences;
+    try {
+        sequences = ctx_sub.is_context_only()
+                      ? co_await _store.get_context_mode_written_at(ctx_sub.ctx)
+                      : co_await _store.get_subject_mode_written_at(ctx_sub);
+    } catch (const exception&) {
+        co_return false;
     }
+
+    if (sequences.empty()) {
+        co_return false;
+    }
+
+    batch_builder rb{write_at};
+    rb.add_tombstones(ctx_sub, sequences);
 
     if (co_await produce_and_apply(std::nullopt, std::move(rb).build())) {
         co_return true;
@@ -520,8 +499,9 @@ ss::future<std::optional<bool>>
 seq_writer::do_delete_context(context ctx, model::offset write_at) {
     vlog(srlog.debug, "delete_context ctx={} offset={}", ctx, write_at);
 
-    if (auto is_materialized = co_await _store.is_context_materialized(ctx);
-        !is_materialized) {
+    if (
+      auto is_materialized = co_await _store.is_context_materialized(ctx);
+      !is_materialized) {
         throw as_exception(
           error_info{
             error_code::subject_not_found,

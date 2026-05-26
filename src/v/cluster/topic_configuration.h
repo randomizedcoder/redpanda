@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0
 #pragma once
 
+#include "base/format_to.h"
 #include "cluster/topic_properties.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -69,9 +70,7 @@ struct topic_configuration
                || properties.record_value_schema_id_validation_compat.value_or(
                  false);
     }
-    bool is_cloud_topic() const {
-        return properties.storage_mode == model::redpanda_storage_mode::cloud;
-    }
+    bool is_cloud_topic() const { return properties.is_cloud_topic(); }
     bool is_compacted() const { return properties.is_compacted(); }
 
     const model::topic_namespace& remote_tp_ns() const {
@@ -97,11 +96,10 @@ struct topic_configuration
     void serde_write(iobuf& out) const;
     void serde_read(iobuf_parser& in, const serde::header& h);
 
-    friend std::ostream& operator<<(std::ostream&, const topic_configuration&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
-    friend bool
-    operator==(const topic_configuration&, const topic_configuration&)
-      = default;
+    friend bool operator==(
+      const topic_configuration&, const topic_configuration&) = default;
 };
 
 using topic_configuration_vector = chunked_vector<topic_configuration>;

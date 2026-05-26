@@ -16,13 +16,11 @@
 #include "resource_mgmt/available_memory.h"
 #include "ssx/async_algorithm.h"
 #include "ssx/future-util.h"
-#include "utils/to_string.h"
+#include "utils/to_string.h" // NOLINT(misc-include-cleaner) fmt::formatter for optionals
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/util/defer.hh>
-
-#include <fmt/ostream.h>
 
 namespace storage {
 
@@ -429,6 +427,63 @@ batch_cache_index::read_result batch_cache_index::read(
     return ret;
 }
 
+bool batch_cache_index::has_contiguous_coverage(
+  model::offset from, model::offset to) const {
+    if (from > to) {
+        return true;
+    }
+    // Find the first entry whose base_offset may contain 'from'.
+    auto it = _index.upper_bound(from);
+    if (it != _index.begin()) {
+        --it;
+    }
+    model::offset expected = from;
+    while (it != _index.end() && expected <= to) {
+        const auto& range = it->second.range();
+        if (!range || !range->valid()) {
+            return false;
+        }
+        auto hdr = it->second.header();
+        if (hdr.base_offset > expected) {
+            return false;
+        }
+        auto next = model::next_offset(hdr.last_offset());
+        if (next <= expected) {
+            ++it;
+            continue;
+        }
+        expected = next;
+        ++it;
+    }
+    return expected > to;
+}
+
+model::offset batch_cache_index::contiguous_end(model::offset from) const {
+    auto it = _index.upper_bound(from);
+    if (it != _index.begin()) {
+        --it;
+    }
+    model::offset expected = from;
+    while (it != _index.end()) {
+        const auto& range = it->second.range();
+        if (!range || !range->valid()) {
+            break;
+        }
+        auto hdr = it->second.header();
+        if (hdr.base_offset > expected) {
+            break;
+        }
+        auto next = model::next_offset(hdr.last_offset());
+        if (next <= expected) {
+            ++it;
+            continue;
+        }
+        expected = next;
+        ++it;
+    }
+    return model::prev_offset(expected);
+}
+
 void batch_cache_index::truncate(model::offset offset) {
     lock_guard lk(*this);
 
@@ -521,41 +576,6 @@ ss::future<> batch_cache::background_reclaimer::reclaim_loop() {
         }
     }
     co_return;
-}
-
-std::ostream&
-operator<<(std::ostream& os, const batch_cache::reclaim_options& opts) {
-    fmt::print(
-      os,
-      "growth window {} stable window {} min_size {} max_size {}",
-      opts.growth_window,
-      opts.stable_window,
-      opts.min_size,
-      opts.max_size);
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& o, const batch_cache& b) {
-    // NOTE: intrusive list have a O(N) for size.
-    // Do _not_ print size of _lru
-    return o << "{is_reclaiming:" << b.is_memory_reclaiming()
-             << ", size_bytes: " << b._size_bytes
-             << ", lru_empty:" << b._lru.empty() << "}";
-}
-std::ostream&
-operator<<(std::ostream& o, const batch_cache_index::read_result& c) {
-    o << "{batches:" << c.batches.size() << ", memory_usage:" << c.memory_usage
-      << ", next_batch:" << c.next_batch << ", next_cache_batch:";
-    if (c.next_cached_batch) {
-        o << *c.next_cached_batch;
-    } else {
-        o << "nullopt";
-    }
-    return o << "}";
-}
-std::ostream& operator<<(std::ostream& o, const batch_cache_index& c) {
-    return o << "{cache_size=" << c._index.size()
-             << ", dirty tracker: " << c._dirty_tracker << "}";
 }
 
 } // namespace storage

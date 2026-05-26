@@ -30,6 +30,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/coroutine/as_future.hh>
 
+#include <avro/ValidSchema.hh>
 #include <google/protobuf/descriptor.h>
 
 #include <algorithm>
@@ -73,16 +74,13 @@ checked<resolved_type, type_resolver::errc> translate_avro_schema(
 
 checked<resolved_type, type_resolver::errc> translate_protobuf_schema(
   const ppsr::protobuf_schema_definition& pb_def,
-  ppsr::schema_id id,
-  std::vector<int32_t> protobuf_offsets,
+  schema_identifier&& id,
   shared_schema_t schema) {
-    // TODO: maybe there's another caching opportunity here.
-    auto d_res = descriptor(pb_def, protobuf_offsets);
-    if (d_res.has_error()) {
+    auto d_res = descriptor(pb_def, id.protobuf_offsets.value());
+    if (!d_res.has_value()) {
         vlog(
           datalake_log.error,
-          "Failed to resolve Protobuf descriptor (missing offsets?): {}",
-          d_res.error());
+          "Failed to resolve Protobuf descriptor (missing offsets?)");
         return type_resolver::errc::bad_input;
     }
     const auto* d = &d_res.value().get();
@@ -90,8 +88,7 @@ checked<resolved_type, type_resolver::errc> translate_protobuf_schema(
         auto type = iceberg::type_to_iceberg(*d).value();
         return resolved_type{
           .schema = resolved_schema(*d, std::move(schema)),
-          .id
-          = {.schema_id = id, .protobuf_offsets = std::move(protobuf_offsets)},
+          .id = std::move(id),
           .type = std::move(type),
         };
     } catch (...) {
@@ -109,7 +106,6 @@ checked<resolved_type, type_resolver::errc> translate_json_schema(
         auto& doc = document(json_def());
         auto fc = iceberg::conversion::json_schema::frontend{};
         // todo figure out
-        // todo is this cached anywhere?
         auto json_schema = fc.compile(
           doc, "https://example.com/schema.json", std::nullopt);
         auto iceberg_ir = iceberg::type_to_ir(json_schema);
@@ -151,61 +147,8 @@ checked<resolved_type, type_resolver::errc> translate_json_schema(
     }
 }
 
-struct schema_translating_visitor {
-    schema_translating_visitor(
-      iobuf b, ppsr::schema_id id, shared_schema_t schema)
-      : buf_no_id(std::move(b))
-      , id(id)
-      , schema(std::move(schema)) {}
-    // Buffer without the schema ID.
-    iobuf buf_no_id;
-    ppsr::schema_id id;
-    shared_schema_t schema;
-
-    checked<type_and_buf, type_resolver::errc>
-    operator()(const ppsr::avro_schema_definition& avro_def) {
-        auto tr_res = translate_avro_schema(avro_def, id, schema);
-        if (tr_res.has_error()) {
-            return tr_res.error();
-        }
-        return type_and_buf{
-          .type = std::move(tr_res.value()),
-          .parsable_buf = std::move(buf_no_id)};
-    }
-
-    checked<type_and_buf, type_resolver::errc>
-    operator()(const ppsr::protobuf_schema_definition& pb_def) {
-        auto offsets_res = get_proto_offsets(buf_no_id);
-        if (offsets_res.has_error()) {
-            return type_resolver::errc::bad_input;
-        }
-        auto offsets = std::move(offsets_res.value());
-
-        auto tr_res = translate_protobuf_schema(
-          pb_def, id, std::move(offsets.protobuf_offsets), schema);
-        if (tr_res.has_error()) {
-            return tr_res.error();
-        }
-
-        return type_and_buf{
-          .type = std::move(tr_res.value()),
-          .parsable_buf = std::move(offsets.shared_message_data)};
-    }
-
-    checked<type_and_buf, type_resolver::errc>
-    operator()(const ppsr::json_schema_definition& json_def) {
-        auto tr_res = translate_json_schema(json_def, id);
-        if (tr_res.has_error()) {
-            return tr_res.error();
-        }
-        return type_and_buf{
-          .type = std::move(tr_res.value()),
-          .parsable_buf = std::move(buf_no_id)};
-    }
-};
-
 struct from_identifier_visitor {
-    from_identifier_visitor(schema_identifier ident, shared_schema_t schema)
+    from_identifier_visitor(schema_identifier&& ident, shared_schema_t&& schema)
       : ident(std::move(ident))
       , schema(std::move(schema)) {}
 
@@ -217,7 +160,8 @@ struct from_identifier_visitor {
         if (ident.protobuf_offsets) {
             return type_resolver::errc::bad_input;
         }
-        return translate_avro_schema(avro_def, ident.schema_id, schema);
+        return translate_avro_schema(
+          avro_def, ident.schema_id, std::move(schema));
     }
     checked<resolved_type, type_resolver::errc>
     operator()(const ppsr::protobuf_schema_definition& pb_def) {
@@ -225,10 +169,7 @@ struct from_identifier_visitor {
             return type_resolver::errc::bad_input;
         }
         return translate_protobuf_schema(
-          pb_def,
-          ident.schema_id,
-          std::move(ident.protobuf_offsets.value()),
-          schema);
+          pb_def, std::move(ident), std::move(schema));
     }
     checked<resolved_type, type_resolver::errc>
     operator()(const ppsr::json_schema_definition& json_def) {
@@ -243,21 +184,23 @@ struct from_identifier_visitor {
 ss::future<checked<shared_schema_t, type_resolver::errc>> get_schema(
   schema::registry* sr,
   std::optional<std::reference_wrapper<schema_cache>> cache,
+  const ppsr::context& context,
   ppsr::schema_id id) {
     if (!sr->is_enabled()) {
         vlog(datalake_log.warn, "Schema registry is not enabled");
         // TODO: should we treat this as transient?
         co_return type_resolver::errc::translation_error;
     }
+    context_schema_cache_key cache_key{.context = context, .schema_id = id};
     if (cache.has_value()) {
-        auto cached_schema = cache->get().get_value(id);
+        auto cached_schema = cache->get().get_value(cache_key);
 
         if (cached_schema) {
             co_return std::move(*cached_schema);
         }
     }
     auto schema_fut = co_await ss::coroutine::as_future(
-      sr->get_valid_schema({ppsr::default_context, id}));
+      sr->get_valid_schema({context, id}));
     if (schema_fut.failed()) {
         auto ex = schema_fut.get_exception();
         vlog(datalake_log.warn, "Error getting schema from registry: {}", ex);
@@ -265,46 +208,111 @@ ss::future<checked<shared_schema_t, type_resolver::errc>> get_schema(
     }
     auto resolved_schema = std::move(schema_fut.get());
     if (!resolved_schema.has_value()) {
-        vlog(datalake_log.trace, "Schema ID {} not in registry", id);
+        vlog(
+          datalake_log.trace,
+          "Schema ID {} not in registry under context {}",
+          id,
+          context);
         co_return type_resolver::errc::bad_input;
     }
     auto shared_schema = ss::make_shared(std::move(resolved_schema.value()));
     if (cache.has_value()) {
-        cache->get().try_insert(id, shared_schema);
+        cache->get().try_insert(cache_key, shared_schema);
     }
     co_return std::move(shared_schema);
 }
 
+checked<shared_resolved_type_t, type_resolver::errc> get_resolved_type(
+  const ppsr::context& context,
+  schema_identifier&& ident,
+  shared_schema_t&& schema,
+  std::optional<std::reference_wrapper<resolved_type_cache>> cache) {
+    auto key = context_schema_identifier{
+      .context = context, .identifier = std::move(ident)};
+    if (cache.has_value()) {
+        auto cached_val = cache->get().get_value(key);
+        if (cached_val) {
+            return *cached_val;
+        }
+    }
+
+    auto* schema_ptr = schema.get();
+    auto resolve_res = schema_ptr->visit(
+      from_identifier_visitor{std::move(key.identifier), std::move(schema)});
+    if (resolve_res.has_error()) {
+        return resolve_res.error();
+    }
+
+    auto shared_val = ss::make_shared<resolved_type>(
+      std::move(resolve_res.value()));
+    if (cache.has_value()) {
+        cache->get().try_insert(
+          context_schema_identifier{
+            .context = context, .identifier = shared_val->id},
+          shared_val);
+    }
+
+    return shared_val;
+}
+
 } // namespace
 
-chunked_schema_cache::chunked_schema_cache(
-  chunked_schema_cache::cache_t::config c)
+template<typename Key, typename Value>
+struct datalake_cache_traits;
+
+template<>
+struct datalake_cache_traits<
+  context_schema_cache_key,
+  pandaproxy::schema_registry::valid_schema> {
+    static constexpr const char* metrics_group_name = "datalake:schema_cache";
+    static constexpr const char* item_label = "a schema";
+};
+
+template<>
+struct datalake_cache_traits<context_schema_identifier, resolved_type> {
+    static constexpr const char* metrics_group_name
+      = "datalake:resolved_type_cache";
+    static constexpr const char* item_label = "an Iceberg type";
+};
+
+template<typename Key, typename Value>
+chunked_datalake_cache<Key, Value>::chunked_datalake_cache(
+  typename cache_t::config c)
   : cache_(c) {}
 
-void chunked_schema_cache::start() { setup_metrics(); }
+template<typename Key, typename Value>
+void chunked_datalake_cache<Key, Value>::start() {
+    setup_metrics();
+}
 
-void chunked_schema_cache::stop() { metrics_.clear(); }
+template<typename Key, typename Value>
+void chunked_datalake_cache<Key, Value>::stop() {
+    metrics_.clear();
+}
 
-ss::optimized_optional<
-  ss::shared_ptr<pandaproxy::schema_registry::valid_schema>>
-chunked_schema_cache::get_value(
-  const pandaproxy::schema_registry::schema_id& id) {
+template<typename Key, typename Value>
+ss::optimized_optional<ss::shared_ptr<Value>>
+chunked_datalake_cache<Key, Value>::get_value(const key_t& id) {
     return cache_.get_value(id);
 }
-bool chunked_schema_cache::try_insert(
+
+template<typename Key, typename Value>
+bool chunked_datalake_cache<Key, Value>::try_insert(
   const key_t& key, ss::shared_ptr<val_t> val) {
     return cache_.try_insert(key, std::move(val));
 }
 
-void chunked_schema_cache::setup_metrics() {
+template<typename Key, typename Value>
+void chunked_datalake_cache<Key, Value>::setup_metrics() {
     namespace sm = ss::metrics;
+    using traits = datalake_cache_traits<Key, Value>;
 
     if (config::shard_local_cfg().disable_metrics()) {
         return;
     }
 
     metrics_.add_group(
-      prometheus_sanitize::metrics_name("datalake:schema_cache"),
+      prometheus_sanitize::metrics_name(traits::metrics_group_name),
       {
         sm::make_counter(
           "misses",
@@ -312,38 +320,35 @@ void chunked_schema_cache::setup_metrics() {
               auto stats = cache_.stat();
               return stats.access_count - stats.hit_count;
           },
-          sm::description("The number of times a schema wasn't in the cache.")),
+          sm::description(
+            fmt::format(
+              "The number of times {} wasn't in the cache.",
+              traits::item_label))),
         sm::make_counter(
           "hits",
           [this] {
               auto stats = cache_.stat();
               return stats.hit_count;
           },
-          sm::description("The number of times a schema was in the cache.")),
+          sm::description(
+            fmt::format(
+              "The number of times {} was in the cache.", traits::item_label))),
       });
 }
+
+template class chunked_datalake_cache<
+  context_schema_cache_key,
+  pandaproxy::schema_registry::valid_schema>;
+template class chunked_datalake_cache<context_schema_identifier, resolved_type>;
 
 resolved_schema::resolved_schema(ss::shared_ptr<iceberg::json_conversion_ir> ir)
   : shared_schema_(std::move(ir))
   , schema_(
       *std::get<ss::shared_ptr<iceberg::json_conversion_ir>>(shared_schema_)) {}
 
-std::ostream& operator<<(std::ostream& o, const type_resolver::errc& e) {
-    switch (e) {
-    case type_resolver::errc::registry_error:
-        return o << "type_resolver::errc::registry_error";
-    case type_resolver::errc::translation_error:
-        return o << "type_resolver::errc::translation_error";
-    case type_resolver::errc::bad_input:
-        return o << "type_resolver::errc::bad_input";
-    case type_resolver::errc::invalid_config:
-        return o << "type_resolver::errc::invalid_config";
-    }
-}
-
 type_and_buf type_and_buf::make_raw_binary(std::optional<iobuf> b) {
     return type_and_buf{
-      .type = std::nullopt,
+      .type = {},
       .parsable_buf = std::move(b),
     };
 }
@@ -353,8 +358,9 @@ binary_type_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     co_return type_and_buf::make_raw_binary(std::move(b));
 }
 
-ss::future<checked<resolved_type, type_resolver::errc>>
-binary_type_resolver::resolve_identifier(schema_identifier) const {
+ss::future<checked<shared_resolved_type_t, type_resolver::errc>>
+binary_type_resolver::resolve_identifier(
+  schema_identifier, ppsr::context) const {
     // method is not expected to be called, as this resolver always returns
     // nullopt type.
     co_return type_resolver::errc::translation_error;
@@ -368,12 +374,14 @@ test_binary_type_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     co_return co_await binary_type_resolver::resolve_buf_type(std::move(b));
 }
 
-ss::future<checked<resolved_type, type_resolver::errc>>
-test_binary_type_resolver::resolve_identifier(schema_identifier id) const {
+ss::future<checked<shared_resolved_type_t, type_resolver::errc>>
+test_binary_type_resolver::resolve_identifier(
+  schema_identifier id, ppsr::context ctx) const {
     if (injected_error_.has_value()) {
         co_return *injected_error_;
     }
-    co_return co_await binary_type_resolver::resolve_identifier(std::move(id));
+    co_return co_await binary_type_resolver::resolve_identifier(
+      std::move(id), std::move(ctx));
 }
 
 ss::future<checked<type_and_buf, type_resolver::errc>>
@@ -395,40 +403,90 @@ record_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     auto schema_id = schema_id_res.schema_id;
     auto buf_no_id = std::move(schema_id_res.shared_message_data);
 
-    auto schema_res = co_await get_schema(&sr_, cache_, schema_id);
+    auto schema_res = co_await get_schema(&sr_, cache_, context_, schema_id);
     if (schema_res.has_error()) {
         co_return schema_res.error();
     }
 
-    auto shared_schema = schema_res.value();
-    co_return shared_schema->visit(
-      schema_translating_visitor{
-        std::move(buf_no_id), schema_id, shared_schema});
+    struct ident_and_buf {
+        schema_identifier ident;
+        iobuf parsable_buf;
+    };
+
+    auto ident_res
+      = schema_res.value()->visit(
+        ss::
+          make_visitor(
+            [&](const ppsr::protobuf_schema_definition&)
+              -> checked<ident_and_buf, type_resolver::errc> {
+                auto offsets_res = get_proto_offsets(buf_no_id);
+                if (offsets_res.has_error()) {
+                    return type_resolver::errc::bad_input;
+                }
+                auto offsets = std::move(offsets_res.value());
+                return ident_and_buf{
+            .ident = {.schema_id = schema_id,
+                      .protobuf_offsets = std::move(offsets.protobuf_offsets)},
+            .parsable_buf = std::move(offsets.shared_message_data),
+          };
+            },
+            [&](const auto&) -> checked<ident_and_buf, type_resolver::errc> {
+                return ident_and_buf{
+                  .ident
+                  = {.schema_id = schema_id, .protobuf_offsets = std::nullopt},
+                  .parsable_buf = std::move(buf_no_id),
+                };
+            }));
+    if (ident_res.has_error()) {
+        co_return ident_res.error();
+    }
+    auto [ident, parsable_buf] = std::move(ident_res.value());
+
+    auto resolve_res = get_resolved_type(
+      context_,
+      std::move(ident),
+      std::move(schema_res.value()),
+      resolved_type_cache_);
+    if (resolve_res.has_error()) {
+        co_return resolve_res.error();
+    }
+
+    co_return type_and_buf{
+      .type = std::move(resolve_res.value()),
+      .parsable_buf = std::move(parsable_buf),
+    };
 }
 
-ss::future<checked<resolved_type, type_resolver::errc>>
-record_schema_resolver::resolve_identifier(schema_identifier ident) const {
-    auto schema_res = co_await get_schema(&sr_, cache_, ident.schema_id);
+ss::future<checked<shared_resolved_type_t, type_resolver::errc>>
+record_schema_resolver::resolve_identifier(
+  schema_identifier ident, ppsr::context ctx) const {
+    auto schema_res = co_await get_schema(&sr_, cache_, ctx, ident.schema_id);
     if (schema_res.has_error()) {
         co_return schema_res.error();
     }
 
-    auto shared_schema = schema_res.value();
-    co_return shared_schema->visit(
-      from_identifier_visitor{std::move(ident), shared_schema});
+    co_return get_resolved_type(
+      ctx,
+      std::move(ident),
+      std::move(schema_res.value()),
+      resolved_type_cache_);
 }
 
 latest_subject_schema_resolver::latest_subject_schema_resolver(
   schema::registry& sr,
+  ppsr::context context,
   ppsr::subject subject,
   std::optional<ss::sstring> protobuf_message_name,
   config::binding<std::chrono::milliseconds> cache_duration,
-  std::optional<std::reference_wrapper<schema_cache>> sc)
+  std::optional<std::reference_wrapper<schema_cache>> sc,
+  std::optional<std::reference_wrapper<resolved_type_cache>> rc)
   : sr_(&sr)
+  , context_(std::move(context))
   , subject_(std::move(subject))
   , protobuf_message_name_(std::move(protobuf_message_name))
   , cache_ttl_(std::move(cache_duration))
-  , cache_(sc) {}
+  , cache_(sc)
+  , resolved_type_cache_(rc) {}
 
 namespace {
 
@@ -436,7 +494,7 @@ checked<std::vector<int32_t>, type_resolver::errc> compute_message_offsets(
   const ppsr::protobuf_schema_definition& pb_def,
   std::string_view message_full_name) {
     auto d_res = ppsr::descriptor(pb_def, message_full_name);
-    if (d_res.has_error()) {
+    if (!d_res.has_value()) {
         return type_resolver::errc::invalid_config;
     }
     // Build up the offsets by walking the descriptor tree
@@ -461,8 +519,7 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     if (schema_lookup_cache_.age(now) < cache_ttl) {
         if (schema_lookup_cache_.entry().has_value()) {
             co_return type_and_buf{
-              .type = std::make_optional(
-                schema_lookup_cache_.entry().value().copy()),
+              .type = schema_lookup_cache_.entry().value(),
               .parsable_buf = std::move(b),
             };
         } else {
@@ -494,7 +551,7 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     auto latest_schema_fut
       = co_await ss::coroutine::as_future<ppsr::stored_schema>(
         sr_->get_subject_schema(
-          {ppsr::default_context, subject_}, /*subject_version=*/std::nullopt));
+          {context_, subject_}, /*subject_version=*/std::nullopt));
     if (latest_schema_fut.failed()) {
         auto ex = latest_schema_fut.get_exception();
         vlog(
@@ -507,18 +564,18 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
         co_return type_resolver::errc::registry_error;
     }
     auto latest_schema = std::move(latest_schema_fut.get());
-    auto schema_res = co_await get_schema(sr_, cache_, latest_schema.id);
+    auto schema_res = co_await get_schema(
+      sr_, cache_, context_, latest_schema.id);
     if (schema_res.has_error()) {
         schema_lookup_cache_ = schema_lookup_cache(
           schema_res.error(), last_sync_time);
         co_return schema_res.error();
     }
-    auto shared_schema = schema_res.value();
-    auto resolve_res = shared_schema->visit(
+
+    auto schema_id_res = schema_res.value()->visit(
       ss::make_visitor(
-        [this, &latest_schema, &shared_schema](
-          const ppsr::protobuf_schema_definition& pb_def)
-          -> checked<resolved_type, type_resolver::errc> {
+        [this, &latest_schema](const ppsr::protobuf_schema_definition& pb_def)
+          -> checked<schema_identifier, type_resolver::errc> {
             std::vector<int32_t> offsets;
             if (const auto& explicit_name = protobuf_message_name_) {
                 auto res = compute_message_offsets(pb_def, *explicit_name);
@@ -529,19 +586,29 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
             } else {
                 offsets = {0};
             }
-            return translate_protobuf_schema(
-              pb_def, latest_schema.id, offsets, std::move(shared_schema));
+            return schema_identifier{
+              .schema_id = latest_schema.id,
+              .protobuf_offsets = std::move(offsets),
+            };
         },
-        [&latest_schema,
-         &shared_schema](const ppsr::avro_schema_definition& def)
-          -> checked<resolved_type, type_resolver::errc> {
-            return translate_avro_schema(
-              def, latest_schema.id, std::move(shared_schema));
-        },
-        [&latest_schema](const ppsr::json_schema_definition& def)
-          -> checked<resolved_type, type_resolver::errc> {
-            return translate_json_schema(def, latest_schema.id);
+        [&latest_schema](
+          const auto&) -> checked<schema_identifier, type_resolver::errc> {
+            return schema_identifier{
+              .schema_id = latest_schema.id,
+              .protobuf_offsets = std::nullopt,
+            };
         }));
+    if (schema_id_res.has_error()) {
+        schema_lookup_cache_ = schema_lookup_cache(
+          schema_id_res.error(), last_sync_time);
+        co_return schema_id_res.error();
+    }
+
+    auto resolve_res = get_resolved_type(
+      context_,
+      std::move(schema_id_res.value()),
+      std::move(schema_res.value()),
+      resolved_type_cache_);
     if (resolve_res.has_error()) {
         schema_lookup_cache_ = schema_lookup_cache(
           resolve_res.error(), last_sync_time);
@@ -555,7 +622,7 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
       "Updated latest schema cache for subject {} and schema ID {}",
       subject_,
       latest_schema.id);
-    schema_lookup_cache_ = schema_lookup_cache(resolved.copy(), last_sync_time);
+    schema_lookup_cache_ = schema_lookup_cache(resolved, last_sync_time);
 
     co_return type_and_buf{
       .type = std::move(resolved),
@@ -563,23 +630,19 @@ latest_subject_schema_resolver::resolve_buf_type(std::optional<iobuf> b) const {
     };
 }
 
-ss::future<checked<resolved_type, type_resolver::errc>>
+ss::future<checked<shared_resolved_type_t, type_resolver::errc>>
 latest_subject_schema_resolver::resolve_identifier(
-  schema_identifier ident) const {
-    auto schema_res = co_await get_schema(sr_, cache_, ident.schema_id);
+  schema_identifier ident, ppsr::context ctx) const {
+    auto schema_res = co_await get_schema(sr_, cache_, ctx, ident.schema_id);
     if (schema_res.has_error()) {
         co_return schema_res.error();
     }
-    auto shared_schema = schema_res.value();
-    co_return shared_schema->visit(
-      from_identifier_visitor{std::move(ident), shared_schema});
+
+    co_return get_resolved_type(
+      ctx,
+      std::move(ident),
+      std::move(schema_res.value()),
+      resolved_type_cache_);
 }
 
-resolved_type resolved_type::copy() const {
-    return {
-      .schema = schema,
-      .id = id,
-      .type = iceberg::make_copy(type),
-    };
-}
 } // namespace datalake

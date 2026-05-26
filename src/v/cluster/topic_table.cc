@@ -9,27 +9,27 @@
 
 #include "cluster/topic_table.h"
 
+#include "base/format_to.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_snapshot.h"
+#include "cluster/data_migrated_resources.h"
+#include "cluster/data_migration_types.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
 #include "cluster/logger.h"
 #include "cluster/topic_validators.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
-#include "data_migration_types.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "storage/ntp_config.h"
-#include "utils/uuid.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include <algorithm>
 #include <optional>
-#include <span>
 #include <utility>
 #include <vector>
 
@@ -705,8 +705,9 @@ topic_table::apply(move_topic_replicas_cmd cmd, model::offset o) {
             co_return errc::partition_disabled;
         }
 
-        if (_updates_in_progress.contains(
-              model::ntp{cmd.key.ns, cmd.key.tp, partition})) {
+        if (
+          _updates_in_progress.contains(
+            model::ntp{cmd.key.ns, cmd.key.tp, partition})) {
             vlog(
               clusterlog.warn,
               "topic {}: Can not move replicas, update for partition {} is in "
@@ -1231,6 +1232,9 @@ topic_properties topic_table::update_topic_properties(
       updated_properties.storage_mode,
       overrides.storage_mode,
       storage::ntp_config::default_storage_mode);
+    incremental_update(
+      updated_properties.schema_registry_context,
+      overrides.schema_registry_context);
     return updated_properties;
 }
 
@@ -1319,8 +1323,9 @@ topic_table::fill_snapshot(controller_snapshot& controller_snap) const {
         for (const auto& [_, p_as] : md_item.get_assignments()) {
             replicas_t replicas;
             model::ntp ntp(ns_tp.ns, ns_tp.tp, p_as.id);
-            if (auto upd_it = _updates_in_progress.find(ntp);
-                upd_it != _updates_in_progress.end()) {
+            if (
+              auto upd_it = _updates_in_progress.find(ntp);
+              upd_it != _updates_in_progress.end()) {
                 const auto& upd = upd_it->second;
                 updates.emplace(
                   p_as.id,
@@ -1354,8 +1359,9 @@ topic_table::fill_snapshot(controller_snapshot& controller_snap) const {
         }
 
         std::optional<topic_disabled_partitions_set> disabled_set;
-        if (auto it = _disabled_partitions.find(ns_tp);
-            it != _disabled_partitions.end()) {
+        if (
+          auto it = _disabled_partitions.find(ns_tp);
+          it != _disabled_partitions.end()) {
             disabled_set = it->second;
         }
 
@@ -1458,8 +1464,9 @@ public:
 
         std::optional<partition_assignment> prev_assignment;
         model::revision_id prev_update_finished_revision;
-        if (auto as_it = md_item.get_assignments().find(p_id);
-            as_it != md_item.get_assignments().end()) {
+        if (
+          auto as_it = md_item.get_assignments().find(p_id);
+          as_it != md_item.get_assignments().end()) {
             prev_assignment = std::move(as_it->second);
             md_item.get_assignments().erase(as_it);
 
@@ -1523,8 +1530,9 @@ public:
 
         model::revision_id prev_last_replica_update_revision
           = prev_update_finished_revision;
-        if (auto prev_update_it = _updates_in_progress.find(ntp);
-            prev_update_it != _updates_in_progress.end()) {
+        if (
+          auto prev_update_it = _updates_in_progress.find(ntp);
+          prev_update_it != _updates_in_progress.end()) {
             prev_last_replica_update_revision
               = prev_update_it->second.get_last_cmd_revision();
             _updates_in_progress.erase(prev_update_it);
@@ -1532,8 +1540,9 @@ public:
 
         model::revision_id last_replica_update_revision
           = partition.last_update_finished_revision;
-        if (auto update_it = topic.updates.find(p_id);
-            update_it != topic.updates.end()) {
+        if (
+          auto update_it = topic.updates.find(p_id);
+          update_it != topic.updates.end()) {
             const auto& update = update_it->second;
             last_replica_update_revision = update.last_cmd_revision;
 
@@ -1631,8 +1640,8 @@ ss::future<> topic_table::apply_snapshot(
         const auto& ns_tp = old_it->first;
         auto& md_item = old_it->second;
 
-        if (auto new_it = snap.topics.find(ns_tp);
-            new_it != snap.topics.end()) {
+        if (
+          auto new_it = snap.topics.find(ns_tp); new_it != snap.topics.end()) {
             const auto& topic_snapshot = new_it->second;
             if (
               topic_snapshot.metadata.revision
@@ -1666,8 +1675,9 @@ ss::future<> topic_table::apply_snapshot(
                       _disabled_partitions[ns_tp],
                       *topic_snapshot.disabled_set);
                     _topics_map_revision++;
-                } else if (auto it = _disabled_partitions.find(ns_tp);
-                           it != _disabled_partitions.end()) {
+                } else if (
+                  auto it = _disabled_partitions.find(ns_tp);
+                  it != _disabled_partitions.end()) {
                     old_disabled_set = std::move(it->second);
                     _disabled_partitions.erase(it);
                     _topics_map_revision++;
@@ -1812,9 +1822,9 @@ ss::future<> topic_table::notify_waiters() {
     }
 }
 
-std::vector<model::topic_namespace> topic_table::all_topics() const {
-    std::vector<model::topic_namespace> topics;
-    topics.reserve(topics.size());
+chunked_vector<model::topic_namespace> topic_table::all_topics() const {
+    chunked_vector<model::topic_namespace> topics;
+    topics.reserve(_topics.size());
     for (auto& [tp_ns, _] : _topics) {
         topics.push_back(tp_ns);
     }
@@ -1982,16 +1992,18 @@ topic_table::get_initial_revision(const model::ntp& ntp) const {
 
 std::optional<replicas_t>
 topic_table::get_previous_replica_set(const model::ntp& ntp) const {
-    if (auto it = _updates_in_progress.find(ntp);
-        it != _updates_in_progress.end()) {
+    if (
+      auto it = _updates_in_progress.find(ntp);
+      it != _updates_in_progress.end()) {
         return it->second.get_previous_replicas();
     }
     return std::nullopt;
 }
 std::optional<replicas_t>
 topic_table::get_target_replica_set(const model::ntp& ntp) const {
-    if (auto it = _updates_in_progress.find(ntp);
-        it != _updates_in_progress.end()) {
+    if (
+      auto it = _updates_in_progress.find(ntp);
+      it != _updates_in_progress.end()) {
         return it->second.get_target_replicas();
     }
     return std::nullopt;
@@ -2029,10 +2041,11 @@ topic_table::ntps_moving_to_node(model::node_id node) const {
         if (unlikely(!current_assignment)) {
             continue;
         }
-        if (moving_to_node(
-              node,
-              state.get_previous_replicas(),
-              current_assignment->replicas)) {
+        if (
+          moving_to_node(
+            node,
+            state.get_previous_replicas(),
+            current_assignment->replicas)) {
             ret.push_back(ntp);
         }
     }
@@ -2048,10 +2061,11 @@ topic_table::ntps_moving_from_node(model::node_id node) const {
         if (unlikely(!current_assignment)) {
             continue;
         }
-        if (moving_from_node(
-              node,
-              state.get_previous_replicas(),
-              current_assignment->replicas)) {
+        if (
+          moving_from_node(
+            node,
+            state.get_previous_replicas(),
+            current_assignment->replicas)) {
             ret.push_back(ntp);
         }
     }
@@ -2192,34 +2206,30 @@ void topic_table::on_partition_deletion(const model::ntp& ntp) {
           it->first);
     }
 }
-
-std::ostream&
-operator<<(std::ostream& o, const topic_table::in_progress_update& u) {
-    fmt::print(
-      o,
+fmt::iterator
+topic_table::in_progress_update::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{state: {}, update_rev: {}, last_cmd_rev: {}, previous: {}, target: "
       "{}, policy: {}}}",
-      u._state,
-      u._update_revision,
-      u._last_cmd_revision,
-      u._previous_replicas,
-      u._target_replicas,
-      u._policy);
-    return o;
+      _state,
+      _update_revision,
+      _last_cmd_revision,
+      _previous_replicas,
+      _target_replicas,
+      _policy);
 }
-
-std::ostream&
-operator<<(std::ostream& o, const topic_table::partition_replicas_view& ri) {
-    fmt::print(
-      o,
+fmt::iterator
+topic_table::partition_replicas_view::format_to(fmt::iterator it) const {
+    it = fmt::format_to(
+      it,
       "{{orig_replicas: {}, last_update_finished_revision: {}",
-      ri.orig_replicas(),
-      ri.last_update_finished_revision());
-    if (ri.update) {
-        fmt::print(o, ", update: {}", *ri.update);
+      orig_replicas(),
+      last_update_finished_revision());
+    if (update) {
+        it = fmt::format_to(it, ", update: {}", *update);
     }
-    fmt::print(o, "}}");
-    return o;
+    return fmt::format_to(it, "}}");
 }
 
 } // namespace cluster

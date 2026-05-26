@@ -9,13 +9,13 @@
  * by the Apache License, Version 2.0
  */
 
+#include "base/format_to.h"
 #include "kafka/protocol/types.h"
 #include "kafka/protocol/wire.h"
 #include "random/generators.h"
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 #include "test_utils/random_bytes.h"
-#include "utils/base64.h"
 
-#include <seastar/core/thread.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include <boost/iterator/counting_iterator.hpp>
@@ -80,9 +80,8 @@ struct test_struct {
         return a.field_a == b.field_a && a.field_b == b.field_b;
     }
 
-    friend std::ostream& operator<<(std::ostream& os, const test_struct& ts) {
-        os << "field_a: " << ts.field_a << " field_b: " << ts.field_b;
-        return os;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "field_a: {} field_b: {}", field_a, field_b);
     }
 };
 
@@ -97,9 +96,8 @@ void write_flex(T& type, iobuf& buf) {
               writer.write(ts.field_b);
               writer.write_tags(kafka::tagged_fields{});
           });
-    } else if constexpr (std::is_same_v<
-                           T,
-                           std::optional<std::vector<test_struct>>>) {
+    } else if constexpr (
+      std::is_same_v<T, std::optional<std::vector<test_struct>>>) {
         writer.write_nullable_flex_array(
           type, [](test_struct& ts, kafka::protocol::encoder& writer) {
               writer.write_flex(ts.field_a);
@@ -135,9 +133,8 @@ T read_flex(iobuf buf) {
             (void)reader.read_tags();
             return v;
         });
-    } else if constexpr (std::is_same_v<
-                           T,
-                           std::optional<std::vector<test_struct>>>) {
+    } else if constexpr (
+      std::is_same_v<T, std::optional<std::vector<test_struct>>>) {
         return reader.read_nullable_flex_array(
           [](kafka::protocol::decoder& reader) {
               test_struct v;

@@ -125,6 +125,9 @@ public:
     /// files are written to cache.
     ss::future<> hydrate_chunk(chunk_start_offset_t start_offset);
 
+    /// Prefetch the first chunk of the segment using the chunks API.
+    ss::future<> prefetch_first_chunk();
+
     /// Loads the segment chunk file from cache into an open file handle. If the
     /// file is not present in cache, the returned file handle is unopened.
     ss::future<ss::file> materialize_chunk(chunk_start_offset_t);
@@ -388,8 +391,8 @@ public:
     operator=(remote_segment_batch_reader&&) noexcept = delete;
     // clang-format on
     remote_segment_batch_reader(const remote_segment_batch_reader&) = delete;
-    remote_segment_batch_reader& operator=(const remote_segment_batch_reader&)
-      = delete;
+    remote_segment_batch_reader&
+    operator=(const remote_segment_batch_reader&) = delete;
     ~remote_segment_batch_reader() noexcept;
 
     ss::future<result<chunked_circular_buffer<model::record_batch>>> read_some(
@@ -430,6 +433,8 @@ public:
     bool reads_from_segment(const remote_segment& segm) const {
         return &segm == _seg.get();
     }
+
+    size_t get_segment_size() const { return _seg->get_segment_size(); }
 
     bool is_stopped() const { return _stopped; }
 
@@ -490,7 +495,16 @@ struct hydration_request {
     kind path_kind;
 };
 
-std::ostream& operator<<(std::ostream&, hydration_request::kind);
+inline fmt::iterator format_to(hydration_request::kind k, fmt::iterator out) {
+    switch (k) {
+    case hydration_request::kind::segment:
+        return fmt::format_to(out, "segment");
+    case hydration_request::kind::tx:
+        return fmt::format_to(out, "tx-range");
+    case hydration_request::kind::index:
+        return fmt::format_to(out, "index");
+    }
+}
 
 struct hydration_loop_state {
     using hydrate_action_t = hydration_request::hydrate_action_t;

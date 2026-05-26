@@ -75,7 +75,7 @@ public:
       size_t bytes_on_disk) override;
     void consume_records(iobuf&&) override;
     ss::future<stop_parser> consume_batch_end() override;
-    void print(std::ostream&) const override;
+    fmt::iterator format_to(fmt::iterator it) const override;
 
 private:
     log_segment_batch_reader& _reader;
@@ -94,11 +94,11 @@ public:
     log_segment_batch_reader(
       segment&, local_log_reader_config& config, probe& p) noexcept;
     log_segment_batch_reader(log_segment_batch_reader&&) noexcept = default;
-    log_segment_batch_reader& operator=(log_segment_batch_reader&&) noexcept
-      = delete;
+    log_segment_batch_reader&
+    operator=(log_segment_batch_reader&&) noexcept = delete;
     log_segment_batch_reader(const log_segment_batch_reader&) = delete;
-    log_segment_batch_reader& operator=(const log_segment_batch_reader&)
-      = delete;
+    log_segment_batch_reader&
+    operator=(const log_segment_batch_reader&) = delete;
     ~log_segment_batch_reader() noexcept = default;
 
     ss::future<result<chunked_circular_buffer<model::record_batch>>>
@@ -161,8 +161,8 @@ public:
 
     ss::future<> finally() noexcept final { return _iterator.close(); }
 
-    void print(std::ostream& os) final {
-        fmt::print(os, "storage::log_reader. config {}", _config);
+    fmt::iterator format_to(fmt::iterator it) const final {
+        return fmt::format_to(it, "storage::log_reader. config {}", _config);
     }
 
     /**

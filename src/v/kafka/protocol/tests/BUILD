@@ -40,6 +40,7 @@ redpanda_cc_btest(
     # because then we could use bazel_tools runfiles library
     env = {"GENERATOR_BIN": "$(rootpath //src/v/test_utils/go/kreq-gen:kafka_request_generator)"},
     deps = [
+        "//src/v/base",
         "//src/v/kafka/protocol",
         "//src/v/kafka/protocol:messages",
         "//src/v/test_utils:seastar_boost",
@@ -55,12 +56,15 @@ redpanda_cc_btest(
         "field_parser_test.cc",
     ],
     deps = [
+        "//src/v/base",
         "//src/v/kafka/protocol",
         "//src/v/random:generators",
+        "//src/v/test_utils:container_ostream",
         "//src/v/test_utils:random_bytes",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:base64",
         "@boost//:iterator",
+        "@fmt",
         "@seastar",
         "@seastar//:testing",
     ],

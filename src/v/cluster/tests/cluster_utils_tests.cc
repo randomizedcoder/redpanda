@@ -8,14 +8,13 @@
 // by the Apache License, Version 2.0
 
 #include "cluster/cluster_utils.h"
+#include "cluster/controller_utils.h"
 #include "cluster/members_table.h"
+#include "cluster/topic_table.h"
 #include "cluster/types.h"
 #include "model/metadata.h"
 #include "utils/unresolved_address.h"
 
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/net/inet_address.hh>
-#include <seastar/net/socket_defs.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 SEASTAR_THREAD_TEST_CASE(test_find_shard_on_node) {

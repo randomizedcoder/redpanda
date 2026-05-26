@@ -1,13 +1,11 @@
 #include "cluster/drain_manager.h"
 
 #include "base/vlog.h"
-#include "cluster/controller_service.h"
 #include "cluster/logger.h"
 #include "cluster/partition_manager.h"
 #include "random/generators.h"
 
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 
 namespace cluster {
@@ -79,7 +77,7 @@ ss::future<> drain_manager::restore() {
     });
 }
 
-ss::future<std::optional<drain_manager::drain_status>> drain_manager::status() {
+ss::future<std::optional<drain_status>> drain_manager::status() {
     if (_abort.abort_requested()) {
         co_return std::nullopt;
     }
@@ -283,21 +281,6 @@ ss::future<> drain_manager::do_restore() {
     vlog(clusterlog.info, "Node drain stopped");
     _partition_manager.local().unblock_new_leadership();
     co_return;
-}
-
-std::ostream&
-operator<<(std::ostream& os, const drain_manager::drain_status& ds) {
-    fmt::print(
-      os,
-      "{{finished: {}, errors: {}, partitions: {}, eligible: {}, transferring: "
-      "{}, failed: {}}}",
-      ds.finished,
-      ds.errors,
-      ds.partitions,
-      ds.eligible,
-      ds.transferring,
-      ds.failed);
-    return os;
 }
 
 } // namespace cluster

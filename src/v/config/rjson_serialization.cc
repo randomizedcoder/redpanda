@@ -153,7 +153,7 @@ void rjson_serialize(
 }
 
 /**
- * Helper for enum/bitfield types that implement operator<< for ostream.
+ * Helper for enum/bitfield types that are formattable via fmt.
  * Otherwise they would be JSON-ized as their integer representation.
  */
 template<typename T>
@@ -296,6 +296,12 @@ void rjson_serialize(
 void rjson_serialize(
   json::Writer<json::StringBuffer>& w,
   const model::iceberg_invalid_record_action& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w,
+  const model::iceberg_schema_case_insensitive& v) {
     stringize(w, v);
 }
 

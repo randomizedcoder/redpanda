@@ -10,12 +10,12 @@
 #pragma once
 
 #include "base/outcome.h"
-#include "kafka/client/client.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/schema_registry/error.h"
 #include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/exceptions.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
+#include "pandaproxy/schema_registry/transport.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "random/simple_time_jitter.h"
 #include "ssx/semaphore.h"
@@ -48,11 +48,11 @@ public:
     seq_writer(
       model::node_id node_id,
       ss::smp_service_group smp_group,
-      ss::sharded<kafka::client::client>& client,
+      transport& transport,
       sharded_store& store,
       std::unique_ptr<sequence_state_checker> state_checker)
       : _smp_opts(ss::smp_submit_to_options{smp_group})
-      , _client(client)
+      , _transport(&transport)
       , _store(store)
       , _node_id(node_id)
       , _state_checker(std::move(state_checker)) {}
@@ -92,7 +92,7 @@ public:
 private:
     ss::smp_submit_to_options _smp_opts;
 
-    ss::sharded<kafka::client::client>& _client;
+    transport* _transport;
     sharded_store& _store;
 
     model::node_id _node_id;
@@ -147,8 +147,8 @@ private:
             }
             return ss::with_semaphore(
               seq._write_sem, 1, [&seq, f, base_backoff]() {
-                  if (auto waiters = seq._wait_for_sem.waiters();
-                      waiters != 0) {
+                  if (
+                    auto waiters = seq._wait_for_sem.waiters(); waiters != 0) {
                       vlog(
                         srlog.debug,
                         "sequenced_write acquired write_sem with {} "

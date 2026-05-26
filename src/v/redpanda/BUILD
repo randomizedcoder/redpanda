@@ -19,6 +19,20 @@ redpanda_cc_library(
         "monitor_unsafe.h",
     ],
     implementation_deps = [
+        "//src/v/cluster:controller_snapshot",
+        "//src/v/cluster:ephemeral_credential_service",
+        "//src/v/cluster:id_allocator_stm",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:log_eviction_stm",
+        "//src/v/cluster:node_local_monitor",
+        "//src/v/cluster:node_status_backend",
+        "//src/v/cluster:node_status_rpc_handler",
+        "//src/v/cluster:node_status_table",
+        "//src/v/cluster:plugin_rpc_types",
+        "//src/v/cluster:producer_state_manager",
+        "//src/v/cluster:self_test",
+        "//src/v/cluster:tm_stm",
+        "//src/v/cluster:topic_metrics_watcher",
         "//src/v/cluster_link",
     ],
     visibility = ["//visibility:public"],
@@ -35,11 +49,23 @@ redpanda_cc_library(
         "//src/v/cloud_topics/level_one/metastore:simple_stm",
         "//src/v/cloud_topics/level_one/metastore/lsm:stm",
         "//src/v/cloud_topics/level_zero/stm:ctp_stm_factory",
+        "//src/v/cloud_topics/read_replica:stm",
         "//src/v/cluster",
+        "//src/v/cluster:bootstrap_types",
         "//src/v/cluster:cloud_metadata_offsets_recovery_router",
         "//src/v/cluster:cloud_metadata_offsets_recovery_service",
         "//src/v/cluster:cloud_metadata_offsets_upload_router",
+        "//src/v/cluster:cluster_uuid",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:inventory_service",
+        "//src/v/cluster:logger",
+        "//src/v/cluster:members_table",
         "//src/v/cluster:offsets_lookup",
+        "//src/v/cluster:partition_properties_stm",
+        "//src/v/cluster:tx_manager_migrator_rpc",
         "//src/v/cluster/utils:partition_change_notifier_impl",
         "//src/v/cluster_link:fwd",
         "//src/v/cluster_link:rpc_service",
@@ -73,6 +99,9 @@ redpanda_cc_library(
         "//src/v/net:tls",
         "//src/v/pandaproxy:core",
         "//src/v/pandaproxy/rest:server",
+        "//src/v/pandaproxy/schema_registry:api",
+        "//src/v/pandaproxy/schema_registry:configuration",
+        "//src/v/pandaproxy/schema_registry:fwd",
         "//src/v/pandaproxy/schema_registry:server",
         "//src/v/raft",
         "//src/v/redpanda/admin",
@@ -80,6 +109,7 @@ redpanda_cc_library(
         "//src/v/redpanda/admin/proxy:client",
         "//src/v/redpanda/admin/proxy:service",
         "//src/v/redpanda/admin/services:cluster",
+        "//src/v/redpanda/admin/services:features",
         "//src/v/redpanda/admin/services:security",
         "//src/v/redpanda/admin/services/datalake",
         "//src/v/redpanda/admin/services/internal:breakglass",
@@ -143,17 +173,30 @@ redpanda_cc_binary(
     srcs = [
         "main.cc",
     ],
-    linkopts =
-        select({
-            ":use_emit_relocs": [
-                "-Wl,--emit-relocs",
-            ],
-            "//conditions:default": [
-            ],
-        }),
+    linkopts = [
+        # Align loadable segments to 2 MB so the text segment is eligible for
+        # transparent huge pages (PMD-mapped). separate-loadable-segments
+        # ensures each PT_LOAD gets its own mmap at a 2 MB boundary rather
+        # than packing segments into a single mapping.
+        "-Wl,-z,max-page-size=2097152",
+        "-Wl,-z,separate-loadable-segments",
+    ] + select({
+        ":use_emit_relocs": [
+            "-Wl,--emit-relocs",
+        ],
+        "//conditions:default": [
+        ],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":application",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:inventory_service",
+        "//src/v/cluster:members_table",
+        "//src/v/cluster:node_status_backend",
+        "//src/v/cluster:partition_properties_stm",
+        "//src/v/cluster:self_test",
+        "//src/v/cluster:tx_manager_migrator_rpc",
         "//src/v/syschecks",
     ],
 )

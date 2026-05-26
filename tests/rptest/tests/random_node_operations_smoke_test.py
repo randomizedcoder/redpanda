@@ -44,7 +44,6 @@ from rptest.services.redpanda import (
     SISettings,
     SchemaRegistryConfig,
     get_cloud_storage_type,
-    CLOUD_TOPICS_CONFIG_STR,
 )
 from rptest.services.redpanda_installer import RedpandaInstaller
 from rptest.tests.datalake.utils import supported_storage_types
@@ -239,7 +238,6 @@ class RandomNodeOperationsBase(PreallocNodesTest):
         if with_cloud_topics:
             self.redpanda.add_extra_rp_conf(
                 {
-                    CLOUD_TOPICS_CONFIG_STR: True,
                     # Set both compaction intervals for cloud topics compaction tests
                     "log_compaction_interval_ms": 5000,
                     "cloud_topics_compaction_interval_ms": 5000,
@@ -278,6 +276,11 @@ class RandomNodeOperationsBase(PreallocNodesTest):
         self.redpanda.await_feature(
             "membership_change_controller_cmds", "active", timeout_sec=30
         )
+
+        if with_cloud_topics:
+            self.redpanda.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
 
     def _alter_local_topic_retention_bytes(self, topic: str, retention_bytes: int):
         rpk = RpkTool(self.redpanda)
@@ -682,6 +685,36 @@ class RandomNodeOperationsBase(PreallocNodesTest):
             catalog_service=self.catalog_service,
         )
 
+        tiered_cloud_delete_consumer = RandomNodeOperationsBase.producer_consumer(
+            test_context=self.test_context,
+            logger=self.logger,
+            topic_name="tp-workload-tc-delete",
+            redpanda=self.redpanda,
+            nodes=[self.preallocated_nodes[2]],
+            msg_size=self.msg_size,
+            rate_limit_bps=self.rate_limit,
+            msg_count=self.msg_count,
+            consumers_count=self.consumers_count,
+            compaction_enabled=False,
+            iceberg_enabled=with_iceberg,
+            catalog_service=self.catalog_service,
+        )
+
+        tiered_cloud_compact_consumer = RandomNodeOperationsBase.producer_consumer(
+            test_context=self.test_context,
+            logger=self.logger,
+            topic_name="tp-workload-tc-compact",
+            redpanda=self.redpanda,
+            nodes=[self.preallocated_nodes[2]],
+            msg_size=self.msg_size,
+            rate_limit_bps=self.rate_limit,
+            msg_count=self.msg_count,
+            consumers_count=self.consumers_count,
+            compaction_enabled=True,
+            iceberg_enabled=with_iceberg,
+            catalog_service=self.catalog_service,
+        )
+
         if with_cloud_topics:
             rpk = RpkTool(self.redpanda)
             rpk.create_topic(
@@ -717,6 +750,40 @@ class RandomNodeOperationsBase(PreallocNodesTest):
                 cloud_topics_compact_consumer.topic, with_iceberg
             )
             cloud_topics_compact_consumer.start(clean=False)
+
+            rpk.create_topic(
+                topic=tiered_cloud_delete_consumer.topic,
+                partitions=self.max_partitions,
+                replicas=3,
+                config={
+                    "segment.bytes": default_segment_size,
+                    "cleanup.policy": "delete",
+                    "redpanda.remote.read": "false",
+                    "redpanda.remote.write": "false",
+                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+                },
+            )
+            self.maybe_enable_iceberg_for_topic(
+                tiered_cloud_delete_consumer.topic, with_iceberg
+            )
+            tiered_cloud_delete_consumer.start(clean=False)
+
+            rpk.create_topic(
+                topic=tiered_cloud_compact_consumer.topic,
+                partitions=self.max_partitions,
+                replicas=3,
+                config={
+                    "segment.bytes": default_segment_size,
+                    "cleanup.policy": "compact",
+                    "redpanda.remote.read": "false",
+                    "redpanda.remote.write": "false",
+                    TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+                },
+            )
+            self.maybe_enable_iceberg_for_topic(
+                tiered_cloud_compact_consumer.topic, with_iceberg
+            )
+            tiered_cloud_compact_consumer.start(clean=False)
 
         write_caching_enabled = enable_write_caching_testing()
         write_caching_producer_consumer = None
@@ -817,6 +884,8 @@ class RandomNodeOperationsBase(PreallocNodesTest):
         if with_cloud_topics:
             cloud_topics_delete_consumer.verify()
             cloud_topics_compact_consumer.verify()
+            tiered_cloud_delete_consumer.verify()
+            tiered_cloud_compact_consumer.verify()
 
         if mixed_versions:
             self.logger.info("Upgrading cluster with current Redpanda version")
@@ -911,7 +980,7 @@ class RedpandaNodeOperationsSmokeTest(RandomNodeOperationsBase):
                     "kafka": "debug",
                     "reconciler": "debug",
                     "cloud_topics": "debug",
-                    "cloud_topics-compaction": "debug",
+                    "cloud_topics_compaction": "debug",
                     "offset_translator": "trace",
                 },
             ),

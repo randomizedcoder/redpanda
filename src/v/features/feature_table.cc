@@ -11,6 +11,7 @@
 
 #include "feature_table.h"
 
+#include "base/format_to.h"
 #include "cluster/feature_update_action.h"
 #include "cluster/version.h"
 #include "config/configuration.h"
@@ -44,6 +45,8 @@ std::string_view to_string_view(feature f) {
         return "consumer_groups_migrations";
     case feature::shadow_linking:
         return "shadow_linking";
+    case feature::batch_mirror_topic_status:
+        return "batch_mirror_topic_status";
     case feature::coordinated_compaction:
         return "coordinated_compaction";
     case feature::cloud_retention:
@@ -132,6 +135,10 @@ std::string_view to_string_view(feature f) {
         return "group_based_authorization";
     case feature::user_based_client_quota:
         return "user_based_client_quota";
+    case feature::cloud_topics:
+        return "cloud_topics";
+    case feature::tiered_cloud_topics:
+        return "tiered_cloud_topics";
 
     /*
      * testing features
@@ -144,6 +151,10 @@ std::string_view to_string_view(feature f) {
         return "__test_charlie";
     }
     __builtin_unreachable();
+}
+
+fmt::iterator format_to(feature f, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(f));
 }
 
 std::string_view to_string_view(feature_state::state s) {
@@ -166,6 +177,10 @@ std::string_view to_string_view(feature_state::state s) {
     __builtin_unreachable();
 };
 
+fmt::iterator format_to(feature_state::state s, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(s));
+}
+
 // The version that this redpanda node will report: increment this
 // on protocol changes to raft0 structures, like adding new services.
 constexpr cluster_version latest_version = to_cluster_version(
@@ -175,7 +190,7 @@ constexpr cluster_version latest_version = to_cluster_version(
 // a freshly initialized node will start at. All features up to this cluster
 // version will automatically be enabled when Redpanda starts.
 constexpr cluster_version earliest_version = to_cluster_version(
-  release_version::v25_3_1);
+  release_version::v26_1_1);
 
 static_assert(
   latest_version - earliest_version == 1L,
@@ -213,6 +228,7 @@ bool is_major_version_release(cluster::cluster_version version) {
     case release_version::v25_2_1:
     case release_version::v25_3_1:
     case release_version::v26_1_1:
+    case release_version::v26_2_1:
         return true;
     }
     __builtin_unreachable();

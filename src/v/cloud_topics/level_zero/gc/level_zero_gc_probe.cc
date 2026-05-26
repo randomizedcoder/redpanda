@@ -13,8 +13,6 @@
 #include "metrics/prometheus_sanitize.h"
 
 #include <seastar/core/metrics.hh>
-#include <seastar/core/metrics_types.hh>
-#include <seastar/core/shared_ptr.hh>
 
 namespace cloud_topics {
 
@@ -77,6 +75,13 @@ void level_zero_gc_probe::setup_internal_metrics(bool disable) {
             "collection."),
           labels),
         sm::make_counter(
+          "list_requests_total",
+          [this] { return list_requests_; },
+          sm::description(
+            "Number of LIST API calls to object storage by L0 garbage "
+            "collection."),
+          labels),
+        sm::make_counter(
           "list_errors_total",
           [this] { return list_errors_; },
           sm::description(
@@ -94,6 +99,13 @@ void level_zero_gc_probe::setup_internal_metrics(bool disable) {
           sm::description(
             "Cumulative time in seconds spent in backoff between L0 "
             "garbage collection rounds."),
+          labels),
+        sm::make_counter(
+          "safety_blocked_rounds_total",
+          [this] { return safety_blocked_rounds_; },
+          sm::description(
+            "Number of L0 GC rounds skipped because the safety monitor "
+            "reported an unsafe condition."),
           labels),
         sm::make_gauge(
           "min_partition_gc_epoch",

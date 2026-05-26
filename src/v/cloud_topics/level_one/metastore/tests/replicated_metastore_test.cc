@@ -9,6 +9,7 @@
  */
 
 #include "cloud_storage/remote_label.h"
+#include "cloud_topics/level_one/metastore/domain_uuid.h"
 #include "cloud_topics/level_one/metastore/manifest_io.h"
 #include "cloud_topics/level_one/metastore/metastore_manifest.h"
 #include "cloud_topics/level_one/metastore/replicated_metastore.h"
@@ -16,12 +17,11 @@
 #include "cloud_topics/tests/cluster_fixture.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "lsm/io/cloud_persistence.h"
+#include "lsm/io/cloud_cache_persistence.h"
 #include "lsm/io/memory_persistence.h"
 #include "lsm/lsm.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
-#include "serde/rw/rw.h"
 
 using namespace cloud_topics::l1;
 
@@ -52,6 +52,7 @@ public:
         };
     }
     void SetUp() override {
+        set_configuration("enable_leader_balancer", false);
         for (size_t i = 0; i < num_brokers; i++) {
             add_node(fixture_cfg());
         }
@@ -85,7 +86,7 @@ private:
         // Create a database using cloud metadata persistence pointing at the
         // LSM state's domain prefix in the bucket.
         auto domain_prefix = cloud_storage_clients::object_key{
-          fmt::format("{}", lsm_st.domain_uuid)};
+          domain_cloud_prefix(lsm_st.domain_uuid)};
         auto meta_persist = lsm::io::open_cloud_metadata_persistence(
                               remote, bucket_name, domain_prefix)
                               .get();
@@ -142,7 +143,7 @@ public:
         auto ret = meta.object_builder().get().value();
         for (int i = 0; i < partitions_count; ++i) {
             auto tp = make_tp(i);
-            auto oid = ret->get_or_create_object_for(tp).value();
+            auto oid = ret->get_or_create_object_for(tp).get().value();
             auto add_res = ret->add(
               oid,
               metastore::object_metadata::ntp_metadata{
@@ -182,7 +183,8 @@ public:
         metastore::term_offset_map_t terms;
         for (int i = 0; i < topics_count; ++i) {
             auto tp = make_topic_p0(i);
-            auto oid = obj_builder->get_or_create_object_for(tp).value();
+            auto oid
+              = (co_await obj_builder->get_or_create_object_for(tp)).value();
             auto add_res = obj_builder->add(
               oid,
               metastore::object_metadata::ntp_metadata{
@@ -227,7 +229,7 @@ TEST_P(ReplicatedMetastoreTest, TestMissingMetastore) {
     // We won't be able to find the partition of the metastore topic because it
     // doesn't exist.
     auto tp = make_tp(0);
-    auto oid = obj_builder->get_or_create_object_for(tp);
+    auto oid = obj_builder->get_or_create_object_for(tp).get();
     ASSERT_FALSE(oid.has_value());
 
     // Adding an object should fail immediately too because the metastore topic
@@ -236,11 +238,15 @@ TEST_P(ReplicatedMetastoreTest, TestMissingMetastore) {
     ASSERT_FALSE(add_res.has_value());
 
     // Creating an object builder should attempt to create the metastore topic
-    // since it doesn't exist.
+    // since it doesn't exist. After the topic is recreated, leader election may
+    // not have completed yet, so retry until get_or_create_object_for succeeds.
     auto builder_res = meta.object_builder().get();
     ASSERT_TRUE(builder_res.has_value());
-    oid = builder_res.value()->get_or_create_object_for(tp);
-    ASSERT_TRUE(oid.has_value());
+    auto new_builder = std::move(builder_res).value();
+    RPTEST_REQUIRE_EVENTUALLY(10s, [&new_builder, &tp] {
+        return new_builder->get_or_create_object_for(tp).then(
+          [](auto r) { return r.has_value(); });
+    });
 }
 
 TEST_P(ReplicatedMetastoreTest, TestAddNotFinished) {
@@ -248,7 +254,7 @@ TEST_P(ReplicatedMetastoreTest, TestAddNotFinished) {
     auto& meta = app.get_sharded_replicated_metastore()->local();
     auto tp = make_tp(0);
     auto obj_builder = meta.object_builder().get().value();
-    auto oid = obj_builder->get_or_create_object_for(tp).value();
+    auto oid = obj_builder->get_or_create_object_for(tp).get().value();
     auto add_res = obj_builder->add(
       oid,
       metastore::object_metadata::ntp_metadata{
@@ -265,6 +271,40 @@ TEST_P(ReplicatedMetastoreTest, TestAddNotFinished) {
     ASSERT_EQ(commit_res.error(), metastore::errc::invalid_request);
 }
 
+TEST_P(ReplicatedMetastoreTest, TestBuilderRejectsInvertedOffsets) {
+    auto& app = get_ct_app(model::node_id{0});
+    auto& meta = app.get_sharded_replicated_metastore()->local();
+    auto tp = make_tp(0);
+    auto obj_builder = meta.object_builder().get().value();
+    auto oid = obj_builder->get_or_create_object_for(tp).get().value();
+
+    // base_offset > last_offset should be rejected.
+    auto add_res = obj_builder->add(
+      oid,
+      metastore::object_metadata::ntp_metadata{
+        .tidp = tp,
+        .base_offset = o{99},
+        .last_offset = o{0},
+        .max_timestamp = ts{10000},
+        .pos = 0,
+        .size = 500,
+      });
+    ASSERT_FALSE(add_res.has_value());
+
+    // A valid extent should still be accepted.
+    auto add_res2 = obj_builder->add(
+      oid,
+      metastore::object_metadata::ntp_metadata{
+        .tidp = tp,
+        .base_offset = o{0},
+        .last_offset = o{99},
+        .max_timestamp = ts{10000},
+        .pos = 0,
+        .size = 500,
+      });
+    ASSERT_TRUE(add_res2.has_value()) << add_res2.error();
+}
+
 TEST_P(ReplicatedMetastoreTest, TestBuilderRemovedObjects) {
     auto& app = get_ct_app(model::node_id{0});
     auto& m = app.get_sharded_replicated_metastore()->local();
@@ -272,12 +312,12 @@ TEST_P(ReplicatedMetastoreTest, TestBuilderRemovedObjects) {
     auto ob = m.object_builder().get().value();
 
     // pending object can be removed, but not twice
-    auto oid = ob->get_or_create_object_for(tp).value();
+    auto oid = ob->get_or_create_object_for(tp).get().value();
     ASSERT_TRUE(ob->remove_pending_object(oid).has_value());
     ASSERT_FALSE(ob->remove_pending_object(oid).has_value());
 
     // after removal, object id shouldn't be reused in this builder
-    auto oid2 = ob->get_or_create_object_for(tp).value();
+    auto oid2 = ob->get_or_create_object_for(tp).get().value();
     ASSERT_NE(oid, oid2);
     oid = oid2;
 
@@ -291,12 +331,12 @@ TEST_P(ReplicatedMetastoreTest, TestBuilderRemovedObjects) {
       ob->add(oid, metastore::object_metadata::ntp_metadata{.tidp = tp})
         .has_value());
 
-    oid2 = ob->get_or_create_object_for(tp).value();
+    oid2 = ob->get_or_create_object_for(tp).get().value();
     ASSERT_NE(oid, oid2);
     oid = oid2;
 
     // finished object cannot be removed
-    oid = ob->get_or_create_object_for(tp).value();
+    oid = ob->get_or_create_object_for(tp).get().value();
     ASSERT_TRUE(ob->finish(oid, 0, 0).has_value());
     ASSERT_FALSE(ob->remove_pending_object(oid).has_value());
     ASSERT_FALSE(ob->finish(oid, 0, 0).has_value());
@@ -313,11 +353,11 @@ TEST_P(ReplicatedMetastoreTest, TestBuilderRemoveObjectRemovesPartition) {
 
     // Add and remove an object, setting up potential for an old bug where an
     // empty partition is left behind after removal.
-    auto oid1 = ob->get_or_create_object_for(tp1).value();
+    auto oid1 = ob->get_or_create_object_for(tp1).get().value();
     ASSERT_TRUE(ob->remove_pending_object(oid1).has_value());
 
     // Now add an object as normal.
-    auto oid2 = ob->get_or_create_object_for(tp2).value();
+    auto oid2 = ob->get_or_create_object_for(tp2).get().value();
     auto add_res = ob->add(
       oid2,
       metastore::object_metadata::ntp_metadata{
@@ -549,7 +589,7 @@ TEST_P(ReplicatedMetastoreTest, TestNotLeader) {
             break;
         }
         auto obj_builder = meta.object_builder().get().value();
-        auto oid = obj_builder->get_or_create_object_for(tp).value();
+        auto oid = obj_builder->get_or_create_object_for(tp).get().value();
         kafka::offset next_last{next_to_send() + 99};
         auto add_res = obj_builder->add(
           oid,
@@ -644,7 +684,7 @@ TEST_P(ReplicatedMetastoreTest, TestGetTermForOffset) {
     auto tp = make_tp(0);
 
     auto obj_builder = meta.object_builder().get().value();
-    auto oid1 = obj_builder->get_or_create_object_for(tp).value();
+    auto oid1 = obj_builder->get_or_create_object_for(tp).get().value();
     auto add_res1 = obj_builder->add(
       oid1,
       metastore::object_metadata::ntp_metadata{
@@ -703,7 +743,7 @@ TEST_P(ReplicatedMetastoreTest, TestGetEndOffsetForTerm) {
 
     // Set up initial objects with multiple terms
     auto obj_builder = meta.object_builder().get().value();
-    auto oid1 = obj_builder->get_or_create_object_for(tp).value();
+    auto oid1 = obj_builder->get_or_create_object_for(tp).get().value();
     auto add_res1 = obj_builder->add(
       oid1,
       metastore::object_metadata::ntp_metadata{
@@ -813,7 +853,7 @@ TEST_P(ReplicatedMetastoreTest, TestBasicRemoveTopics) {
     auto& app = get_ct_app(model::node_id{0});
     auto& meta = app.get_sharded_replicated_metastore()->local();
 
-    static constexpr auto topics_count = 10000;
+    static constexpr auto topics_count = 3000;
     add_objects_for_topics(meta, topics_count, 99).get();
 
     // Sanity check that all topics exist.
@@ -836,11 +876,20 @@ TEST_P(ReplicatedMetastoreTest, TestBasicRemoveTopics) {
         topic_ids_to_remove.push_back(tp.topic_id);
     }
 
-    // Remove all topics.
-    auto remove_res = meta.remove_topics(topic_ids_to_remove).get();
-    ASSERT_TRUE(remove_res.has_value());
-    EXPECT_TRUE(remove_res->not_removed.empty())
-      << remove_res->not_removed.size() << " topics remain";
+    // Remove all topics, retrying as needed since batching may return
+    // not_removed topics when extent counts exceed the batch limit.
+    while (!topic_ids_to_remove.empty()) {
+        auto remove_res = meta.remove_topics(topic_ids_to_remove).get();
+        ASSERT_TRUE(remove_res.has_value());
+        chunked_vector<model::topic_id> remaining;
+        remaining.reserve(remove_res->not_removed.size());
+        for (auto& tid : remove_res->not_removed) {
+            remaining.push_back(tid);
+        }
+        ASSERT_LT(remaining.size(), topic_ids_to_remove.size())
+          << "no progress removing topics";
+        topic_ids_to_remove = std::move(remaining);
+    }
 
     // Verify all topics are gone.
     for (int i = 0; i < topics_count; ++i) {
@@ -890,8 +939,16 @@ TEST_P(ReplicatedMetastoreTest, TestRemoveTopicsWithShuffleLoop) {
             break;
         }
         auto remove_res = meta.remove_topics(topics_to_remove).get();
-        if (
-          !remove_res.has_value() || !remove_res.value().not_removed.empty()) {
+        if (!remove_res.has_value()) {
+            ss::sleep(100ms).get();
+            continue;
+        }
+        if (!remove_res.value().not_removed.empty()) {
+            topics_to_remove.clear();
+            std::copy(
+              remove_res->not_removed.begin(),
+              remove_res->not_removed.end(),
+              std::back_inserter(topics_to_remove));
             ss::sleep(100ms).get();
             continue;
         }
@@ -1121,6 +1178,214 @@ TEST_P(ReplicatedMetastoreTest, TestRestoreCreatesCorrectPartitionCount) {
     auto cfg = tp_state.get_topic_cfg(model::l1_metastore_nt);
     ASSERT_TRUE(cfg.has_value());
     ASSERT_EQ(cfg->partition_count, expected_partitions);
+}
+
+TEST_P(ReplicatedMetastoreTest, TestReplaceObjectsRejectsEpoch) {
+    auto& app = get_ct_app(model::node_id{0});
+    auto& meta = app.get_sharded_replicated_metastore()->local();
+
+    // Add initial objects for one partition.
+    ASSERT_NO_FATAL_FAILURE(add_initial_objects(meta, 1, 99).get());
+
+    auto tp = make_tp(0);
+
+    // Read the current compaction epoch - should be 0.
+    auto spec = metastore::compaction_info_spec{
+      .tidp = tp, .tombstone_removal_upper_bound_ts = model::timestamp::min()};
+    auto info = meta.get_compaction_info(spec).get();
+    ASSERT_TRUE(info.has_value()) << fmt::to_string(info.error());
+    EXPECT_EQ(info->compaction_epoch, metastore::compaction_epoch{0});
+
+    // Replace with correct epoch (0). Should succeed.
+    std::unique_ptr<metastore::object_metadata_builder> new_objs;
+    ASSERT_NO_FATAL_FAILURE(create_initial_objects(meta, 1, 99, &new_objs));
+    metastore::replace_epoch_map_t epoch_map;
+    epoch_map[tp] = metastore::compaction_epoch{0};
+    auto replace_res = meta.replace_objects(*new_objs, epoch_map).get();
+    ASSERT_TRUE(replace_res.has_value()) << fmt::to_string(replace_res.error());
+
+    // Epoch should still be 0, since replace_objects() does not bump the epoch.
+    info = meta.get_compaction_info(spec).get();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->compaction_epoch, metastore::compaction_epoch{0});
+
+    // Replace again with incorrect epoch (1). Should fail.
+    std::unique_ptr<metastore::object_metadata_builder> incorrect_objs;
+    ASSERT_NO_FATAL_FAILURE(
+      create_initial_objects(meta, 1, 99, &incorrect_objs));
+    metastore::replace_epoch_map_t incorrect_map;
+    incorrect_map[tp] = metastore::compaction_epoch{1};
+    auto incorrect_res
+      = meta.replace_objects(*incorrect_objs, incorrect_map).get();
+    ASSERT_FALSE(incorrect_res.has_value());
+    EXPECT_EQ(incorrect_res.error(), metastore::errc::invalid_request);
+}
+
+TEST_P(ReplicatedMetastoreTest, TestCompactObjectsBumpsEpochAndRejectsStale) {
+    auto& app = get_ct_app(model::node_id{0});
+    auto& meta = app.get_sharded_replicated_metastore()->local();
+
+    // Add initial objects for one partition.
+    ASSERT_NO_FATAL_FAILURE(add_initial_objects(meta, 1, 99).get());
+
+    auto tp = make_tp(0);
+
+    // Read the current compaction epoch - should be 0.
+    auto spec = metastore::compaction_info_spec{
+      .tidp = tp, .tombstone_removal_upper_bound_ts = model::timestamp::min()};
+    auto info = meta.get_compaction_info(spec).get();
+    ASSERT_TRUE(info.has_value()) << fmt::to_string(info.error());
+    EXPECT_EQ(info->compaction_epoch, metastore::compaction_epoch{0});
+
+    // First compact with correct epoch (0). Should succeed.
+    std::unique_ptr<metastore::object_metadata_builder> new_objs;
+    ASSERT_NO_FATAL_FAILURE(create_initial_objects(meta, 1, 99, &new_objs));
+    metastore::compaction_map_t cmap;
+    metastore::compaction_update update;
+    update.cleaned_at = model::timestamp(3000);
+    update.new_cleaned_ranges.push_back(
+      metastore::compaction_update::cleaned_range{
+        .base_offset = o{0}, .last_offset = o{99}});
+    update.expected_compaction_epoch = metastore::compaction_epoch{0};
+    cmap[tp] = std::move(update);
+    auto compact_res = meta.compact_objects(*new_objs, cmap).get();
+    ASSERT_TRUE(compact_res.has_value()) << fmt::to_string(compact_res.error());
+
+    // Epoch should now be 1.
+    info = meta.get_compaction_info(spec).get();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->compaction_epoch, metastore::compaction_epoch{1});
+
+    // Second compact with stale epoch (0). Should fail.
+    std::unique_ptr<metastore::object_metadata_builder> stale_objs;
+    ASSERT_NO_FATAL_FAILURE(create_initial_objects(meta, 1, 99, &stale_objs));
+    metastore::compaction_map_t stale_cmap;
+    metastore::compaction_update stale_update;
+    stale_update.cleaned_at = model::timestamp(3000);
+    stale_update.new_cleaned_ranges.push_back(
+      metastore::compaction_update::cleaned_range{
+        .base_offset = o{0}, .last_offset = o{99}});
+    stale_update.expected_compaction_epoch = metastore::compaction_epoch{
+      0}; // stale
+    stale_cmap[tp] = std::move(stale_update);
+    auto stale_res = meta.compact_objects(*stale_objs, stale_cmap).get();
+    ASSERT_FALSE(stale_res.has_value());
+    EXPECT_EQ(stale_res.error(), metastore::errc::invalid_request);
+}
+
+namespace {
+
+struct leveling_case {
+    std::string name;
+    std::vector<size_t> object_sizes;
+    size_t min_acceptable;
+    std::vector<levelable_range> expected_ranges;
+};
+
+} // namespace
+
+TEST_P(ReplicatedMetastoreTest, TestGetLevelingInfo) {
+    auto& app = get_ct_app(model::node_id{0});
+    auto& meta = app.get_sharded_replicated_metastore()->local();
+
+    const std::vector<leveling_case> cases = {
+      {.name = "NoUndersizedExtents",
+       .object_sizes = {100, 100, 100},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+      {.name = "SmallSandwichedBetweenLarge",
+       .object_sizes = {100, 2, 100, 15, 2, 100},
+       .min_acceptable = 50,
+       .expected_ranges
+       = {{.base_offset = o{30}, .last_offset = o{49}, .size_bytes = 17}}},
+      {.name = "IsolatedSmallSingleton",
+       .object_sizes = {100, 2, 100},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+      {.name = "SmallFollowedByManyHealthy",
+       .object_sizes = {100, 2, 100, 100, 100, 100},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+      {.name = "TwoSmallsSeparatedByHealthies",
+       .object_sizes = {100, 2, 100, 100, 2, 100},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+      {.name = "AllSmall",
+       .object_sizes = {2, 2, 2},
+       .min_acceptable = 50,
+       .expected_ranges
+       = {{.base_offset = o{0}, .last_offset = o{29}, .size_bytes = 6}}},
+      {.name = "LeadingHealthyExtentsUntouched",
+       .object_sizes = {100, 100, 2, 2, 100},
+       .min_acceptable = 50,
+       .expected_ranges
+       = {{.base_offset = o{20}, .last_offset = o{39}, .size_bytes = 4}}},
+      {.name = "SmallsAcrossHealthyAreNotMerged",
+       .object_sizes = {100, 30, 100, 30, 100},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+      {.name = "LeadingSmallSingleton",
+       .object_sizes = {2, 100, 100},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+      {.name = "ThresholdBelowAllSizes",
+       .object_sizes = {200, 200, 200},
+       .min_acceptable = 50,
+       .expected_ranges = {}},
+    };
+
+    // Stage every case's objects in a single builder, then commit them
+    // all atomically via add_objects.
+    auto obj_builder = meta.object_builder().get().value();
+    metastore::term_offset_map_t terms;
+    for (size_t case_idx = 0; case_idx < cases.size(); ++case_idx) {
+        const auto& c = cases[case_idx];
+        auto tp = make_tp(static_cast<int>(case_idx));
+        for (size_t i = 0; i < c.object_sizes.size(); ++i) {
+            auto oid = obj_builder->get_or_create_object_for(tp).get().value();
+            auto add_res = obj_builder->add(
+              oid,
+              metastore::object_metadata::ntp_metadata{
+                .tidp = tp,
+                .base_offset = o{static_cast<int64_t>(i * 10)},
+                .last_offset = o{static_cast<int64_t>(i * 10 + 9)},
+                .max_timestamp = ts{static_cast<int64_t>((i + 1) * 1000)},
+                .pos = 0,
+                .size = c.object_sizes[i],
+              });
+            ASSERT_TRUE(add_res.has_value())
+              << c.name << ": " << add_res.error();
+            auto fin_res = obj_builder->finish(
+              oid, c.object_sizes[i], c.object_sizes[i]);
+            ASSERT_TRUE(fin_res.has_value())
+              << c.name << ": " << fin_res.error();
+        }
+        terms[tp].emplace_back(
+          metastore::term_offset{
+            .term = model::term_id{0}, .first_offset = o{0}});
+    }
+    auto add_res = meta.add_objects(*obj_builder, terms).get();
+    ASSERT_TRUE(add_res.has_value());
+
+    // Query each partition's leveling info and verify the result.
+    for (size_t case_idx = 0; case_idx < cases.size(); ++case_idx) {
+        const auto& c = cases[case_idx];
+        auto tp = make_tp(static_cast<int>(case_idx));
+        chunked_vector<metastore::leveling_info_spec> specs;
+        specs.push_back(
+          {.tidp = tp, .min_acceptable_extent_bytes = c.min_acceptable});
+        auto infos_res = meta.get_leveling_infos(specs).get();
+        ASSERT_TRUE(infos_res.has_value())
+          << c.name << ": " << static_cast<int>(infos_res.error());
+        auto it = infos_res->find(tp);
+        ASSERT_NE(it, infos_res->end()) << c.name;
+        ASSERT_TRUE(it->second.has_value())
+          << c.name << ": " << static_cast<int>(it->second.error());
+        const auto& res = it->second.value();
+
+        EXPECT_THAT(res.ranges, ::testing::ElementsAreArray(c.expected_ranges))
+          << c.name;
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(

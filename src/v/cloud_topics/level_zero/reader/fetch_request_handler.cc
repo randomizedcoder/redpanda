@@ -10,20 +10,14 @@
 
 #include "cloud_topics/level_zero/reader/fetch_request_handler.h"
 
-#include "cloud_topics/level_zero/pipeline/event_filter.h"
 #include "cloud_topics/level_zero/pipeline/read_request.h"
 #include "cloud_topics/level_zero/reader/materialized_extent_reader.h"
-#include "cloud_topics/level_zero/stm/placeholder.h"
 #include "cloud_topics/logger.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
-#include "model/timeout_clock.h"
 #include "ssx/future-util.h"
-#include "storage/types.h"
 #include "utils/retry_chain_node.h"
 
-#include <seastar/core/internal/timers.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
@@ -105,13 +99,13 @@ ss::future<> fetch_handler::process_single_request(l0::read_request<>* req) {
     std::optional<chunked_vector<model::tx_range>> aborted_tx;
     try {
         auto meta = std::move(req->query.meta);
-
         auto extent = co_await ss::coroutine::as_future(
           materialize_placeholders(
             _bucket,
             std::move(meta),
             *_remote,
             *_cache,
+            req->query.allow_mat_failure,
             req->rtc,
             req->rtc_logger));
 

@@ -9,15 +9,15 @@
 
 #include "cluster/topic_properties.h"
 
+#include "base/format_to.h"
 #include "model/adl_serde.h"
 #include "model/metadata.h"
 #include "reflection/adl.h"
 
 namespace cluster {
-
-std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
-    fmt::print(
-      o,
+fmt::iterator topic_properties::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{ compression: {}, cleanup_policy_bitflags: {}, compaction_strategy: "
       "{}, retention_bytes: {}, retention_duration_ms: {}, segment_size: {}, "
       "timestamp_type: {}, recovery_enabled: {}, shadow_indexing: {}, "
@@ -27,6 +27,7 @@ std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
       "remote_topic_allow_gaps: {}, "
       "batch_max_bytes: {}, retention_local_target_bytes: {}, "
       "retention_local_target_ms: {}, remote_delete: {}, segment_ms: {}, "
+      "schema_registry_context: {}, "
       "record_key_schema_id_validation: {}, "
       "record_key_schema_id_validation_compat: {}, "
       "record_key_subject_name_strategy: {}, "
@@ -53,59 +54,75 @@ std::ostream& operator<<(std::ostream& o, const topic_properties& properties) {
       "max_compaction_lag_ms: {}, "
       "message_timestamp_before_max_ms: {}, "
       "message_timestamp_after_max_ms: {}, "
-      "redpanda_storage_mode: {}",
-      properties.compression,
-      properties.cleanup_policy_bitflags,
-      properties.compaction_strategy,
-      properties.retention_bytes,
-      properties.retention_duration,
-      properties.segment_size,
-      properties.timestamp_type,
-      properties.recovery,
-      properties.shadow_indexing,
-      properties.read_replica,
-      properties.read_replica_bucket,
-      properties.remote_topic_namespace_override,
-      properties.remote_topic_properties,
-      properties.remote_topic_allow_gaps,
-      properties.batch_max_bytes,
-      properties.retention_local_target_bytes,
-      properties.retention_local_target_ms,
-      properties.remote_delete,
-      properties.segment_ms,
-      properties.record_key_schema_id_validation,
-      properties.record_key_schema_id_validation_compat,
-      properties.record_key_subject_name_strategy,
-      properties.record_key_subject_name_strategy_compat,
-      properties.record_value_schema_id_validation,
-      properties.record_value_schema_id_validation_compat,
-      properties.record_value_subject_name_strategy,
-      properties.record_value_subject_name_strategy_compat,
-      properties.initial_retention_local_target_bytes,
-      properties.initial_retention_local_target_ms,
-      properties.mpx_virtual_cluster_id,
-      properties.write_caching,
-      properties.flush_ms,
-      properties.flush_bytes,
-      properties.remote_label,
-      properties.iceberg_mode,
-      properties.leaders_preference,
-      properties.delete_retention_ms,
-      properties.iceberg_delete,
-      properties.iceberg_partition_spec,
-      properties.iceberg_invalid_record_action,
-      properties.iceberg_target_lag_ms,
-      properties.min_cleanable_dirty_ratio,
-      properties.min_compaction_lag_ms,
-      properties.max_compaction_lag_ms,
-      properties.message_timestamp_before_max_ms,
-      properties.message_timestamp_after_max_ms,
-      properties.storage_mode);
-
-    o << "}";
-
-    return o;
+      "redpanda_storage_mode: {}}}",
+      compression,
+      cleanup_policy_bitflags,
+      compaction_strategy,
+      retention_bytes,
+      retention_duration,
+      segment_size,
+      timestamp_type,
+      recovery,
+      shadow_indexing,
+      read_replica,
+      read_replica_bucket,
+      remote_topic_namespace_override,
+      remote_topic_properties,
+      remote_topic_allow_gaps,
+      batch_max_bytes,
+      retention_local_target_bytes,
+      retention_local_target_ms,
+      remote_delete,
+      segment_ms,
+      schema_registry_context,
+      record_key_schema_id_validation,
+      record_key_schema_id_validation_compat,
+      record_key_subject_name_strategy,
+      record_key_subject_name_strategy_compat,
+      record_value_schema_id_validation,
+      record_value_schema_id_validation_compat,
+      record_value_subject_name_strategy,
+      record_value_subject_name_strategy_compat,
+      initial_retention_local_target_bytes,
+      initial_retention_local_target_ms,
+      mpx_virtual_cluster_id,
+      write_caching,
+      flush_ms,
+      flush_bytes,
+      remote_label,
+      iceberg_mode,
+      leaders_preference,
+      delete_retention_ms,
+      iceberg_delete,
+      iceberg_partition_spec,
+      iceberg_invalid_record_action,
+      iceberg_target_lag_ms,
+      min_cleanable_dirty_ratio,
+      min_compaction_lag_ms,
+      max_compaction_lag_ms,
+      message_timestamp_before_max_ms,
+      message_timestamp_after_max_ms,
+      storage_mode);
 }
+
+bool topic_properties::is_local_topic() const {
+    switch (storage_mode) {
+    case model::redpanda_storage_mode::local:
+        return true;
+    case model::redpanda_storage_mode::tiered:
+        return false;
+    case model::redpanda_storage_mode::cloud:
+        return false;
+    case model::redpanda_storage_mode::tiered_cloud:
+        return false;
+    case model::redpanda_storage_mode::unset:
+        // Unset storage mode, infer from archival and remote fetch settings.
+        return !is_archival_enabled() && !is_remote_fetch_enabled();
+    }
+    vunreachable(
+      "unknown redpanda_storage_mode: {}", std::to_underlying(storage_mode));
+}
+
 bool topic_properties::is_compacted() const {
     if (!cleanup_policy_bitflags) {
         return false;
@@ -150,7 +167,8 @@ bool topic_properties::has_overrides() const {
         || remote_topic_allow_gaps.has_value()
         || message_timestamp_before_max_ms.has_value()
         || message_timestamp_after_max_ms.has_value()
-        || storage_mode != storage::ntp_config::default_storage_mode;
+        || storage_mode != storage::ntp_config::default_storage_mode
+        || schema_registry_context.has_value();
 
     return overrides;
 }
@@ -181,8 +199,7 @@ bool topic_properties::requires_cloud_topic_remote_erase() const {
     // * Using cloud topics
     // * Not a read replica
     // * Has redpanda.remote.delete=true
-    return storage_mode == model::redpanda_storage_mode::cloud
-           && !read_replica.value_or(false) && remote_delete;
+    return is_cloud_topic() && !read_replica.value_or(false) && remote_delete;
 }
 
 bool topic_properties::requires_iceberg_remote_erase() const {

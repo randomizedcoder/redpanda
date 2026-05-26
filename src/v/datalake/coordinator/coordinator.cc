@@ -14,11 +14,14 @@
 #include "config/configuration.h"
 #include "container/chunked_vector.h"
 #include "datalake/catalog_schema_manager.h"
+#include "datalake/coordinator/catalog_config.h"
 #include "datalake/coordinator/state_update.h"
 #include "datalake/logger.h"
 #include "datalake/partition_spec_parser.h"
+#include "datalake/record_schema_resolver.h"
 #include "datalake/record_translator.h"
 #include "datalake/table_id_provider.h"
+#include "iceberg/field_name_comparison.h"
 #include "model/fundamental.h"
 #include "ssx/future-util.h"
 #include "ssx/sleep_abortable.h"
@@ -27,7 +30,6 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
-#include <exception>
 #include <optional>
 
 namespace datalake::coordinator {
@@ -78,25 +80,6 @@ coordinator::maybe_add_waiter(
     }
     in_flight_map.insert({key, {}});
     return std::nullopt;
-}
-
-std::ostream& operator<<(std::ostream& o, coordinator::errc e) {
-    switch (e) {
-    case coordinator::errc::not_leader:
-        return o << "coordinator::errc::not_leader";
-    case coordinator::errc::shutting_down:
-        return o << "coordinator::errc::shutting_down";
-    case coordinator::errc::stm_apply_error:
-        return o << "coordinator::errc::stm_apply_error";
-    case coordinator::errc::revision_mismatch:
-        return o << "coordinator::errc::revision_mismatch";
-    case coordinator::errc::incompatible_schema:
-        return o << "coordinator::errc::incompatible_schema";
-    case coordinator::errc::timedout:
-        return o << "coordinator::errc::timedout";
-    case coordinator::errc::failed:
-        return o << "coordinator::errc::failed";
-    }
 }
 
 void coordinator::start() {
@@ -292,14 +275,14 @@ checked<ss::gate::holder, coordinator::errc> coordinator::maybe_gate() {
 }
 
 struct coordinator::table_schema_provider {
-    virtual iceberg::table_identifier get_table_id(const model::topic&) const
-      = 0;
+    virtual iceberg::table_identifier
+    get_table_id(const model::topic&) const = 0;
 
     virtual ss::future<checked<iceberg::struct_type, coordinator::errc>>
       get_record_type(record_schema_components) const = 0;
 
-    virtual ss::sstring get_partition_spec(const cluster::topic_metadata&) const
-      = 0;
+    virtual ss::sstring
+    get_partition_spec(const cluster::topic_metadata&) const = 0;
 
     virtual ~table_schema_provider() = default;
 };
@@ -404,7 +387,10 @@ coordinator::do_ensure_table_exists(
     }
 
     auto ensure_res = co_await schema_mgr_.ensure_table_schema(
-      table_id, record_type.value(), partition_spec.value());
+      table_id,
+      record_type.value(),
+      partition_spec.value(),
+      resolve_field_name_comparison());
     if (ensure_res.has_error()) {
         switch (ensure_res.error()) {
         case schema_manager::errc::not_supported:
@@ -421,8 +407,10 @@ coordinator::do_ensure_table_exists(
 
 struct coordinator::main_table_schema_provider
   : public coordinator::table_schema_provider {
-    explicit main_table_schema_provider(coordinator& parent)
-      : parent(parent) {}
+    main_table_schema_provider(
+      coordinator& parent, pandaproxy::schema_registry::context ctx)
+      : parent(parent)
+      , ctx_(std::move(ctx)) {}
 
     iceberg::table_identifier
     get_table_id(const model::topic& topic) const final {
@@ -431,10 +419,10 @@ struct coordinator::main_table_schema_provider
 
     ss::future<checked<iceberg::struct_type, coordinator::errc>>
     get_record_type(record_schema_components comps) const final {
-        std::optional<resolved_type> val_type;
+        std::optional<shared_resolved_type_t> val_type;
         if (comps.val_identifier) {
             auto type_res = co_await parent.type_resolver_.resolve_identifier(
-              comps.val_identifier.value());
+              comps.val_identifier.value(), ctx_);
             if (type_res.has_error()) {
                 co_return errc::failed;
             }
@@ -452,6 +440,7 @@ struct coordinator::main_table_schema_provider
     }
 
     const coordinator& parent;
+    pandaproxy::schema_registry::context ctx_;
 };
 
 ss::future<checked<std::nullopt_t, coordinator::errc>>
@@ -467,12 +456,20 @@ coordinator::sync_ensure_table_exists(
     if (waiter_fut.has_value()) {
         co_return co_await std::move(*waiter_fut);
     }
+    auto topic_md = topic_table_.get_topic_metadata_ref(
+      model::topic_namespace_view{model::kafka_namespace, topic});
+    auto sr_ctx = topic_md ? topic_md->get()
+                               .get_configuration()
+                               .properties.schema_registry_context.value_or(
+                                 pandaproxy::schema_registry::default_context)
+                           : pandaproxy::schema_registry::default_context;
+
     auto res_fut = co_await ss::coroutine::as_future(do_ensure_table_exists(
       topic,
       topic_revision,
       std::move(comps),
       "sync_ensure_table_exists",
-      main_table_schema_provider{*this}));
+      main_table_schema_provider{*this, std::move(sr_ctx)}));
 
     if (res_fut.failed()) {
         // NOTE: we don't expect any exceptions given we're using result types,

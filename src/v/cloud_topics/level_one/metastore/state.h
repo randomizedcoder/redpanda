@@ -86,8 +86,7 @@ struct compaction_state
           serde::compat_version<0>> {
         friend bool operator==(
           const cleaned_range_with_tombstones&,
-          const cleaned_range_with_tombstones&)
-          = default;
+          const cleaned_range_with_tombstones&) = default;
         auto operator<=>(const cleaned_range_with_tombstones&) const = default;
         auto serde_fields() {
             return std::tie(
@@ -105,8 +104,8 @@ struct compaction_state
     using tombstone_range_set_t
       = absl::btree_set<cleaned_range_with_tombstones>;
 
-    friend bool operator==(const compaction_state&, const compaction_state&)
-      = default;
+    friend bool
+    operator==(const compaction_state&, const compaction_state&) = default;
     auto serde_fields() {
         return std::tie(cleaned_ranges, cleaned_ranges_with_tombstones);
     }
@@ -189,8 +188,8 @@ public:
 struct partition_state
   : public serde::
       envelope<partition_state, serde::version<0>, serde::compat_version<0>> {
-    friend bool operator==(const partition_state&, const partition_state&)
-      = default;
+    friend bool
+    operator==(const partition_state&, const partition_state&) = default;
     auto serde_fields() {
         return std::tie(
           extents,
@@ -274,16 +273,23 @@ struct topic_state
 // Metadata about a given object that is not specific to any partition.
 struct object_entry
   : public serde::
-      envelope<object_entry, serde::version<0>, serde::compat_version<0>> {
+      envelope<object_entry, serde::version<1>, serde::compat_version<0>> {
     friend bool operator==(const object_entry&, const object_entry&) = default;
     auto serde_fields() {
         return std::tie(
-          total_data_size, removed_data_size, footer_pos, object_size);
+          total_data_size,
+          removed_data_size,
+          footer_pos,
+          object_size,
+          last_updated,
+          is_preregistration);
     }
     size_t total_data_size{0};
     size_t removed_data_size{0};
     size_t footer_pos{0};
     size_t object_size{0};
+    model::timestamp last_updated;
+    bool is_preregistration{false};
 };
 
 // Tracks the state of each topic revision.

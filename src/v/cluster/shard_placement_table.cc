@@ -11,12 +11,14 @@
 
 #include "cluster/shard_placement_table.h"
 
+#include "base/format_to.h"
 #include "cluster/cluster_utils.h"
+#include "cluster/controller_utils.h"
 #include "cluster/logger.h"
 #include "cluster/topic_table.h"
+#include "cluster/types.h"
 #include "metrics/prometheus_sanitize.h"
 #include "ssx/async_algorithm.h"
-#include "types.h"
 
 #include <seastar/util/defer.hh>
 
@@ -67,41 +69,36 @@ private:
 
     metrics::internal_metric_groups _metrics;
 };
-
-std::ostream& operator<<(
-  std::ostream& o, const shard_placement_table::shard_local_assignment& as) {
-    fmt::print(
-      o,
+fmt::iterator shard_placement_table::shard_local_assignment::format_to(
+  fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{group: {}, log_revision: {}, shard_revision: {}}}",
-      as.group,
-      as.log_revision,
-      as.shard_revision);
-    return o;
+      group,
+      log_revision,
+      shard_revision);
 }
-
-std::ostream&
-operator<<(std::ostream& o, shard_placement_table::hosted_status s) {
-    switch (s) {
+fmt::iterator
+format_to(shard_placement_table::hosted_status e, fmt::iterator out) {
+    switch (e) {
     case shard_placement_table::hosted_status::receiving:
-        return o << "receiving";
+        return fmt::format_to(out, "receiving");
     case shard_placement_table::hosted_status::hosted:
-        return o << "hosted";
+        return fmt::format_to(out, "hosted");
     case shard_placement_table::hosted_status::obsolete:
-        return o << "obsolete";
+        return fmt::format_to(out, "obsolete");
     }
     __builtin_unreachable();
 }
-
-std::ostream& operator<<(
-  std::ostream& o, const shard_placement_table::shard_local_state& ls) {
-    fmt::print(
-      o,
+fmt::iterator
+shard_placement_table::shard_local_state::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{group: {}, log_revision: {}, status: {}, shard_revision: {}}}",
-      ls.group,
-      ls.log_revision,
-      ls.status,
-      ls.shard_revision);
-    return o;
+      group,
+      log_revision,
+      status,
+      shard_revision);
 }
 
 shard_placement_table::reconciliation_action
@@ -439,7 +436,7 @@ shard_placement_table::initialize_from_kvstore(
     for (size_t i = 0; i < extra_kvstores.size(); ++i) {
         extra_spts.push_back(
           std::make_unique<shard_placement_table>(
-            ss::smp::count + i, *extra_kvstores[i]));
+            ss::this_smp_shard_count() + i, *extra_kvstores[i]));
     }
 
     // 1. gather kvstore markers from all shards
@@ -632,14 +629,14 @@ ss::future<> shard_placement_table::scatter_init_data(
               if (_shard == init_data.hosted.shard) {
                   if (
                     init_data.receiving.shard
-                    && init_data.receiving.shard < ss::smp::count) {
+                    && init_data.receiving.shard < ss::this_smp_shard_count()) {
                       state._next = placement_state::versioned_shard{
                         .shard = init_data.receiving.shard.value(),
                         .revision = init_data.receiving.revision};
                   }
               } else if (
                 _shard != init_data.receiving.shard || !init_data.hosted.shard
-                || _shard >= ss::smp::count) {
+                || _shard >= ss::this_smp_shard_count()) {
                   state.set_hosted_status(hosted_status::obsolete, *_probe);
               }
           }
@@ -655,7 +652,7 @@ ss::future<> shard_placement_table::scatter_init_data(
                   state._is_initial_for = init_data.log_revision;
               }
 
-              if (_shard >= ss::smp::count) {
+              if (_shard >= ss::this_smp_shard_count()) {
                   // mark states on extra shards as ready to transfer
                   state.set_assigned(std::nullopt, *_probe);
               }
@@ -793,7 +790,10 @@ ss::future<> shard_placement_table::set_target(
 
     if (target) {
         vassert(
-          target->shard < ss::smp::count, "[{}] bad target: {}", ntp, target);
+          target->shard < ss::this_smp_shard_count(),
+          "[{}] bad target: {}",
+          ntp,
+          target);
     }
 
     // ensure that there is no concurrent enable_persistence() call
@@ -862,7 +862,7 @@ ss::future<> shard_placement_table::set_target(
                     assignment_kvstore_key(target->group),
                     std::move(marker_buf));
               });
-        } else if (prev_target.value().shard < ss::smp::count) {
+        } else if (prev_target.value().shard < ss::this_smp_shard_count()) {
             co_await container().invoke_on(
               prev_target.value().shard,
               [group = prev_target->group, &ntp](shard_placement_table& other) {
@@ -911,7 +911,7 @@ ss::future<> shard_placement_table::set_target(
     }
 
     if (
-      prev_target && prev_target->shard < ss::smp::count
+      prev_target && prev_target->shard < ss::this_smp_shard_count()
       && (!target || target->shard != prev_target->shard)) {
         co_await container().invoke_on(
           prev_target->shard,
@@ -942,7 +942,8 @@ ss::future<> shard_placement_table::set_target(
     // 3. Lastly, remove obsolete kvstore marker
 
     if (
-      _persistence_enabled && prev_target && prev_target->shard < ss::smp::count
+      _persistence_enabled && prev_target
+      && prev_target->shard < ss::this_smp_shard_count()
       && (!target || target->shard != prev_target->shard)) {
         co_await container().invoke_on(
           prev_target->shard,

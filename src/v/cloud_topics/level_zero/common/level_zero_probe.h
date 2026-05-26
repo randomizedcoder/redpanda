@@ -52,6 +52,7 @@ public:
         _memory_pressure_blocked += mem;
         return ss::defer([this, mem] { _memory_pressure_blocked -= mem; });
     }
+    void register_request_limit_blocked() { ++_request_limit_waits; }
     void register_bytes_in(uint64_t bytes) {
         _total_bytes_in += bytes;
         _request_memory_histogram.record(bytes);
@@ -80,6 +81,8 @@ private:
     uint64_t _memory_pressure_waits{0};
     // memory pressure (memory blocked by waiting for semaphore)
     uint64_t _memory_pressure_blocked{0};
+    // request count limit pressure (req. waits for inflight slot)
+    uint64_t _request_limit_waits{0};
     // total bytes in (for write pipeline)
     uint64_t _total_bytes_in{0};
     // total bytes out (for read pipeline)
@@ -114,6 +117,8 @@ public:
 
     void set_active_groups(uint64_t count) { _active_groups = count; }
 
+    void set_next_stage_bytes(uint64_t bytes) { _next_stage_bytes = bytes; }
+
 private:
     void setup_internal_metrics(bool disable);
 
@@ -128,6 +133,37 @@ private:
     uint64_t _rx_bytes_xshard{0};
     /// Number of active upload groups
     uint64_t _active_groups{0};
+    /// Bytes buffered in the next pipeline stage
+    uint64_t _next_stage_bytes{0};
+
+    metrics::internal_metric_groups _metrics;
+};
+
+class read_merge_probe {
+public:
+    explicit read_merge_probe(bool disable);
+
+    void register_request_in(uint64_t bytes) {
+        _requests_in += 1;
+        _bytes_in += bytes;
+    }
+
+    void register_request_out(uint64_t bytes) {
+        _requests_out += 1;
+        _bytes_out += bytes;
+    }
+
+private:
+    void setup_internal_metrics(bool disable);
+
+    /// Number of requests handled by the component (all requests)
+    uint64_t _requests_in{0};
+    /// Total bytes of all requests handled
+    uint64_t _bytes_in{0};
+    /// Number of proxy requests forwarded to the next stage
+    uint64_t _requests_out{0};
+    /// Total bytes of proxy requests forwarded
+    uint64_t _bytes_out{0};
 
     metrics::internal_metric_groups _metrics;
 };

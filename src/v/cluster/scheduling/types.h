@@ -13,6 +13,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_set.h"
+#include "base/format_to.h"
 #include "base/oncore.h"
 #include "base/vassert.h"
 #include "cluster/types.h"
@@ -50,8 +51,8 @@ class hard_constraint {
 public:
     struct impl {
         virtual hard_constraint_evaluator make_evaluator(
-          const allocated_partition&, std::optional<model::node_id> prev) const
-          = 0;
+          const allocated_partition&,
+          std::optional<model::node_id> prev) const = 0;
 
         virtual ss::sstring name() const = 0;
         virtual ~impl() = default;
@@ -76,11 +77,11 @@ public:
 
     ss::sstring name() const { return _impl->name(); }
 
-private:
-    friend std::ostream& operator<<(std::ostream& o, const hard_constraint& c) {
-        fmt::print(o, "hard: [{}]", c.name());
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "hard: [{}]", name());
     }
+
+private:
     std::unique_ptr<impl> _impl;
 };
 
@@ -90,8 +91,7 @@ public:
     struct impl {
         virtual soft_constraint_evaluator make_evaluator(
           const allocated_partition& partition,
-          std::optional<model::node_id> prev) const
-          = 0;
+          std::optional<model::node_id> prev) const = 0;
         virtual ss::sstring name() const = 0;
         virtual ~impl() = default;
     };
@@ -115,12 +115,11 @@ public:
 
     ss::sstring name() const { return _impl->name(); }
 
-private:
-    friend std::ostream& operator<<(std::ostream& o, const soft_constraint& c) {
-        fmt::print(o, "soft: [{}]", c.name());
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "soft: [{}]", name());
     }
 
+private:
     std::unique_ptr<impl> _impl;
 };
 
@@ -178,8 +177,8 @@ struct allocation_constraints {
     }
 
     void add(allocation_constraints);
-    friend std::ostream&
-    operator<<(std::ostream&, const allocation_constraints&);
+
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 /**
  * RAII based helper holding allocated partitions, allocation is reverted
@@ -337,8 +336,7 @@ struct partition_constraints {
     std::optional<raft::group_id> existing_group;
     replicas_t existing_replicas;
 
-    friend std::ostream&
-    operator<<(std::ostream&, const partition_constraints&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 using node2count_t = absl::flat_hash_map<model::node_id, size_t>;
@@ -359,7 +357,7 @@ struct allocation_request {
     // objective.
     std::optional<node2count_t> existing_replica_counts;
 
-    friend std::ostream& operator<<(std::ostream&, const allocation_request&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /**
@@ -372,8 +370,8 @@ struct simple_allocation_request {
     simple_allocation_request() = delete;
     simple_allocation_request(const simple_allocation_request&) = delete;
     simple_allocation_request(simple_allocation_request&&) = default;
-    simple_allocation_request& operator=(const simple_allocation_request&)
-      = delete;
+    simple_allocation_request&
+    operator=(const simple_allocation_request&) = delete;
     simple_allocation_request& operator=(simple_allocation_request&&) = default;
     ~simple_allocation_request() = default;
 
@@ -394,8 +392,7 @@ struct simple_allocation_request {
     // objective.
     std::optional<node2count_t> existing_replica_counts;
 
-    friend std::ostream&
-    operator<<(std::ostream&, const simple_allocation_request&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 } // namespace cluster

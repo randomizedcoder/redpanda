@@ -101,6 +101,7 @@ redpanda_cc_btest(
         "//src/v/serde:optional",
         "//src/v/serde:uuid",
         "//src/v/serde:vector",
+        "//src/v/test_utils:container_ostream",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:named_type",
         "//src/v/utils:uuid",
@@ -615,5 +616,29 @@ redpanda_cc_gtest(
         "//src/v/utils:windowed_sum_tracker",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "device_utils_test",
+    timeout = "short",
+    srcs = ["device_utils_test.cc"],
+    deps = [
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:device_utils",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "variant_test",
+    timeout = "short",
+    srcs = [
+        "variant_test.cc",
+    ],
+    deps = [
+        "//src/v/test_utils:gtest",
+        "//src/v/utils:variant",
+        "@googletest//:gtest",
     ],
 )

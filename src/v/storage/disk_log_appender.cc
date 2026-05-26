@@ -12,15 +12,14 @@
 #include "base/likely.h"
 #include "base/vlog.h"
 #include "model/record_utils.h"
+#include "ssx/future-util.h"
 #include "storage/disk_log_impl.h"
 #include "storage/logger.h"
 #include "storage/segment.h"
-#include "storage/segment_appender.h"
 
 #include <seastar/coroutine/exception.hh>
 
 #include <exception>
-#include <type_traits>
 
 namespace storage {
 
@@ -117,7 +116,13 @@ disk_log_appender::operator()(model::record_batch& batch) {
     } catch (...) {
         release_lock();
         auto e = std::current_exception();
-        vlog(stlog.error, "Could not append batch: {} - {}", e, *this);
+        vlogl(
+          stlog,
+          ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                        : ss::log_level::error,
+          "Could not append batch: {} - {}",
+          e,
+          *this);
         _log.get_probe().batch_write_error();
         throw;
     }
@@ -126,8 +131,8 @@ disk_log_appender::operator()(model::record_batch& batch) {
 ss::future<ss::stop_iteration>
 disk_log_appender::append_batch_to_segment(const model::record_batch& batch) {
     // ghost batch handling, it doesn't happen often so we can use unlikely
-    if (unlikely(
-          batch.header().type == model::record_batch_type::ghost_batch)) {
+    if (
+      unlikely(batch.header().type == model::record_batch_type::ghost_batch)) {
         _idx = batch.last_offset() + model::offset(1); // next base offset
         _last_offset = batch.last_offset();
         return ss::make_ready_future<ss::stop_iteration>(
@@ -169,13 +174,17 @@ ss::future<append_result> disk_log_appender::end_of_stream() {
     co_return retval;
 }
 
-std::ostream& operator<<(std::ostream& o, const disk_log_appender& a) {
-    return o << "{offset_idx:" << a._idx
-             << ", active_segment:" << (a._seg_lock ? "yes" : "no")
-             << ", _bytes_left_in_segment:" << a._bytes_left_in_segment
-             << ", _base_offset:" << a._base_offset
-             << ", _last_offset:" << a._last_offset
-             << ", _last_term:" << a._last_term
-             << ", _byte_size:" << a._byte_size << "}";
+fmt::iterator disk_log_appender::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{offset_idx:{}, active_segment:{}, _bytes_left_in_segment:{}, "
+      "_base_offset:{}, _last_offset:{}, _last_term:{}, _byte_size:{}}}",
+      _idx,
+      (_seg_lock ? "yes" : "no"),
+      _bytes_left_in_segment,
+      _base_offset,
+      _last_offset,
+      _last_term,
+      _byte_size);
 }
 } // namespace storage

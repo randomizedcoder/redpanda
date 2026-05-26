@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cloud_roles/logger.h"
 #include "cloud_roles/probe.h"
 #include "cloud_roles/types.h"
@@ -18,7 +19,6 @@
 #include "model/metadata.h"
 
 #include <seastar/core/future.hh>
-#include <seastar/util/noncopyable_function.hh>
 
 #include <memory>
 
@@ -39,7 +39,8 @@ public:
           net::unresolved_address address,
           aws_region_name region,
           ss::abort_source& as,
-          retry_params retry_params);
+          retry_params retry_params,
+          ss::sstring metrics_tag = "");
         impl(impl&&) noexcept = default;
 
         impl& operator=(impl&&) noexcept = delete;
@@ -61,7 +62,7 @@ public:
 
         ss::future<> sleep_until_expiry() const;
 
-        virtual std::ostream& print(std::ostream& os) const = 0;
+        virtual fmt::iterator format_to(fmt::iterator it) const = 0;
 
         /// When a retryable error is seen, increment retries and set a small
         /// backoff before attempting to fetch credentials again. If the retries
@@ -125,6 +126,12 @@ public:
         retry_params _retry_params;
         ss::shared_ptr<ss::tls::certificate_credentials> _tls_certs = nullptr;
         mutable std::optional<ss::abort_source> _per_sleep_as;
+
+        /// Identifier of the owning subsystem (e.g. "datalake"). Appended to
+        /// the TLS certificate probe's `detail` label so multiple
+        /// `refresh_credentials` instances using the same credential type
+        /// register distinct metrics.
+        ss::sstring _metrics_tag;
     };
 
     refresh_credentials(
@@ -136,7 +143,9 @@ public:
 
     void start();
 
-    std::ostream& print(std::ostream& os) const { return _impl->print(os); }
+    fmt::iterator format_to(fmt::iterator it) const {
+        return _impl->format_to(it);
+    }
 
     ss::future<api_response> fetch_credentials() {
         return _impl->fetch_credentials();
@@ -176,8 +185,6 @@ private:
     std::unique_ptr<auth_refresh_probe> _probe;
 };
 
-std::ostream& operator<<(std::ostream& os, const refresh_credentials& rc);
-
 static constexpr retry_params default_retry_params{
   .backoff_ms = std::chrono::milliseconds{500}, .max_retries = 8};
 
@@ -188,6 +195,7 @@ refresh_credentials make_refresh_credentials(
   aws_service_name service,
   aws_region_name region,
   std::optional<net::unresolved_address> endpoint = std::nullopt,
+  std::optional<ss::sstring> host_override = std::nullopt,
   retry_params retry_params = default_retry_params,
   ss::sstring metrics_tag = "") {
     ss::sstring host = {
@@ -196,16 +204,13 @@ refresh_credentials make_refresh_credentials(
     if (endpoint) {
         host = endpoint->host();
     }
-    if (auto cfg_host
-        = config::shard_local_cfg().cloud_storage_credentials_host();
-        cfg_host.has_value()) {
+    if (host_override.has_value()) {
         vlog(
           clrl_log.info,
-          "overriding default cloud roles credentials host {} with {} set "
-          "in configuration.",
+          "applying cloud roles credentials host override: {} -> {}.",
           host,
-          cfg_host.value());
-        host = cfg_host.value();
+          host_override.value());
+        host = host_override.value();
     }
     auto port = endpoint ? endpoint->port() : CredentialsProvider::default_port;
     auto impl = std::make_unique<CredentialsProvider>(
@@ -213,7 +218,8 @@ refresh_credentials make_refresh_credentials(
       service,
       region,
       as,
-      retry_params);
+      retry_params,
+      metrics_tag);
     return refresh_credentials{
       std::move(impl),
       as,
@@ -231,6 +237,7 @@ refresh_credentials make_refresh_credentials(
   aws_service_name service,
   aws_region_name region,
   std::optional<net::unresolved_address> endpoint = std::nullopt,
+  std::optional<ss::sstring> host_override = std::nullopt,
   retry_params retry_params = default_retry_params,
   ss::sstring metrics_tag = "");
 

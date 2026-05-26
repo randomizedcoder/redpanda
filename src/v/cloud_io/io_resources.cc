@@ -110,7 +110,7 @@ throughput_limit get_hard_throughput_limit() {
     auto hard_limit = config::shard_local_cfg()
                         .cloud_storage_max_throughput_per_shard()
                         .value_or(0)
-                      * ss::smp::count;
+                      * ss::this_smp_shard_count();
 
     if (hard_limit == 0) {
         // Run tiered-storage without throttling by setting
@@ -120,7 +120,8 @@ throughput_limit get_hard_throughput_limit() {
 
     return {
       .disk_node_throughput_limit = hard_limit,
-      .download_shard_throughput_limit = hard_limit / ss::smp::count,
+      .download_shard_throughput_limit = hard_limit
+                                         / ss::this_smp_shard_count(),
     };
 }
 
@@ -128,14 +129,12 @@ throughput_limit get_throughput_limit(std::optional<size_t> device_throughput) {
     auto hard_limit = config::shard_local_cfg()
                         .cloud_storage_max_throughput_per_shard()
                         .value_or(0)
-                      * ss::smp::count;
+                      * ss::this_smp_shard_count();
+    auto percent = config::shard_local_cfg()
+                     .cloud_storage_throughput_limit_percent()
+                     .value_or(0);
 
-    if (
-      config::shard_local_cfg()
-          .cloud_storage_throughput_limit_percent()
-          .value_or(0)
-        == 0
-      || hard_limit == 0) {
+    if (percent == 0 || hard_limit == 0) {
         // Run tiered-storage without throttling by setting
         // 'cloud_storage_throughput_limit_percent' to nullopt or
         // 'cloud_storage_max_throughput_per_shard' to nullopt
@@ -149,14 +148,17 @@ throughput_limit get_throughput_limit(std::optional<size_t> device_throughput) {
         // is set we still need to limit network bandwidth even though
         // the limit is overly high.
         return throughput_limit{
-          .download_shard_throughput_limit = hard_limit / ss::smp::count,
+          .download_shard_throughput_limit = hard_limit
+                                             / ss::this_smp_shard_count(),
         };
     }
 
-    auto tp = std::min(hard_limit, device_throughput.value());
+    auto scaled_device_throughput = muldiv(
+      device_throughput.value(), percent, 100);
+    auto tp = std::min(hard_limit, scaled_device_throughput);
     return {
       .disk_node_throughput_limit = tp,
-      .download_shard_throughput_limit = tp / ss::smp::count,
+      .download_shard_throughput_limit = tp / ss::this_smp_shard_count(),
     };
 }
 
@@ -170,17 +172,10 @@ ss::future<std::optional<device_throughput>> get_storage_device_throughput() {
         auto fs = co_await ss::file_stat(cache_path);
         auto& queue = ss::engine().get_io_queue(fs.device_id);
         auto cfg = queue.get_config();
-        auto percent = config::shard_local_cfg()
-                         .cloud_storage_throughput_limit_percent()
-                         .value_or(0);
-        if (percent > 0) {
-            // percent == nullopt indicates that the throttling is disabled
-            // intentionally
-            co_return device_throughput{
-              .read = muldiv(cfg.read_bytes_rate, percent, 100),
-              .write = muldiv(cfg.write_bytes_rate, percent, 100),
-            };
-        }
+        co_return device_throughput{
+          .read = cfg.read_bytes_rate,
+          .write = cfg.write_bytes_rate,
+        };
     } catch (...) {
         vlog(
           log.info,
@@ -239,6 +234,8 @@ ss::future<> io_resources::set_disk_max_bandwidth(size_t tput) {
     try {
         if (tput == 0 || tput == std::numeric_limits<size_t>::max()) {
             _throttling_disabled = true;
+            co_await _scheduling_group.update_io_bandwidth(
+              effectively_unlimited_bw);
             vlog(
               log.info,
               "Scheduling group's {} bandwidth is not limited",
@@ -295,6 +292,7 @@ ss::input_stream<char> io_resources::throttle_download(
 }
 
 ss::future<> io_resources::update_throughput() {
+    auto units = co_await _update_lock.get_units();
     auto tp = get_throughput_limit(_device_throughput);
     if (ss::this_shard_id() == 0) {
         co_await set_disk_max_bandwidth(tp.disk_node_throughput_limit);

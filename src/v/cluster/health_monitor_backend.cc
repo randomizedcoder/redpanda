@@ -12,8 +12,11 @@
 
 #include "absl/container/node_hash_map.h"
 #include "absl/container/node_hash_set.h"
+#include "base/format_to.h"
+#include "cloud_topics/level_zero/stm/ctp_stm.h"
 #include "cluster/cloud_storage_size_reducer.h"
 #include "cluster/controller_service.h"
+#include "cluster/drain_manager.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
 #include "cluster/health_monitor_types.h"
@@ -35,19 +38,14 @@
 #include "rpc/types.h"
 #include "ssx/async_algorithm.h"
 
-#include <seastar/core/chunked_fifo.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/sleep.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/util/log.hh>
 
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <chrono>
@@ -305,8 +303,7 @@ public:
     constexpr underlying operator()() const { return _value; };
 
     friend constexpr bool
-    operator==(const partition_risk&, const partition_risk&)
-      = default;
+    operator==(const partition_risk&, const partition_risk&) = default;
 
     friend constexpr partition_risk
     operator&(const partition_risk x, const partition_risk y) {
@@ -324,7 +321,7 @@ public:
         return x;
     }
     constexpr explicit operator bool() const;
-    friend std::ostream& operator<<(std::ostream&, const partition_risk&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct partition_risk::c {
@@ -335,24 +332,22 @@ struct partition_risk::c {
 constexpr partition_risk::operator bool() const {
     return *this != partition_risk::c::no_risk;
 }
-
-std::ostream& operator<<(std::ostream& o, const partition_risk& r) {
+fmt::iterator partition_risk::format_to(fmt::iterator it) const {
     std::vector<std::string_view> parts;
-    if (r & cluster::partition_risk::c::rf1_offline) {
+    if (*this & cluster::partition_risk::c::rf1_offline) {
         parts.emplace_back("rf1_offline");
     }
-    if (r & cluster::partition_risk::c::full_acks_produce_unavailable) {
+    if (*this & cluster::partition_risk::c::full_acks_produce_unavailable) {
         parts.emplace_back("full_acks_produce_unavailable");
     }
-    if (r & cluster::partition_risk::c::unavailable) {
+    if (*this & cluster::partition_risk::c::unavailable) {
         parts.emplace_back("unavailable");
     }
-    if (r & cluster::partition_risk::c::acks1_data_loss) {
+    if (*this & cluster::partition_risk::c::acks1_data_loss) {
         parts.emplace_back("acks1_data_loss");
     }
 
-    fmt::print(o, "{{{}}}", fmt::join(parts, ", "));
-    return o;
+    return fmt::format_to(it, "{{{}}}", fmt::join(parts, ", "));
 }
 
 void record_risks_in_report(
@@ -617,7 +612,9 @@ health_monitor_backend::get_current_node_in_sync_replicas_share(
         const followers_stats& fs,
         const model::topic_namespace&,
         model::partition_id) {
-          if (std::ranges::count(fs.out_of_sync, _self)) {
+          if (
+            std::ranges::contains(fs.out_of_sync, _self)
+            || std::ranges::contains(fs.down, _self)) {
               ++out_of_sync_replicas;
           } else {
               ++in_sync_replicas;
@@ -961,8 +958,11 @@ partition_status build_partition_status(const partition& p) {
     status.revision_id = p.get_revision_id();
     status.size_bytes = p.size_bytes() + p.non_log_disk_size_bytes();
     status.reclaimable_size_bytes = p.reclaimable_size_bytes();
-    status.cloud_topic_max_gc_eligible_epoch
-      = p.cloud_topic_max_gc_eligible_epoch();
+    auto ctp_stm = p.raft()->stm_manager()->get<cloud_topics::ctp_stm>();
+    if (ctp_stm) {
+        status.cloud_topic_max_gc_eligible_epoch
+          = ctp_stm->estimate_inactive_epoch();
+    }
     status.shard = ss::this_shard_id();
 
     if (p.ntp().ns == model::kafka_namespace && p.started()) {
@@ -1084,7 +1084,7 @@ std::chrono::milliseconds health_monitor_backend::max_metadata_age() {
     return config::shard_local_cfg().health_monitor_max_metadata_age();
 }
 
-ss::future<result<std::optional<cluster::drain_manager::drain_status>>>
+ss::future<result<std::optional<cluster::drain_status>>>
 health_monitor_backend::get_node_drain_status(
   model::node_id node_id, model::timeout_clock::time_point deadline) {
     if (node_id == _self) {
@@ -1122,7 +1122,7 @@ bool is_partition_offline(
 ss::future<> health_monitor_backend::fill_aggregate_with_offline_partitions(
   const std::vector<model::node_id>& offline_nodes,
   aggregated_report& aggr_report) {
-    size_t retries_left = 5;
+    uint8_t retries_left = 5;
 
     ssx::async_counter counter;
     while (retries_left > 0) {
@@ -1132,12 +1132,17 @@ ss::future<> health_monitor_backend::fill_aggregate_with_offline_partitions(
                  ++it) {
                 const auto& topic = it->first;
                 const auto& assignment_set = it->second.get_assignments();
-                co_await ssx::async_for_each_counter(
+                auto inner_it = assignment_set.begin();
+                auto inner_end = assignment_set.end();
+                co_await ssx::async_while_counter(
                   counter,
-                  assignment_set,
-                  [&offline_nodes, &aggr_report, &topic, &it](
-                    const auto& p_as) {
+                  [&it, &inner_it, &inner_end] {
                       it.check();
+                      return inner_it != inner_end;
+                  },
+                  [&inner_it, &offline_nodes, &aggr_report, &topic] {
+                      const auto& p_as = *inner_it;
+                      ++inner_it;
                       if (!is_partition_offline(p_as.second, offline_nodes)) {
                           return;
                       }
@@ -1151,7 +1156,6 @@ ss::future<> health_monitor_backend::fill_aggregate_with_offline_partitions(
                         model::ntp(topic.ns, topic.tp, p_as.first));
                   });
             }
-            // success, return from the function
             co_return;
         } catch (const iterator_stability_violation&) {
             --retries_left;

@@ -11,9 +11,10 @@
 #pragma once
 
 #include "cloud_topics/level_one/common/file_io.h"
-#include "cloud_topics/level_one/compaction/scheduler.h"
 #include "cloud_topics/level_one/domain/domain_supervisor.h"
+#include "cloud_topics/level_one/frontend_reader/l1_reader_cache.h"
 #include "cloud_topics/level_one/frontend_reader/level_one_reader_probe.h"
+#include "cloud_topics/level_one/maintenance/scheduler.h"
 #include "cloud_topics/level_one/metastore/leader_router.h"
 #include "cloud_topics/level_one/metastore/replicated_metastore.h"
 #include "cloud_topics/level_zero/cluster_services_impl/cluster_services.h"
@@ -38,7 +39,8 @@ class api;
 namespace cloud_topics {
 class data_plane_api;
 class cloud_topics_manager;
-class level_zero_gc;
+template<class>
+class level_zero_gc_t;
 class housekeeper_manager;
 class topic_manifest_upload_manager;
 
@@ -46,6 +48,11 @@ namespace l1 {
 class flush_loop_manager;
 class topic_purger_manager;
 } // namespace l1
+
+namespace read_replica {
+class snapshot_manager;
+class metadata_manager;
+} // namespace read_replica
 
 class app : public ssx::sharded_service_container {
 public:
@@ -82,7 +89,7 @@ public:
     ss::sharded<reconciler::reconciler<>>* get_reconciler();
     ss::sharded<l1::replicated_metastore>* get_sharded_replicated_metastore();
     l1::compaction_scheduler* get_compaction_scheduler();
-    ss::sharded<level_zero_gc>* get_level_zero_gc();
+    ss::sharded<level_zero_gc_t<ss::lowres_clock>>* get_level_zero_gc();
     cluster_services& get_local_cluster_services();
 
     // TODO: add 'get_control_plane_api' etc
@@ -95,6 +102,7 @@ private:
 
     ss::sstring _logger_name;
     ss::sharded<level_one_reader_probe> _l1_reader_probe;
+    ss::sharded<l1_reader_cache> _l1_reader_cache;
     std::unique_ptr<data_plane_api> data_plane;
     ss::sharded<state_accessors> state;
     ss::sharded<l1::file_io> l1_io;
@@ -105,11 +113,15 @@ private:
     ss::sharded<l1::topic_purger_manager> topic_purge_manager;
     ss::sharded<l1::flush_loop_manager> flush_loop_manager;
     ss::sharded<cloud_topics_manager> manager;
-    ss::sharded<level_zero_gc> l0_gc;
+    ss::sharded<level_zero_gc_t<ss::lowres_clock>> l0_gc;
     ss::sharded<housekeeper_manager> housekeeper_manager;
     ss::sharded<topic_manifest_upload_manager> topic_manifest_upload_mgr;
     std::unique_ptr<l1::compaction_scheduler> compaction_scheduler;
     ss::sharded<l0::cluster_services> cluster_services;
+
+    // Read replica components
+    ss::sharded<read_replica::snapshot_manager> rr_snapshot_manager_;
+    ss::sharded<read_replica::metadata_manager> rr_metadata_manager_;
 };
 
 } // namespace cloud_topics

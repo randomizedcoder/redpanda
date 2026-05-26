@@ -12,11 +12,9 @@
 
 #include "cloud_roles/types.h"
 #include "cloud_storage_clients/configuration.h"
-#include "cloud_storage_clients/types.h"
 #include "config/configuration.h"
 #include "datalake/logger.h"
 #include "hashing/secure.h"
-#include "net/types.h"
 
 namespace datalake {
 
@@ -237,7 +235,9 @@ void credential_manager::start_auth_refresh_if_needed() {
 
     auto config_source
       = cloud_storage_clients::build_refresh_credentials_source(
-        *client_config, cfg.cloud_storage_credentials_source);
+        *client_config,
+        get_credentials_source(cfg),
+        cfg.iceberg_rest_catalog_credentials_host());
 
     auth_refresh_bg_op_.emplace(
       datalake_log,

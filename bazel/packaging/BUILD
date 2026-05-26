@@ -1,11 +1,21 @@
 load("@rules_go//go:def.bzl", "go_binary", "go_library")
 load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
-load(":packaging.bzl", "native_package", "redpanda_deb_package", "redpanda_package")
+load(":packaging.bzl", "redpanda_deb_package", "redpanda_package", "script_package")
 
 # this is the real binary. the rpk alias at the root //:rpk is a wrapper.
 alias(
     name = "rpk",
     actual = "//src/go/rpk/cmd/rpk:rpk",
+)
+
+# Sysroot libs and loader shipped alongside packaged binaries, selected per
+# target arch from the sysroot repos defined in //bazel:repositories.bzl.
+alias(
+    name = "sysroot_runtime",
+    actual = select({
+        "@platforms//cpu:x86_64": "@x86_64_sysroot_runtime//:runtime",
+        "@platforms//cpu:aarch64": "@aarch64_sysroot_runtime//:runtime",
+    }),
 )
 
 redpanda_package(
@@ -16,6 +26,7 @@ redpanda_package(
     redpanda_binary = "//:redpanda",
     rpath_override = "$ORIGIN/../lib",
     rpk_binary = ":rpk",
+    sysroot_runtime = ":sysroot_runtime",
 )
 
 redpanda_package(
@@ -31,6 +42,7 @@ redpanda_package(
     redpanda_binary = "//:redpanda",
     rpath_override = "$ORIGIN/../lib",
     rpk_binary = ":rpk",
+    sysroot_runtime = ":sysroot_runtime",
 )
 
 # This is "bazel-dir" packaging mode used for local DT tests.
@@ -44,6 +56,7 @@ redpanda_package(
     redpanda_binary = "//:redpanda",
     rpath_override = "$ORIGIN/../lib",
     rpk_binary = ":rpk",
+    sysroot_runtime = ":sysroot_runtime",
 )
 
 # This is the ID for the nonroot user in the distroless containers.
@@ -77,6 +90,7 @@ redpanda_deb_package(
     preinst = "scripts/redpanda.preinst",
     prerm = "scripts/redpanda.prerm",
     redpanda_binary = "//:redpanda",
+    sysroot_runtime = ":sysroot_runtime",
     systemd_service = "scripts/redpanda.service",
     systemd_slice = "scripts/redpanda.slice",
 )
@@ -116,22 +130,12 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-native_package(
-    name = "direct_consumer_verifier_ducktape",
-    out = "direct_consumer_verifier_ducktape",
-    cc_binaries = [
-        "//src/v/kafka/client/direct_consumer/verifier:direct_consumer_verifier",
-    ],
-    install_path = "/opt/redpanda_installs/direct_consumer_verifier",
-)
-
-native_package(
-    name = "direct_consumer_verifier_tar",
-    out = "direct_consumer_verifier.tar.gz",
-    cc_binaries = [
-        "//src/v/kafka/client/direct_consumer/verifier:direct_consumer_verifier",
-    ],
-    install_path = "/opt/redpanda_installs/direct_consumer_verifier",
+script_package(
+    name = "controller_forced_reconfiguration_ducktape",
+    out = "controller_forced_reconfiguration_ducktape",
+    scripts = {
+        "//tools/controller_forced_reconfiguration:invoke_controller_reconfiguration.py": "invoke_controller_reconfiguration",
+    },
 )
 
 # NOTE: this image is currently experimental, don't use this for production.

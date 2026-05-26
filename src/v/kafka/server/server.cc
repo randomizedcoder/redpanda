@@ -17,17 +17,16 @@
 #include "cluster/security_frontend.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/tx_gateway_frontend.h"
-#include "cluster_link/model/filter_utils.h"
 #include "config/broker_authn_endpoint.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
 #include "config/sasl_mechanisms.h"
 #include "container/chunked_hash_map.h"
+#include "container/chunked_vector.h"
 #include "features/enterprise_feature_messages.h"
 #include "features/feature_table.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/offset_fetch.h"
-#include "kafka/protocol/produce.h"
 #include "kafka/protocol/schemata/list_groups_response.h"
 #include "kafka/server/connection_context.h"
 #include "kafka/server/coordinator_ntp_mapper.h"
@@ -68,10 +67,7 @@
 #include "random/generators.h"
 #include "security/acl.h"
 #include "security/audit/schemas/iam.h"
-#include "security/audit/schemas/utils.h"
-#include "security/audit/types.h"
 #include "security/errc.h"
-#include "security/exceptions.h"
 #include "security/gssapi_authenticator.h"
 #include "security/mtls.h"
 #include "security/oidc_authenticator.h"
@@ -81,10 +77,7 @@
 #include "ssx/future-util.h"
 #include "ssx/thread_worker.h"
 #include "ssx/when_all.h"
-#include "strings/string_switch.h"
-#include "strings/utf8.h"
 
-#include <seastar/core/byteorder.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/sharded.hh>
@@ -100,7 +93,6 @@
 #include <chrono>
 #include <exception>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <ranges>
 #include <vector>
@@ -215,7 +207,8 @@ server::server(
       memory_fetch_sem(),
       [this] -> fetch_memory_units_manager& {
           return container().local().fetch_units_manager();
-      })
+      },
+      config::shard_local_cfg().kafka_max_message_size_upper_limit_bytes.bind())
   , _probe(std::make_unique<class kafka_probe>())
   , _sasl_probe(std::make_unique<class sasl_probe>())
   , _read_dist_probe(std::make_unique<read_distribution_probe>())
@@ -1977,7 +1970,7 @@ ss::future<response_ptr> create_acls_handler::handle(
     result_index.reserve(request.data.creations.size());
 
     // bindings to create. optimized for common case
-    std::vector<security::acl_binding> bindings;
+    chunked_vector<security::acl_binding> bindings;
     bindings.reserve(request.data.creations.size());
 
     for (const auto& acl : request.data.creations) {
@@ -1999,7 +1992,7 @@ ss::future<response_ptr> create_acls_handler::handle(
     // so we have access to the parsed data for auditing.  May result in
     // unecessary cycles if auditing fails or if the operation isn't authorized.
 
-    auto get_bindings = [&bindings] { return bindings; };
+    auto get_bindings = [&bindings] { return bindings.copy(); };
 
     bool authz = ctx.authorized(
       security::acl_operation::alter,
@@ -2399,24 +2392,25 @@ list_transactions_handler::handle(request_context ctx, ss::smp_service_group) {
                        const list_transactions_request& req,
                        const cluster::tx_metadata& tx) -> bool {
         if (!req.data.producer_id_filters.empty()) {
-            if (std::none_of(
-                  req.data.producer_id_filters.begin(),
-                  req.data.producer_id_filters.end(),
-                  [pid = tx.pid.get_id()](const auto& provided_pid) {
-                      return pid == provided_pid;
-                  })) {
+            if (
+              std::none_of(
+                req.data.producer_id_filters.begin(),
+                req.data.producer_id_filters.end(),
+                [pid = tx.pid.get_id()](const auto& provided_pid) {
+                    return pid == provided_pid;
+                })) {
                 return false;
             }
         }
 
         if (!req.data.state_filters.empty()) {
-            if (std::none_of(
-                  req.data.state_filters.begin(),
-                  req.data.state_filters.end(),
-                  [status = tx.get_kafka_status()](
-                    const auto& provided_status) {
-                      return status == provided_status;
-                  })) {
+            if (
+              std::none_of(
+                req.data.state_filters.begin(),
+                req.data.state_filters.end(),
+                [status = tx.get_kafka_status()](const auto& provided_status) {
+                    return status == provided_status;
+                })) {
                 return false;
             }
         }

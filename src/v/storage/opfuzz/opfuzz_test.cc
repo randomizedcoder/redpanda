@@ -9,20 +9,17 @@
 
 #include "model/fundamental.h"
 #include "random/generators.h"
-#include "storage/file_sanitizer.h"
 #include "storage/opfuzz/opfuzz.h"
 #include "storage/tests/storage_test_fixture.h"
 #include "storage/types.h"
-#include "test_utils/test_macros.h"
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 
 #include <seastar/util/defer.hh>
-#include <seastar/util/log.hh>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <iterator>
-#include <optional>
 
 inline model::cleanup_policy_bitflags randcompaction() {
     auto c = model::cleanup_policy_bitflags::compaction;
@@ -65,9 +62,15 @@ TEST_F(storage_test_fixture, test_random_workload) {
               ntp, mngr.config().base_dir, std::move(overrides));
         }
         auto log = mngr.manage(std::move(cfg)).get();
+        log->stm_hookset()->start();
         logs_to_fuzz.emplace_back(
           std::make_unique<storage::opfuzz>(std::move(log), ops_per_ntp));
     }
+    auto stop_stms = ss::defer([&logs_to_fuzz] {
+        for (auto& w : logs_to_fuzz) {
+            w->log()->stm_hookset()->stop();
+        }
+    });
     // Execute NTP workloads in parallel
     ss::parallel_for_each(
       logs_to_fuzz,
@@ -105,6 +108,7 @@ TEST_F(storage_test_fixture, test_random_remove) {
         auto directory = ssx::sformat(
           "{}/{}", mngr.config().base_dir, ntp.path());
         auto log = mngr.manage(storage::ntp_config(ntp, directory)).get();
+        log->stm_hookset()->start();
         logs_to_fuzz.emplace_back(
           std::make_unique<storage::opfuzz>(std::move(log), ops_per_ntp));
     }
@@ -118,6 +122,11 @@ TEST_F(storage_test_fixture, test_random_remove) {
           });
       })
       .get();
+
+    // Stop stm_managers before removing logs
+    for (auto& w : logs_to_fuzz) {
+        w->log()->stm_hookset()->stop();
+    }
 
     std::vector<size_t> random_ntp_removal_sequence;
     std::generate_n(

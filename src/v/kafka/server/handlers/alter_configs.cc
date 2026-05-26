@@ -9,7 +9,6 @@
 
 #include "kafka/server/handlers/alter_configs.h"
 
-#include "absl/container/node_hash_set.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
@@ -27,16 +26,12 @@
 #include "kafka/server/response.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "model/timeout_clock.h"
-#include "pandaproxy/schema_registry/subject_name_strategy.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "strings/string_switch.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/do_with.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/util/log.hh>
-
-#include <fmt/ostream.h>
 
 #include <string_view>
 
@@ -104,7 +99,7 @@ create_topic_properties_update(
     std::apply(apply_op(op_t::none), update.custom_properties.serde_fields());
 
     static_assert(
-      std::tuple_size_v<decltype(update.properties.serde_fields())> == 44,
+      std::tuple_size_v<decltype(update.properties.serde_fields())> == 45,
       "If you add a property, decide on its default alter config "
       "policy, and handle the update in the loop below");
     static_assert(
@@ -148,6 +143,7 @@ create_topic_properties_update(
     update.properties.delete_retention_ms.op = op_t::none;
 
     update.properties.storage_mode.op = op_t::none;
+    update.properties.schema_registry_context.op = op_t::none;
 
     // Now that the defaults are set, continue to set properties from the
     // request
@@ -334,8 +330,9 @@ create_topic_properties_update(
             if (
               config::shard_local_cfg().enable_schema_id_validation()
               != pandaproxy::schema_registry::schema_id_validation_mode::none) {
-                if (schema_id_validation_config_parser(
-                      cfg, kafka::config_resource_operation::set)) {
+                if (
+                  schema_id_validation_config_parser(
+                    cfg, kafka::config_resource_operation::set)) {
                     continue;
                 }
             }
@@ -455,6 +452,30 @@ create_topic_properties_update(
                   });
                 continue;
             }
+            if (cfg.name == topic_property_schema_registry_context) {
+                if (
+                  topic_cfg
+                  && topic_cfg->properties.iceberg_mode
+                       != model::iceberg_mode::disabled) {
+                    return make_error_alter_config_resource_response<
+                      alter_configs_resource_response>(
+                      resource,
+                      error_code::invalid_config,
+                      "Cannot change redpanda.schema.registry.context while "
+                      "Iceberg translation is enabled; set "
+                      "redpanda.iceberg.mode=disabled first");
+                }
+                parse_and_set_property(
+                  tp_ns,
+                  update.properties.schema_registry_context,
+                  cfg.value,
+                  kafka::config_resource_operation::set,
+                  schema_registry_context_validator{},
+                  [](const ss::sstring& s) {
+                      return pandaproxy::schema_registry::context{s};
+                  });
+                continue;
+            }
 
             if (cfg.name == topic_property_min_cleanable_dirty_ratio) {
                 parse_and_set_tristate(
@@ -513,11 +534,30 @@ create_topic_properties_update(
                 continue;
             }
             if (cfg.name == topic_property_redpanda_storage_mode) {
+                auto validator = [current_storage_mode,
+                                  &feature_table = ctx.feature_table().local()](
+                                   const ss::sstring& raw,
+                                   const model::redpanda_storage_mode& value)
+                  -> std::optional<ss::sstring> {
+                    auto transition_err = storage_mode_validator{
+                      current_storage_mode}(raw, value);
+                    if (transition_err) {
+                        return transition_err;
+                    }
+                    if (
+                      value == model::redpanda_storage_mode::tiered_cloud
+                      && !feature_table.is_active(
+                        features::feature::tiered_cloud_topics)) {
+                        return "tiered_cloud storage mode requires the "
+                               "tiered_cloud_topics feature to be enabled";
+                    }
+                    return std::nullopt;
+                };
                 parse_and_set_optional(
                   update.properties.storage_mode,
                   cfg.value,
                   kafka::config_resource_operation::set,
-                  storage_mode_validator{current_storage_mode});
+                  validator);
                 continue;
             }
 

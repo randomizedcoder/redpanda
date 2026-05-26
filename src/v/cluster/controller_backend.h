@@ -13,6 +13,7 @@
 
 #include "absl/container/btree_map.h"
 #include "absl/container/node_hash_map.h"
+#include "base/format_to.h"
 #include "base/outcome.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
@@ -232,8 +233,7 @@ public:
         uint64_t retries = 0;
         cluster::errc last_error = errc::success;
 
-        friend std::ostream&
-        operator<<(std::ostream&, const in_progress_operation&);
+        fmt::iterator format_to(fmt::iterator it) const;
     };
 
     std::optional<in_progress_operation>
@@ -242,8 +242,8 @@ public:
     void notify_reconciliation(const model::ntp&);
 
     /// Copy partition kvstore data from an extra shard (i.e. kvstore shard that
-    /// is >= ss::smp::count). This method is expected to be called *before*
-    /// start().
+    /// is >= ss::this_smp_shard_count()). This method is expected to be called
+    /// *before* start().
     ss::future<> transfer_partitions_from_extra_shard(
       storage::kvstore&, shard_placement_table&);
 

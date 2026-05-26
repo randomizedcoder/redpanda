@@ -12,9 +12,11 @@ import io
 import json
 import random
 import socket
+import sys
 import time
 import zipfile
 from typing import Optional
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import requests
@@ -22,8 +24,10 @@ from ducktape.cluster.cluster import ClusterNode
 from ducktape.mark import matrix
 from ducktape.services.service import Service
 from ducktape.utils.util import wait_until
+from keycloak import KeycloakOpenID
 
 from rptest.clients.rpk import RpkTool
+from rptest.services.rpk_producer import RpkProducer
 from rptest.services.admin import (
     Admin,
     DebugBundleLabelSelection,
@@ -31,6 +35,7 @@ from rptest.services.admin import (
     DebugBundleStartConfigParams,
 )
 from rptest.services.cluster import cluster
+from rptest.services.keycloak import DEFAULT_REALM, KeycloakService
 from rptest.services.redpanda import (
     LoggingConfig,
     MetricSamples,
@@ -39,10 +44,12 @@ from rptest.services.redpanda import (
     SecurityConfig,
     TLSProvider,
 )
-from rptest.services.redpanda_types import SaslCredentials
+from rptest.services.redpanda_types import OAuthBearerCredentials, SaslCredentials
 from rptest.services.tls import Certificate, CertificateAuthority, TLSCertManager
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import wait_until_result
+
+_OIDC_TOKEN_AUDIENCE = "account"
 
 
 class DebugBundleErrorCode:
@@ -598,6 +605,90 @@ class DebugBundleTest(DebugBundleTestBase):
             f"Failed to find {search_str}"
         )
 
+    @cluster(num_nodes=2)
+    def test_proc_file_sampling(self):
+        """
+        Verify that /proc/interrupts, /proc/softirqs, and /proc/diskstats
+        are captured as N-sample snapshots under proc/<name>/t{N}.txt.
+        Other /proc files stay at their flat legacy paths, and metrics
+        samples appear at the same cadence.
+        """
+        node = random.choice(self.redpanda.started_nodes())
+        samples = 2
+
+        # /proc/diskstats only ticks when a block device sees I/O. Run
+        # a kafka producer against redpanda for the whole bundle
+        # duration so that redpanda keeps writing to its data dir, which
+        # guarantees diskstats activity in the t0/t1 sampling window.
+        probe_topic = "rptest_diskstats_probe"
+        RpkTool(self.redpanda).create_topic(probe_topic, partitions=1, replicas=1)
+        producer = RpkProducer(
+            self.test_context,
+            self.redpanda,
+            probe_topic,
+            msg_size=1024,
+            msg_count=sys.maxsize,
+            acks=-1,
+        )
+        producer.start()
+
+        try:
+            job_id = uuid4()
+            self._run_debug_bundle(
+                job_id=job_id,
+                node=node,
+                config=DebugBundleStartConfigParams(
+                    metrics_samples=samples,
+                    metrics_interval_seconds=1,
+                ),
+            )
+            zip_bytes = self._retrieve_file(node=node)
+        finally:
+            producer.stop()
+            producer.wait()
+            producer.free()
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            names = zf.namelist()
+            self.logger.debug(f"zip entries: {names}")
+
+            # Strip the single top-level bundle-root directory from each entry.
+            entries = {n.split("/", 1)[1]: n for n in names if "/" in n}
+
+            # All three must change between t0 and t1:
+            #   - interrupts: timer IRQs tick continuously
+            #   - softirqs:   TIMER softirqs tick continuously
+            #   - diskstats:  guaranteed by the producer running above
+            for proc_name in ("interrupts", "softirqs", "diskstats"):
+                contents = []
+                for n in range(samples):
+                    path = f"proc/{proc_name}/t{n}.txt"
+                    assert path in entries, (
+                        f"Expected {path} in bundle; got {sorted(entries)}"
+                    )
+                    with zf.open(entries[path]) as f:
+                        data = f.read()
+                    assert data, f"Expected {path} to be non-empty"
+                    contents.append(data)
+                assert contents[0] != contents[-1], (
+                    f"Expected proc/{proc_name} to change between t0 and "
+                    f"t{samples - 1}; content was identical"
+                )
+
+            for flat in ("proc/cpuinfo", "proc/cmdline", "proc/mounts"):
+                assert flat in entries, (
+                    f"Expected legacy flat path {flat}; got {sorted(entries)}"
+                )
+
+            for n in range(samples):
+                metric_samples = [
+                    e for e in entries if e.startswith("metrics/") and f"/t{n}_" in e
+                ]
+                assert len(metric_samples) >= 2, (
+                    f"Expected t{n} samples for both metrics and public_metrics; "
+                    f"got {sorted(metric_samples)}"
+                )
+
 
 class DebugBundleSCRAMAuthn(DebugBundleTestBase):
     """
@@ -734,3 +825,98 @@ class DebugBundleTLS(DebugBundleTestBase):
         )
         content = self._retrieve_file(node=node)
         self._validate_topic_name_in_response(content, self.topic_name, True)
+
+
+class DebugBundleOAuthBearerAuthn(DebugBundleTestBase):
+    """
+    End-to-end test verifying OAUTHBEARER authentication for the debug bundle.
+
+    The broker receives {mechanism: OAUTHBEARER, token: JWT} in the start
+    request and forwards it as -Xsasl.mechanism=OAUTHBEARER and
+    -Xpass=token:<JWT> to the rpk subprocess. The subprocess uses those
+    credentials to authenticate to Kafka, producing a successful bundle.
+    """
+
+    _CLIENT_ID = "debug-bundle-test"
+    _TOPIC = "oauthbearer_test_topic"
+
+    def __init__(self, context):
+        # Allocate the Keycloak node now so we can derive its hostname for
+        # oidc_discovery_url before creating the Redpanda service.  The node
+        # is not started until setUp() so that self.logger is available for
+        # error handling by then.
+        self.keycloak = KeycloakService(context)
+        kc_node = self.keycloak.nodes[0]
+        kc_discovery_url = self.keycloak.get_discovery_url(kc_node)
+
+        security = SecurityConfig()
+        security.enable_sasl = True
+        security.sasl_mechanisms = ["SCRAM", "OAUTHBEARER"]
+        security.kafka_enable_authorization = False
+        security.endpoint_authn_method = "sasl"
+
+        super().__init__(
+            context,
+            num_brokers=1,
+            security=security,
+            extra_rp_conf={
+                "oidc_discovery_url": kc_discovery_url,
+                "oidc_token_audience": _OIDC_TOKEN_AUDIENCE,
+            },
+        )
+
+        self.super_admin = Admin(self.redpanda)
+        self.rpk = RpkTool(
+            self.redpanda,
+            username=self.redpanda.SUPERUSER_CREDENTIALS.username,
+            password=self.redpanda.SUPERUSER_CREDENTIALS.password,
+            sasl_mechanism=self.redpanda.SUPERUSER_CREDENTIALS.algorithm,
+        )
+
+    def setUp(self):
+        kc_node = self.keycloak.nodes[0]
+        try:
+            self.keycloak.start_node(kc_node)
+        except Exception as e:
+            self.logger.error(f"Keycloak failed to start: {e}")
+            self.keycloak.clean_node(kc_node)
+            raise
+
+        super().setUp()
+
+        self.keycloak.admin.create_client(self._CLIENT_ID)
+        self.oauth_cfg = self.keycloak.generate_oauth_config(kc_node, self._CLIENT_ID)
+        self.rpk.create_topic(self._TOPIC)
+
+    def _get_access_token(self) -> str:
+        cfg = self.oauth_cfg
+        parsed = urlparse(cfg.token_endpoint)
+        openid = KeycloakOpenID(
+            server_url=f"{parsed.scheme}://{parsed.netloc}",
+            client_id=cfg.client_id,
+            client_secret_key=cfg.client_secret,
+            realm_name=DEFAULT_REALM,
+            verify=False,
+        )
+        return openid.token(grant_type="client_credentials")["access_token"]
+
+    @cluster(num_nodes=2)
+    def test_oauthbearer_auth(self):
+        """
+        Verify that the broker correctly forwards the bearer token to the rpk
+        subprocess, which uses OAUTHBEARER to authenticate to Kafka and produce
+        a successful debug bundle containing the expected topic metadata.
+        """
+        node = self.redpanda.started_nodes()[0]
+        token = self._get_access_token()
+
+        job_id = uuid4()
+        config = DebugBundleStartConfigParams(
+            authentication=OAuthBearerCredentials(token=token)
+        )
+        self._run_debug_bundle(
+            job_id=job_id, node=node, config=config, admin=self.super_admin
+        )
+
+        content = self._retrieve_file(node=node, admin=self.super_admin)
+        self._validate_topic_name_in_response(content, self._TOPIC, True)

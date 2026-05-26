@@ -10,18 +10,11 @@
  */
 #include "compaction/key_offset_map.h"
 #include "model/fundamental.h"
-#include "model/record_batch_reader.h"
-#include "storage/compaction_reducers.h"
-#include "storage/lock_manager.h"
-#include "storage/log_reader.h"
 #include "storage/probe.h"
 #include "storage/segment_deduplication_utils.h"
 #include "storage/segment_set.h"
-#include "storage/segment_utils.h"
 #include "storage/tests/batch_generators.h"
 #include "storage/tests/storage_test_fixture.h"
-#include "storage/types.h"
-#include "test_utils/test.h"
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/defer.hh>
@@ -44,17 +37,16 @@ TEST_F(MapBuildingReducerFixtureTest, TestMapIndexing) {
       ntp,
       mgr.config().base_dir,
       std::make_unique<storage::ntp_config::default_overrides>(overrides));
-    auto log = mgr.manage(std::move(ntp_cfg)).get();
-    auto disk_log = log;
+    auto log = manage_log(mgr, std::move(ntp_cfg));
 
     // Append some linear kv ints
     int num_appends = 5;
     append_random_batches<linear_int_kv_batch_generator>(log, num_appends);
     log->flush().get();
-    disk_log->force_roll().get();
-    ASSERT_EQ(disk_log->segment_count(), 2);
+    log->force_roll().get();
+    ASSERT_EQ(log->segment_count(), 2);
 
-    auto& segments = disk_log->segments();
+    auto& segments = log->segments();
     auto& seg = segments.front();
 
     static constexpr int64_t max_keys = 4;

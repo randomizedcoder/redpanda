@@ -237,17 +237,18 @@ void set_routes(ss::httpd::routes& r) {
               return "wrong query_parameter";
           }
 
-          if (auto computed_md5base64 =
-                [&] {
-                    auto hash = hash_md5{};
-                    hash.update(req.content);
-                    auto digest = hash.reset();
+          if (
+            auto computed_md5base64 =
+              [&] {
+                  auto hash = hash_md5{};
+                  hash.update(req.content);
+                  auto digest = hash.reset();
 
-                    return bytes_to_base64(
-                      {reinterpret_cast<const uint8_t*>(digest.data()),
-                       digest.size()});
-                }();
-              computed_md5base64 != req.get_header("Content-MD5")) {
+                  return bytes_to_base64(
+                    {reinterpret_cast<const uint8_t*>(digest.data()),
+                     digest.size()});
+              }();
+            computed_md5base64 != req.get_header("Content-MD5")) {
               reply.set_status(reply::status_type::bad_request);
               return fmt::format(
                 "bad Content-MD5, expected:[{}] got:[{}] body:[{}]",
@@ -988,6 +989,8 @@ SEASTAR_THREAD_TEST_CASE(test_parse_delete_object_response_infra_error) {
       &result);
     BOOST_REQUIRE_NE(error, nullptr);
     BOOST_REQUIRE_EQUAL(error->code_string(), "SlowDown");
+    BOOST_REQUIRE_EQUAL(error->message(), "Please reduce your request rate.");
+    BOOST_REQUIRE_EQUAL(error->request_id(), "R123");
 }
 
 SEASTAR_THREAD_TEST_CASE(test_parse_delete_object_response_key_error) {

@@ -11,6 +11,8 @@
 
 #include "compression/gzip_stream_decompression.h"
 
+#include <seastar/coroutine/exception.hh>
+
 namespace compression {
 
 gzip_stream_decompressor::gzip_stream_decompressor(
@@ -22,9 +24,10 @@ void gzip_stream_decompressor::reset() {
     vassert(!_decompression_started, "decompressor initialized twice");
     constexpr auto default_windowbits = 15;
     constexpr auto decode_with_header_detection = 32;
-    if (auto init_res = inflateInit2(
-          &_zs, default_windowbits + decode_with_header_detection);
-        init_res != Z_OK) {
+    if (
+      auto init_res = inflateInit2(
+        &_zs, default_windowbits + decode_with_header_detection);
+      init_res != Z_OK) {
         throw stream_decompression_error{fmt::format(
           "Failed to initialize decompression context: {}", zError(init_res))};
     }
@@ -90,10 +93,11 @@ ss::future<std::optional<iobuf>> gzip_stream_decompressor::next() {
         const auto available = _zs.avail_in;
         const auto out = _zs.avail_out;
 
-        if (auto code = inflate(&_zs, Z_NO_FLUSH);
-            code != Z_OK && code != Z_STREAM_END) {
-            throw stream_decompression_error(
-              fmt::format("Failed to decompress chunk: {}", zError(code)));
+        if (
+          auto code = inflate(&_zs, Z_NO_FLUSH);
+          code != Z_OK && code != Z_STREAM_END) {
+            co_await ss::coroutine::return_exception(stream_decompression_error(
+              fmt::format("Failed to decompress chunk: {}", zError(code))));
         }
 
         // It is possible for the avail_in field not to change, if the

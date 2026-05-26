@@ -60,13 +60,8 @@
 #include "utils/unresolved_address.h"
 
 #include <seastar/core/future.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/timed_out_error.hh>
-#include <seastar/util/log.hh>
-
-#include <fmt/format.h>
 
 #include <chrono>
 #include <cstddef>
@@ -93,7 +88,6 @@ redpanda_thread_fixture::redpanda_thread_fixture(
   bool enable_data_transforms,
   bool enable_legacy_upload_mode,
   bool iceberg_enabled,
-  bool enable_cloud_topics,
   bool development_cluster_linking_enabled,
   cloud_topics::test_fixture_cfg ct_test_cfg)
   : app(ssx::sformat("redpanda-{}", node_id()))
@@ -117,7 +111,6 @@ redpanda_thread_fixture::redpanda_thread_fixture(
       enable_data_transforms,
       enable_legacy_upload_mode,
       iceberg_enabled,
-      enable_cloud_topics,
       development_cluster_linking_enabled);
     try {
         app.initialize(
@@ -133,6 +126,7 @@ redpanda_thread_fixture::redpanda_thread_fixture(
           }),
           audit_log_client_config(kafka_port));
         app.check_environment();
+        app.wire_up_and_start_crypto_services();
         app.wire_up_and_start(*app_signal, true, ct_test_cfg);
     } catch (...) {
         // shutdown half-initialized app nicely so that its destructor doesn't
@@ -210,7 +204,8 @@ redpanda_thread_fixture::redpanda_thread_fixture(
   init_cloud_storage_tag,
   std::optional<uint16_t> port,
   cloud_storage_clients::s3_url_style url_style,
-  model::node_id node_id)
+  model::node_id node_id,
+  cloud_topics::test_fixture_cfg ct_test_cfg)
   : redpanda_thread_fixture(
       node_id,
       9092,
@@ -222,7 +217,14 @@ redpanda_thread_fixture::redpanda_thread_fixture(
       true,
       get_s3_config(port, url_style),
       get_archival_config(),
-      get_cloud_config(port, url_style)) {}
+      get_cloud_config(port, url_style),
+      configure_node_id::yes,
+      empty_seed_starts_cluster::yes,
+      false,
+      true,
+      false,
+      false,
+      ct_test_cfg) {}
 
 // Start redpanda with shadow indexing enabled
 redpanda_thread_fixture::redpanda_thread_fixture(
@@ -248,14 +250,14 @@ redpanda_thread_fixture::redpanda_thread_fixture(
       false,
       true,
       false,
-      true,
       false,
       ct_test_cfg) {}
 
 redpanda_thread_fixture::redpanda_thread_fixture(
   init_cloud_storage_no_archiver_tag,
   std::optional<uint16_t> port,
-  cloud_storage_clients::s3_url_style url_style)
+  cloud_storage_clients::s3_url_style url_style,
+  cloud_topics::test_fixture_cfg ct_test_cfg)
   : redpanda_thread_fixture(
       model::node_id(1),
       9092,
@@ -267,7 +269,14 @@ redpanda_thread_fixture::redpanda_thread_fixture(
       true,
       get_s3_config(port, url_style),
       get_archival_config(),
-      std::nullopt) {}
+      std::nullopt,
+      configure_node_id::yes,
+      empty_seed_starts_cluster::yes,
+      false,
+      true,
+      false,
+      false,
+      ct_test_cfg) {}
 
 redpanda_thread_fixture::~redpanda_thread_fixture() {
     shutdown();
@@ -338,6 +347,7 @@ void redpanda_thread_fixture::restart(should_wipe w) {
     }).get();
     app.initialize(proxy_config(), proxy_client_config());
     app.check_environment();
+    app.wire_up_and_start_crypto_services();
     app.wire_up_and_start(*app_signal, true, ct_test_cfg);
 }
 
@@ -354,7 +364,6 @@ void redpanda_thread_fixture::configure(
   bool data_transforms_enabled,
   bool legacy_upload_mode_enabled,
   bool iceberg_enabled,
-  bool cloud_topics_enabled,
   bool development_cluster_linking_enabled) {
     auto base_path = std::filesystem::path(data_dir);
     ss::smp::invoke_on_all([=]() {
@@ -451,11 +460,6 @@ void redpanda_thread_fixture::configure(
         config.get("cloud_storage_disable_archiver_manager")
           .set_value(legacy_upload_mode_enabled);
         config.get("iceberg_enabled").set_value(iceberg_enabled);
-
-        if (cloud_topics_enabled) {
-            config.get(config::shard_local_cfg().cloud_topics_enabled.name())
-              .set_value(true);
-        }
 
         config.get("enable_shadow_linking")
           .set_value(development_cluster_linking_enabled);
@@ -651,20 +655,42 @@ redpanda_thread_fixture::delete_topic(model::topic_namespace tp_ns) {
       });
 }
 
-ss::future<> redpanda_thread_fixture::wait_for_partition_offset(
-  model::ntp ntp, model::offset o, model::timeout_clock::duration tout) {
+namespace {
+ss::future<> do_wait_for_partition_offset(
+  application& app,
+  model::ntp ntp,
+  model::offset o,
+  model::timeout_clock::duration tout,
+  bool wait_lso) {
     RPTEST_REQUIRE_EVENTUALLY_CORO(
-      tout, [this, ntp = std::move(ntp), o]() mutable {
+      tout, [&app, ntp = std::move(ntp), o, wait_lso]() mutable {
           auto shard = app.shard_table.local().shard_for(ntp);
           if (!shard) {
               return ss::make_ready_future<bool>(false);
           }
           return app.partition_manager.invoke_on(
-            *shard, [ntp, o](cluster::partition_manager& mgr) {
+            *shard, [ntp, o, wait_lso](cluster::partition_manager& mgr) {
                 auto partition = mgr.get(ntp);
-                return partition && partition->committed_offset() >= o;
+                if (!partition) {
+                    return false;
+                }
+                return wait_lso ? partition->last_stable_offset() >= o
+                                : partition->committed_offset() >= o;
             });
       });
+}
+} // namespace
+
+ss::future<> redpanda_thread_fixture::wait_for_committed_offset(
+  model::ntp ntp, model::offset o, model::timeout_clock::duration tout) {
+    return do_wait_for_partition_offset(
+      app, std::move(ntp), o, tout, /*wait_lso=*/false);
+}
+
+ss::future<> redpanda_thread_fixture::wait_for_lso(
+  model::ntp ntp, model::offset o, model::timeout_clock::duration tout) {
+    return do_wait_for_partition_offset(
+      app, std::move(ntp), o, tout, /*wait_lso=*/true);
 }
 
 ss::future<model::offset>

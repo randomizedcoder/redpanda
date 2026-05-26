@@ -73,18 +73,31 @@ null_order null_order_from_str(std::string_view s) {
       .match(null_order_to_str(null_order::nulls_last), null_order::nulls_last);
 }
 
+nested_field::id_t
+parse_source_id(const json::Value& v, std::string_view field_name) {
+    if (!v.IsInt()) {
+        throw std::invalid_argument(
+          fmt::format("Expected {} to be int: {}", field_name, v.GetType()));
+    }
+    return nested_field::id_t{v.GetInt()};
+}
+
 } // namespace
 
 sort_field parse_sort_field(const json::Value& v) {
     const auto& transform_str = parse_required_str(v, "transform");
     chunked_vector<nested_field::id_t> source_ids;
-    for (const auto& id_json : parse_required_array(v, "source-ids")) {
-        if (!id_json.IsInt()) {
-            throw std::invalid_argument(
-              fmt::format(
-                "Expected source-ids to be ints: {}", id_json.GetType()));
+    // The spec allows for either a single "source-id" or an array of
+    // "source-ids" for backwards compatibility with older spec versions. Handle
+    // both cases.
+    if (
+      const auto id_json = parse_optional(v, "source-id");
+      id_json.has_value()) {
+        source_ids.emplace_back(parse_source_id(id_json->get(), "source-id"));
+    } else {
+        for (const auto& id : parse_required_array(v, "source-ids")) {
+            source_ids.emplace_back(parse_source_id(id, "source-ids"));
         }
-        source_ids.emplace_back(nested_field::id_t{id_json.GetInt()});
     }
     auto direction = parse_required_str(v, "direction");
     auto null_order = parse_required_str(v, "null-order");
@@ -245,7 +258,7 @@ void rjson_serialize(
     w.Key("format-version");
     w.Int(iceberg::format_version_to_int(m.format_version));
     w.Key("table-uuid");
-    w.String(fmt::to_string(m.table_uuid));
+    w.String(fmt::format("{}", m.table_uuid));
     w.Key("location");
     w.String(m.location());
     w.Key("last-sequence-number");

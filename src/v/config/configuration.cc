@@ -13,7 +13,6 @@
 #include "cluster/scheduling/topic_memory_per_partition_default.h"
 #include "config/base_property.h"
 #include "config/bounded_property.h"
-#include "config/node_config.h"
 #include "config/sasl_mechanisms.h"
 #include "config/types.h"
 #include "config/validators.h"
@@ -707,6 +706,19 @@ configuration::configuration()
       "if it means returning less bytes in the fetch than are available.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       5s)
+  , enable_listoffsets_historical_leader_epoch(
+      *this,
+      "enable_listoffsets_historical_leader_epoch",
+      "When enabled, the Kafka ListOffsets API returns the historical "
+      "(record-time) leader epoch instead of the current leader epoch. "
+      "Intended as a one-way opt-in: disabling after it has been enabled "
+      "regresses to the original bug. "
+      "Gated as a development feature: not all response paths are fixed "
+      "yet (CORE-12505), so enabling this property produces internally "
+      "inconsistent epoch values across paths and must not be enabled in "
+      "production.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , fetch_read_strategy(
       *this,
       "fetch_read_strategy",
@@ -886,6 +898,14 @@ configuration::configuration()
       "Use separate scheduler group to handle parsing Kafka protocol requests",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       true)
+  , kafka_handler_latency_all(
+      *this,
+      "kafka_handler_latency_all",
+      "Enable latency histograms for all Kafka API handlers. When disabled, "
+      "only important handlers (produce, fetch, metadata, api_versions, "
+      "offset_commit) have latency histograms.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      false)
   , kafka_tcp_keepalive_idle_timeout_seconds(
       *this,
       "kafka_tcp_keepalive_timeout",
@@ -949,14 +969,9 @@ configuration::configuration()
       "Maximum number of active producer sessions per shard. Each shard "
       "tracks producer IDs using an LRU (Least Recently Used) eviction "
       "policy. When the configured limit is exceeded, the least recently "
-      "used producer IDs are evicted from the cache. IMPORTANT: The default "
-      "value is unlimited, which can lead to unbounded memory growth and "
-      "out-of-memory (OOM) crashes in production environments with heavy "
-      "producer usage, especially when using transactions or idempotent "
-      "producers. It is strongly recommended to set a reasonable limit in "
-      "production deployments.",
+      "used producer IDs are evicted from the cache.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      std::numeric_limits<uint64_t>::max(),
+      100000,
       {.min = 1})
   , max_transactions_per_coordinator(
       *this,
@@ -968,7 +983,7 @@ configuration::configuration()
       "invalid producer epoch or invalid_producer_id_mapping error (depends on "
       "the transaction execution phase).",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
-      std::numeric_limits<uint64_t>::max(),
+      10000,
       {.min = 1})
   , enable_idempotence(
       *this,
@@ -1123,8 +1138,7 @@ configuration::configuration()
       "allows compaction.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       true,
-      property<bool>::noop_validator,
-      legacy_default<bool>(false, legacy_version{17}))
+      property<bool>::noop_validator)
   , retention_bytes(
       *this,
       "retention_bytes",
@@ -1998,6 +2012,14 @@ configuration::configuration()
       "produce audit log messages using a Kafka client instead.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
       true)
+  , schema_registry_use_rpc(
+      *this,
+      "schema_registry_use_rpc",
+      "Use internal Redpanda RPCs for schema registry internal topic I/O. "
+      "When disabled, use a Kafka client for schema registry internal topic "
+      "I/O instead.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      true)
   , cloud_storage_enabled(
       *this,
       true,
@@ -2418,9 +2440,20 @@ configuration::configuration()
       "The per-partition limit for the number of segments pending deletion "
       "from the cloud. Segments can be deleted due to retention or compaction. "
       "If this limit is breached and deletion fails, then segments will be "
-      "orphaned in the cloud and will have to be removed manually",
+      "orphaned in the cloud and will have to be removed manually. Applies "
+      "only the the in-memory manifest. Spillover manifests are not affected "
+      "by this limit.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       5000)
+  , cloud_storage_gc_max_segments_per_run(
+      *this,
+      "cloud_storage_gc_max_segments_per_run",
+      "Maximum number of segments to delete per housekeeping run. Each segment "
+      "maps to up to three object keys (data, index, tx manifest), so a value "
+      "of 300 produces 600 to 900 deletes plus one per spillover manifest.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      300,
+      {.min = 1})
   , cloud_storage_enable_compacted_topic_reupload(
       *this,
       "cloud_storage_enable_compacted_topic_reupload",
@@ -2860,13 +2893,7 @@ configuration::configuration()
       "disabled following an upgrade.",
       {.needs_restart = needs_restart::no, .visibility = visibility::user},
       true)
-  , space_management_enable_override(
-      *this,
-      "space_management_enable_override",
-      "Enable automatic space management. This option is ignored and "
-      "deprecated in versions >= v23.3.",
-      {.needs_restart = needs_restart::no, .visibility = visibility::user},
-      false)
+  , space_management_enable_override(*this, "space_management_enable_override")
   , disk_reservation_percent(
       *this,
       "disk_reservation_percent",
@@ -3086,6 +3113,13 @@ configuration::configuration()
       "Number of chunks to prefetch ahead of every downloaded chunk",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       0)
+  , cloud_storage_prefetch_segments_max(
+      *this,
+      "cloud_storage_prefetch_segments_max",
+      "Maximum number of small segments (size <= chunk size) to prefetch ahead "
+      "during sequential reads. Set to 0 to disable cross-segment prefetch.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      3)
   , cloud_storage_cache_num_buckets(
       *this,
       "cloud_storage_cache_num_buckets",
@@ -3372,6 +3406,7 @@ configuration::configuration()
       {
         model::leader_balancer_mode::calibrated,
         model::leader_balancer_mode::random,
+        model::leader_balancer_mode::greedy,
       })
   , leader_balancer_idle_timeout(
       *this,
@@ -3561,9 +3596,31 @@ configuration::configuration()
   , features_auto_enable(
       *this,
       "features_auto_enable",
-      "Whether new feature flags auto-activate after upgrades (true) or must "
-      "wait for manual activation via the Admin API (false).",
+      "Whether features whose `available_policy` is `always` or "
+      "`new_clusters_only` are auto-activated by the controller after the "
+      "cluster active logical version reaches their required version. When "
+      "false, the cluster active version still advances normally, but each "
+      "such feature must be activated explicitly via the Admin API. Does not "
+      "affect features with `available_policy::explicit_only`, which always "
+      "require explicit activation.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      true)
+  , features_auto_finalization(
+      *this,
+      false, /* restricted value: license required to disable */
+      "features_auto_finalization",
+      "Whether the cluster active logical version is advanced automatically "
+      "once all nodes have been upgraded (true), or only in response to an "
+      "explicit request via the Admin API (false). When false, the cluster "
+      "remains able to downgrade to the previous version until finalization "
+      "is requested. Setting this to false is an Enterprise feature and "
+      "requires a valid license. Note: if upgrade was performed with this "
+      "set to false and the cluster is ready to finalize, flipping this to "
+      "true does not reliably trigger finalization. Leave this set to false "
+      "and use the Admin API to finalize; once the upgrade is complete this "
+      "can be set back to true to restore automatic finalization for future "
+      "upgrades.",
+      meta{.needs_restart = needs_restart::no, .visibility = visibility::user},
       true)
   , enable_rack_awareness(
       *this,
@@ -3804,11 +3861,11 @@ configuration::configuration()
       *this,
       "schema_registry_enable_qualified_subjects",
       "Enable parsing of qualified subject syntax (:.context:subject). "
+      "When true, qualified syntax is parsed to extract context and subject. "
       "When false, subjects are treated literally, as subjects in the default "
-      "context. When true, qualified syntax is parsed to extract context and "
-      "subject.",
-      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
-      false)
+      "context.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      true)
   , pp_sr_smp_max_non_local_requests(
       *this,
       "pp_sr_smp_max_non_local_requests",
@@ -3888,6 +3945,25 @@ configuration::configuration()
       "https://auth.prd.cloud.redpanda.com/.well-known/openid-configuration",
       [](const auto& v) -> std::optional<ss::sstring> {
           auto res = security::oidc::parse_url(v);
+          if (res.has_error()) {
+              return res.error().message();
+          }
+          return std::nullopt;
+      })
+  , oidc_http_proxy_url(
+      *this,
+      "oidc_http_proxy_url",
+      "URL of the HTTP forward proxy used for OIDC discovery and JWKS "
+      "fetches. Accepts http://host:port or https://host:port. When "
+      "set, oidc_discovery_url must use https:// — plaintext OIDC "
+      "origins cannot be routed through a forward proxy.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::user},
+      std::nullopt,
+      [](const auto& v) -> std::optional<ss::sstring> {
+          if (!v.has_value()) {
+              return std::nullopt;
+          }
+          auto res = security::oidc::parse_url(*v);
           if (res.has_error()) {
               return res.error().message();
           }
@@ -4027,12 +4103,10 @@ configuration::configuration()
       *this,
       true,
       "iceberg_enabled",
-      "Enables the translation of topic data into Iceberg tables. Setting "
-      "iceberg_enabled to true activates the feature at the cluster level, but "
-      "each topic must also set the redpanda.iceberg.enabled topic-level "
-      "property to true to use it. If iceberg_enabled is set to false, the "
-      "feature is disabled for all topics in the cluster, overriding any "
-      "topic-level settings.",
+      "Enables Apache Iceberg integration for storing topic data in the "
+      "Iceberg open table format. Setting iceberg_enabled to true activates "
+      "the feature at the cluster level, but each topic must also configure "
+      "the redpanda.iceberg.mode topic-level property to use it.",
       meta{
         .needs_restart = needs_restart::yes,
         .visibility = visibility::user,
@@ -4097,7 +4171,8 @@ configuration::configuration()
         .example = "http://hostname:8181",
         .visibility = visibility::user,
       },
-      std::nullopt)
+      std::nullopt,
+      &validate_iceberg_rest_catalog_endpoint)
   , iceberg_rest_catalog_client_id(
       *this,
       "iceberg_rest_catalog_client_id",
@@ -4295,6 +4370,18 @@ configuration::configuration()
       {.needs_restart = needs_restart::yes, .visibility = visibility::user},
       std::nullopt,
       &validate_non_empty_string_opt)
+  , iceberg_rest_catalog_credentials_host(
+      *this,
+      "iceberg_rest_catalog_credentials_host",
+      "The hostname to connect to for retrieving role based credentials for "
+      "the Iceberg REST catalog. Derived from "
+      "iceberg_rest_catalog_credentials_source if not set. Only required "
+      "when using IAM role based access on AWS; does not apply to "
+      "OAuth-based authentication schemes. Independent of "
+      "cloud_storage_credentials_host.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      std::nullopt,
+      &validate_non_empty_string_opt)
   , iceberg_backlog_controller_p_coeff(
       *this,
       "iceberg_backlog_controller_p_coeff",
@@ -4358,6 +4445,22 @@ configuration::configuration()
       {
         model::iceberg_invalid_record_action::drop,
         model::iceberg_invalid_record_action::dlq_table,
+      })
+  , iceberg_schema_case_insensitive(
+      *this,
+      "iceberg_schema_case_insensitive",
+      "Schema field name comparison mode when matching Redpanda's "
+      "schema against the one returned by the Iceberg catalog. Some catalogs "
+      "(e.g. AWS Glue) return field names with inconsistent casing, requiring "
+      "case-insensitive comparison. \"auto\" enables case-insensitive "
+      "comparison when the catalog is AWS Glue, and exact comparison "
+      "otherwise.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::user},
+      model::iceberg_schema_case_insensitive::auto_,
+      {
+        model::iceberg_schema_case_insensitive::auto_,
+        model::iceberg_schema_case_insensitive::no,
+        model::iceberg_schema_case_insensitive::yes,
       })
   , iceberg_target_lag_ms(
       *this,
@@ -4529,19 +4632,21 @@ configuration::configuration()
       "cluster for data replication.",
       meta{.needs_restart = needs_restart::no, .visibility = visibility::user},
       false)
+  , shadow_link_failover_batch_size(
+      *this,
+      "shadow_link_failover_batch_size",
+      "Maximum number of mirror topics to include in a single batched "
+      "failover controller command.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1000,
+      {.min = 1})
   , internal_rpc_request_timeout_ms(
       *this,
       "internal_rpc_request_timeout_ms",
       "Default timeout for RPC requests between Redpanda nodes.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       10s)
-  , cloud_topics_enabled(
-      *this,
-      true,
-      "cloud_topics_enabled",
-      "Enable cloud topics.",
-      meta{.needs_restart = needs_restart::yes, .visibility = visibility::user},
-      false)
+  , cloud_topics_enabled(*this, "cloud_topics_enabled")
   , cloud_topics_produce_batching_size_threshold(
       *this,
       "cloud_topics_produce_batching_size_threshold",
@@ -4636,6 +4741,16 @@ configuration::configuration()
       {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
       8,
       {.min = size_t{1}, .max = size_t{64}})
+  , cloud_topics_allow_materialization_failure(
+      *this,
+      "cloud_topics_allow_materialization_failure",
+      "When enabled, the reconciler tolerates missing L0 extent objects "
+      "(404 errors) during materialization. Failed extents are skipped, "
+      "producing L1 state with empty offset ranges where deleted data was. "
+      "Use this to recover partitions after accidental deletion of live "
+      "extent objects.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , cloud_topics_compaction_max_object_size(
       *this,
       "cloud_topics_compaction_max_object_size",
@@ -4695,6 +4810,12 @@ configuration::configuration()
       "The local cache duration of a cluster wide epoch.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1min)
+  , cloud_topics_epoch_service_max_same_epoch_duration(
+      *this,
+      "cloud_topics_epoch_service_max_same_epoch_duration",
+      "The duration of time that a node can use the exact same epoch.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      24 * 60min)
   , cloud_topics_short_term_gc_minimum_object_age(
       *this,
       "cloud_topics_short_term_gc_minimum_object_age",
@@ -4716,6 +4837,28 @@ configuration::configuration()
       "when no progress is being made or errors are occurring.",
       {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
       1min)
+  , cloud_topics_gc_health_check_interval(
+      *this,
+      "cloud_topics_gc_health_check_interval",
+      "The interval at which the L0 garbage collector checks cluster health. "
+      "GC will not proceed while the cluster is unhealthy.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      10s)
+  , cloud_topics_metastore_replication_timeout_ms(
+      *this,
+      "cloud_topics_metastore_replication_timeout_ms",
+      "Timeout for L1 metastore Raft replication and waiting for the STM to "
+      "apply the replicated write batch.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      30s)
+  , cloud_topics_metastore_lsm_apply_timeout_ms(
+      *this,
+      "cloud_topics_metastore_lsm_apply_timeout_ms",
+      "Timeout for applying a replicated write batch to the local LSM "
+      "database. This may take longer than usual when L0 compaction is "
+      "behind and writes are being throttled.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      5min)
   , cloud_topics_parallel_fetch_enabled(
       *this,
       "cloud_topics_parallel_fetch_enabled",
@@ -4732,6 +4875,70 @@ configuration::configuration()
       "performance and lowering the cost.",
       {.needs_restart = needs_restart::yes, .visibility = visibility::user},
       true)
+  , cloud_topics_preregistered_object_ttl(
+      *this,
+      "cloud_topics_preregistered_object_ttl",
+      "Time-to-live for pre-registered L1 objects before they are expired.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1h)
+  , cloud_topics_long_term_file_deletion_delay(
+      *this,
+      "cloud_topics_long_term_file_deletion_delay",
+      "Delay before deleting stale long term files, allowing concurrent "
+      "readers (e.g. read replica topics) to finish reading them before "
+      "removal.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      1h)
+  , cloud_topics_num_metastore_partitions(
+      *this,
+      "cloud_topics_num_metastore_partitions",
+      "Number of partitions for the cloud topics metastore topic, used to "
+      "spread metastore load across the cluster. Higher values allow more "
+      "parallel metadata operations but reduce the amount of work each "
+      "partition can batch together. Only takes effect when the metastore "
+      "topic is first created.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      3,
+      {.min = 1})
+  , cloud_topics_produce_write_inflight_limit(
+      *this,
+      "cloud_topics_produce_write_inflight_limit",
+      "Maximum number of in-flight write requests per shard in the cloud "
+      "topics write pipeline. Requests that exceed this limit are queued "
+      "until a slot becomes available.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      1024,
+      {.min = 1})
+  , cloud_topics_produce_no_pid_concurrency(
+      *this,
+      "cloud_topics_produce_no_pid_concurrency",
+      "Maximum number of concurrent raft replication requests for producers "
+      "without a producer ID (idempotency disabled). Limits how many no-PID "
+      "writes can proceed past the producer queue into raft simultaneously.",
+      {.needs_restart = needs_restart::yes, .visibility = visibility::tunable},
+      32,
+      {.min = 1})
+  , cloud_topics_l1_reader_cache_eviction_timeout_ms(
+      *this,
+      "cloud_topics_l1_reader_cache_eviction_timeout_ms",
+      "Time after which idle L1 readers are evicted from the per-shard "
+      "reader cache.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      60'000ms)
+  , cloud_topics_l1_reader_cache_max_size(
+      *this,
+      "cloud_topics_l1_reader_cache_max_size",
+      "Maximum number of L1 readers cached per shard. When the cache exceeds "
+      "this limit, the oldest idle reader is evicted.",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      128,
+      {.min = 0, .max = 10000})
+  , code_hugepages_enabled(
+      *this,
+      "code_hugepages_enabled",
+      "Map the binary into hugepages",
+      {.needs_restart = needs_restart::no, .visibility = visibility::tunable},
+      false)
   , development_feature_property_testing_only(
       *this,
       "development_feature_property_testing_only",

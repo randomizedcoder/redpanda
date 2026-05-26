@@ -44,8 +44,8 @@ public:
     ss::future<std::expected<add_response, errc>> add_objects(
       const object_metadata_builder&, const term_offset_map_t&) override;
 
-    ss::future<std::expected<void, errc>>
-    replace_objects(const object_metadata_builder&) override;
+    ss::future<std::expected<void, errc>> replace_objects(
+      const object_metadata_builder&, const replace_epoch_map_t&) override;
 
     ss::future<std::expected<void, errc>>
     set_start_offset(const model::topic_id_partition&, kafka::offset) override;
@@ -84,12 +84,16 @@ public:
     ss::future<std::expected<compaction_info_map, errc>>
     get_compaction_infos(const chunked_vector<compaction_info_spec>&) override;
 
+    ss::future<std::expected<leveling_info_map, errc>>
+    get_leveling_infos(const chunked_vector<leveling_info_spec>&) override;
+
     ss::future<std::expected<extent_metadata_response, errc>>
     get_extent_metadata_forwards(
       const model::topic_id_partition&,
       kafka::offset,
       kafka::offset,
-      size_t) override;
+      size_t,
+      include_object_metadata) override;
 
     ss::future<std::expected<extent_metadata_response, errc>>
     get_extent_metadata_backwards(

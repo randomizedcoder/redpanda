@@ -19,10 +19,10 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/temporary_buffer.hh>
 
+#include <sys/uio.h>
+
 #include <compare>
 #include <ranges>
-
-struct iovec;
 
 // A fixed size chunked array of data normally for IO operations.
 //
@@ -79,12 +79,22 @@ public:
     // a new ioarray.
     //
     // REQUIRES: All but the last buffer must be `max_chunk_size` in length.
-    static ioarray from_sized_buffers(std::span<ss::temporary_buffer<char>>);
+    static ioarray from_sized_buffers(scattered_buffer_view);
 
     // Create an uninitialized ioarray where all the chunks are aligned.
     // It's assumed that the alignment is a power of two less than
     // `max_chunk_size` and that size is a multiple of alignment.
     static ioarray aligned(size_t alignment, size_t size);
+
+    // Concatenate two ioarrays. Both inputs are consumed.
+    //
+    // Fast path (zero-copy): when a's data ends on a chunk boundary
+    // (offset + size is a multiple of max_chunk_size) and b has offset 0,
+    // the underlying buffers are moved directly.
+    //
+    // Slow path (copy): otherwise, both arrays are copied byte-by-byte into
+    // a fresh ioarray.
+    static ioarray concat(ioarray a, ioarray b);
 
     // Create the ioarray from copying out of an iobuf.
     //

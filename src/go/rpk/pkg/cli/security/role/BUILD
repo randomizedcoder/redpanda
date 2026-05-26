@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "role",
@@ -27,4 +27,11 @@ go_library(
         "@com_github_twmb_franz_go_pkg_kadm//:kadm",
         "@com_github_twmb_types//:types",
     ],
+)
+
+go_test(
+    name = "role_test",
+    srcs = ["role_test.go"],
+    embed = [":role"],
+    deps = ["@com_github_stretchr_testify//require"],
 )

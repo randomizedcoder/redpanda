@@ -12,6 +12,7 @@
 #include "cloud_storage/types.h"
 #include "cloud_topics/data_plane_api.h"
 #include "cloud_topics/frontend/errc.h"
+#include "cloud_topics/level_one/frontend_reader/l1_reader_cache.h"
 #include "cloud_topics/level_one/frontend_reader/level_one_reader.h"
 #include "cloud_topics/level_one/metastore/metastore.h"
 #include "cloud_topics/level_zero/common/extent_meta.h"
@@ -23,10 +24,11 @@
 #include "cloud_topics/logger.h"
 #include "cloud_topics/state_accessors.h"
 #include "cloud_topics/topic_id_partition.h"
-#include "cluster/metadata_cache.h"
 #include "cluster/partition.h"
 #include "cluster/rm_stm_types.h"
 #include "cluster/types.h"
+#include "kafka/protocol/errors.h"
+#include "kafka/server/write_at_offset_stm.h"
 #include "model/fundamental.h"
 #include "model/offset_interval.h"
 #include "model/record.h"
@@ -38,19 +40,16 @@
 #include "ssx/future-util.h"
 #include "storage/log_reader.h"
 #include "storage/offset_translator_state.h"
-#include "storage/record_batch_builder.h"
 #include "storage/types.h"
 
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/coroutine/as_future.hh>
-#include <seastar/util/defer.hh>
+#include <seastar/coroutine/exception.hh>
 
 #include <chrono>
 #include <expected>
-#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -159,12 +158,17 @@ get_aborted_transactions_local(
     auto source = co_await p.aborted_transactions(
       offsets.begin_rp, offsets.end_rp);
 
+    // We trim beginning of aborted ranges to raft_start_offset because we
+    // don't have offset translation info for earlier offsets. This mirrors
+    // the logic in replicated_partition::aborted_transactions_local().
+    auto trim_at = p.raft_start_offset();
+
     std::vector<cluster::tx::tx_range> target;
     target.reserve(source.size());
     for (const auto& range : source) {
         target.emplace_back(
           range.pid,
-          ot_state->from_log_offset(range.first),
+          ot_state->from_log_offset(std::max(trim_at, range.first)),
           ot_state->from_log_offset(range.last));
     }
 
@@ -285,8 +289,7 @@ frontend::make_reader(cloud_topic_log_reader_config cfg) {
         if (!tidp) {
             throw topic_config_not_found_exception(ntp());
         }
-        co_return storage::translating_reader{
-          model::record_batch_reader(make_l1_reader(cfg, *tidp))};
+        co_return storage::translating_reader{make_l1_reader(cfg, *tidp)};
     }
     co_return storage::translating_reader{
       model::record_batch_reader(make_l0_reader(cfg)),
@@ -329,17 +332,17 @@ std::optional<model::topic_id_partition> frontend::topic_id_partition() const {
 
 std::unique_ptr<model::record_batch_reader::impl>
 frontend::make_l0_reader(const cloud_topic_log_reader_config& cfg) const {
-    return std::make_unique<level_zero_log_reader_impl>(
+    auto rdr = std::make_unique<level_zero_log_reader_impl>(
       cfg, _partition, _data_plane);
+    rdr->register_with_stm(_ctp_stm_api.get());
+    return rdr;
 }
 
-ss::future<size_t> frontend::size_bytes() {
-    auto l0_size = _ctp_stm_api->estimated_data_size();
-
+ss::future<std::optional<l1::metastore::size_response>> frontend::l1_size() {
     // If we have never reconciled there is no L1 data to query.
     auto lro = _ctp_stm_api->get_last_reconciled_offset();
     if (lro < kafka::offset{0}) {
-        co_return l0_size;
+        co_return std::nullopt;
     }
 
     auto ct_state = _partition->get_cloud_topics_state();
@@ -347,7 +350,7 @@ ss::future<size_t> frontend::size_bytes() {
 
     auto tidp = topic_id_partition();
     if (!tidp) {
-        co_return 0;
+        co_return std::nullopt;
     }
     auto size_res = co_await l1_metastore->get_size(*tidp);
     if (!size_res.has_value()) {
@@ -356,6 +359,23 @@ ss::future<size_t> frontend::size_bytes() {
           "Could not fetch L1 partition size for {}: {}",
           tidp,
           size_res.error());
+        co_return std::nullopt;
+    }
+
+    co_return size_res.value();
+}
+
+ss::future<size_t> frontend::size_bytes() {
+    auto l0_size = get_l0_size_estimate();
+
+    // If we have never reconciled there is no L1 data to query.
+    auto lro = _ctp_stm_api->get_last_reconciled_offset();
+    if (lro < kafka::offset{0}) {
+        co_return l0_size;
+    }
+
+    auto l1_size_res = co_await l1_size();
+    if (!l1_size_res) {
         /*
          * If we can't get an estimate of L1 we return 0 without reporting L0.
          * The rationale here is that if we are going to have size estimates
@@ -365,19 +385,31 @@ ss::future<size_t> frontend::size_bytes() {
         co_return 0;
     }
 
-    co_return size_res.value().size + l0_size;
+    co_return l0_size + l1_size_res.value().size;
 }
 
-std::unique_ptr<model::record_batch_reader::impl> frontend::make_l1_reader(
+model::record_batch_reader frontend::make_l1_reader(
   const cloud_topic_log_reader_config& cfg,
   model::topic_id_partition tidp) const {
     auto ct_state = _partition->get_cloud_topics_state();
+    auto* cache = ct_state->local().get_l1_reader_cache();
+    if (cache) {
+        if (auto hit = cache->get_reader(tidp, cfg); hit) {
+            return std::move(*hit);
+        }
+    }
+
     auto l1_metastore = ct_state->local().get_l1_metastore();
     auto l1_io = ct_state->local().get_l1_io();
     auto l1_reader_probe = ct_state->local().get_l1_reader_probe();
 
-    return std::make_unique<level_one_log_reader_impl>(
+    auto reader = std::make_unique<level_one_log_reader_impl>(
       cfg, _partition->ntp(), tidp, l1_metastore, l1_io, l1_reader_probe);
+
+    if (cache) {
+        return cache->put(std::move(reader));
+    }
+    return model::record_batch_reader(std::move(reader));
 }
 
 ss::future<std::optional<storage::timequery_result>>
@@ -489,16 +521,17 @@ ss::future<std::optional<storage::timequery_result>>
 frontend::refine_timequery_result(
   coarse_grained_timequery_result input,
   model::opt_abort_source_t abort_source) {
+    // Pass the timestamp so the L1 reader can use the footer's timestamp
+    // index to seek directly to the relevant position, avoiding unnecessary
+    // cloud IO. In the case of L0, we should only need to materialize a
+    // single batch here, because the local log is correct to the granularity of
+    // a batch (but not within a batch due to placeholders).
     cloud_topic_log_reader_config reader_cfg(
       /*start_offset=*/input.start_offset,
       /*max_offset=*/input.last_offset,
-      /*as=*/abort_source);
-    // TODO(perf): In the case of L0, we should only need to materialize a
-    // single batch here, because the local log is correct to the granularity of
-    // a batch (but not within a batch due to placeholders). For L1, we could be
-    // giving the reader a timestamp so it uses the L1 object indexes to seek
-    // to the correct spot within the index, this would allow us to optimize IO
-    // against the cloud.
+      /*first_timestamp=*/input.time,
+      /*as=*/abort_source,
+      /*client_addr=*/std::nullopt);
     auto reader = co_await make_reader(reader_cfg);
     auto generator = std::move(reader.reader).generator(model::no_timeout);
     auto query_interval = model::bounded_offset_interval::checked(
@@ -558,6 +591,10 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
     const auto& ntp = partition->ntp();
     // The default errc that will cause the client to retry the operation
     constexpr auto default_errc = raft::errc::timeout;
+    auto timeout = opts.timeout.value_or(0ms);
+    if (timeout == 0ms) {
+        timeout = L0_upload_default_timeout;
+    }
     /*
      * L0 GC relies on a minimum epoch associated with each NTP for calculating
      * the name of an L0 object. The minimum is based on the topic revision, but
@@ -566,16 +603,42 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
      * the rest of its journey.
      */
     auto min_epoch = cluster_epoch(partition->get_topic_revision_id());
+
+    /*
+     * Sync the STM so that our min_accepted epoch is not stale.
+     */
+    if (opts.as) {
+        co_await ctp_stm_api->sync_in_term(
+          model::time_from_now(timeout), opts.as->get());
+    } else {
+        ss::abort_source as;
+        co_await ctp_stm_api->sync_in_term(model::time_from_now(timeout), as);
+    }
+
+    /*
+     * We want to prevent from uploading data we know is going to get rejected,
+     * so we want to upload and ensure the epoch doesn't get fenced. So we
+     * have two options here we can enforce either bound of our window. We
+     * choose to use the max epoch here so that if something else in-flight
+     * pushes the window we have buffer to still accept this batch.
+     */
+    auto accepted_min = ctp_stm_api->get_max_seen_epoch(partition->term());
+    if (!accepted_min) {
+        accepted_min = ctp_stm_api->get_max_epoch();
+    }
+    if (accepted_min) {
+        min_epoch = std::max(min_epoch, *accepted_min);
+    }
+
     vassert(
       min_epoch() > 0L,
       "Unexpected invalid min epoch {} for {}",
       min_epoch,
       ntp);
 
-    auto timeout = opts.timeout.value_or(0ms);
-    if (timeout == 0ms) {
-        timeout = L0_upload_default_timeout;
-    }
+    // Invalidate the epoch if it's below some threshold.
+    co_await api->invalidate_epoch_below(min_epoch);
+
     auto upload_fut = co_await ss::coroutine::as_future(api->execute_write(
       ntp,
       min_epoch,
@@ -597,12 +660,14 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
           upload_res.error().message());
         co_return default_errc;
     }
-    if (upload_res.value().empty()) {
+    if (upload_res.value().extents.empty()) {
         vlog(
           cd_log.warn,
           "LO object upload returned empty result, nothing to replicate");
         co_return default_errc;
     }
+
+    auto batch_epoch = upload_res.value().extents.front().id.epoch;
 
     // Wait for all previous requests from this producer to be processed
     if (opts.as) {
@@ -617,25 +682,48 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
     // (because it needs to drain current requests as the epoch is being
     // bumped).
     auto fence_fut = co_await ss::coroutine::as_future(
-      ctp_stm_api->fence_epoch(upload_res.value().front().id.epoch));
+      ctp_stm_api->fence_epoch(batch_epoch));
     if (fence_fut.failed()) {
+        auto not_leader = !partition->is_leader();
         auto e = fence_fut.get_exception();
-        vlogl(
-          cd_log,
-          ssx::is_shutdown_exception(e) ? ss::log_level::debug
-                                        : ss::log_level::warn,
-          "Failed to fence epoch {} for ntp {}, error: {}",
-          upload_res.value().front().id.epoch,
-          ntp,
-          e);
+        if (not_leader) {
+            vlog(
+              cd_log.debug,
+              "Failed to fence epoch {} for ntp {}, not a leader",
+              batch_epoch,
+              ntp);
+        } else {
+            vlogl(
+              cd_log,
+              ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                            : ss::log_level::warn,
+              "Failed to fence epoch {} for ntp {}, error: {}",
+              batch_epoch,
+              ntp,
+              e);
+        }
         co_return default_errc;
     }
     auto fence = std::move(fence_fut.get());
     if (!fence.has_value()) {
-        vlog(
-          cd_log.warn,
+        auto upload_shard = upload_res.value().shard;
+        // If the upload failed, then maybe just that shard is behind, we'll
+        // dispatch a request to that shard to invalidate the epoch.
+        co_await ss::smp::submit_to(
+          upload_shard, [api, e = fence.error().window_min] {
+              return api->invalidate_epoch_below(e);
+          });
+        auto no_window = fence.error().window_min == fence.error().window_max;
+        // NOTE: we might see the error when the partition is just created
+        // or right after the leadership transfer. This is transient state
+        // and is expected so we're logging this on DEBUG level. If the
+        // fence is not acquired during the steady state operation the log
+        // message is more useful and is logged on WARN level.
+        vlogl(
+          cd_log,
+          no_window ? ss::log_level::debug : ss::log_level::warn,
           "Failed to fence epoch {} for ntp {}, ctp window is [{}, {}]",
-          upload_res.value().front().id.epoch,
+          batch_epoch,
           ntp,
           fence.error().window_min,
           fence.error().window_max);
@@ -645,7 +733,7 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
     chunked_vector<model::record_batch_header> headers;
     headers.push_back(header);
     auto placeholders = co_await convert_to_placeholders(
-      upload_res.value(), headers);
+      upload_res.value().extents, headers);
 
     vassert(
       placeholders.batches.size() == 1,
@@ -684,22 +772,13 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
         // which case it's not stored) or from the log replay. The
         // simplest solution in this case is to skip caching.
         if (res.value().last_term >= model::term_id{0}) {
-            // Topic config may already be gone if the topic is being
-            // deleted; skip caching in that case.
             auto tidp = get_topic_id_partition(partition);
             if (tidp) {
                 update_batches(
                   cache_batches,
                   kafka::offset_cast(res.value().last_offset),
                   res.value().last_term);
-                for (const auto& b : cache_batches) {
-                    vlog(
-                      cd_log.trace,
-                      "Putting batch to cache: {}, term: {}",
-                      b.base_offset(),
-                      b.term());
-                    api->cache_put(*tidp, b);
-                }
+                api->cache_put_ordered(*tidp, std::move(cache_batches));
             }
         } else {
             vlog(
@@ -719,6 +798,18 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
 
 ss::future<std::expected<kafka::offset, std::error_code>> frontend::replicate(
   chunked_vector<model::record_batch> batches, raft::replicate_options opts) {
+    // In tiered_cloud mode, replicate raft_data directly through raft.
+    // No L0 upload, no placeholders, no epoch fencing. The client's
+    // requested acks level is passed through (unlike cloud mode which
+    // forces quorum_ack to protect placeholder consistency).
+    if (_partition->get_ntp_config().is_tiered_cloud()) {
+        auto result = co_await _partition->replicate(std::move(batches), opts);
+        if (!result) {
+            co_return std::unexpected(result.error());
+        }
+        co_return result.value().last_offset;
+    }
+
     chunked_vector<model::record_batch_header> headers;
     headers.reserve(batches.size());
     for (const auto& batch : batches) {
@@ -759,19 +850,30 @@ ss::future<std::expected<kafka::offset, std::error_code>> frontend::replicate(
         co_return std::unexpected(res.error());
     }
 
+    auto batch_epoch = res.value().extents.front().id.epoch;
+
     auto fence_fut = co_await ss::coroutine::as_future(
-      _ctp_stm_api->fence_epoch(res.value().front().id.epoch));
+      _ctp_stm_api->fence_epoch(batch_epoch));
     if (fence_fut.failed()) {
+        auto not_leader = !_partition->is_leader();
         auto e = fence_fut.get_exception();
-        vlogl(
-          cd_log,
-          ssx::is_shutdown_exception(e) ? ss::log_level::debug
-                                        : ss::log_level::warn,
-          "Failed to fence epoch {} for ntp {}, error: {}",
-          res.value().front().id.epoch,
-          ntp(),
-          fence_fut.get_exception());
-        std::rethrow_exception(e);
+        if (not_leader) {
+            vlog(
+              cd_log.debug,
+              "Failed to fence epoch {} for ntp {}, not a leader",
+              batch_epoch,
+              ntp());
+        } else {
+            vlogl(
+              cd_log,
+              ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                            : ss::log_level::warn,
+              "Failed to fence epoch {} for ntp {}, error: {}",
+              batch_epoch,
+              ntp(),
+              e);
+        }
+        co_await ss::coroutine::return_exception_ptr(std::move(e));
     }
     auto fence = std::move(fence_fut.get());
     if (!fence.has_value()) {
@@ -779,7 +881,7 @@ ss::future<std::expected<kafka::offset, std::error_code>> frontend::replicate(
           cd_log.warn,
           "Failed to fence epoch {} for ntp {}, ctp latest seen epoch is [{}, "
           "{}]",
-          res.value().front().id.epoch,
+          batch_epoch,
           ntp(),
           fence.error().window_min,
           fence.error().window_max);
@@ -787,7 +889,8 @@ ss::future<std::expected<kafka::offset, std::error_code>> frontend::replicate(
           kafka::make_error_code(kafka::error_code::request_timed_out));
     }
 
-    auto placeholders = co_await convert_to_placeholders(res.value(), headers);
+    auto placeholders = co_await convert_to_placeholders(
+      res.value().extents, headers);
 
     chunked_vector<model::record_batch> placeholder_batches;
     for (auto&& batch : placeholders.batches) {
@@ -801,22 +904,15 @@ ss::future<std::expected<kafka::offset, std::error_code>> frontend::replicate(
     if (!result) {
         co_return std::unexpected(result.error());
     }
-    auto ret_offset = model::offset(result.value().last_offset());
+    auto ret_offset = result.value().last_offset;
     if (!rb_copy.empty()) {
-        // Topic config may already be gone if the topic is being
-        // deleted; skip caching in that case.
         auto tidp = topic_id_partition();
         if (tidp) {
-            update_batches(rb_copy, ret_offset, result.value().last_term);
-            for (const auto& b : rb_copy) {
-                vlog(
-                  cd_log.trace,
-                  "Putting batch for {} to cache: {}, term: {}",
-                  ntp(),
-                  b.base_offset(),
-                  b.term());
-                _data_plane->cache_put(*tidp, b);
-            }
+            update_batches(
+              rb_copy,
+              kafka::offset_cast(ret_offset),
+              result.value().last_term);
+            _data_plane->cache_put_ordered(*tidp, std::move(rb_copy));
         }
     }
     co_return ret_offset;
@@ -826,6 +922,29 @@ raft::replicate_stages frontend::replicate(
   model::batch_identity batch_id,
   model::record_batch batch,
   raft::replicate_options opts) {
+    // In tiered_cloud mode, replicate raft_data directly through raft.
+    // Use partition->replicate_in_stages which returns kafka_stages (with
+    // kafka-translated offsets), then adapt to raft::replicate_stages.
+    // The client's requested acks level is passed through.
+    if (_partition->get_ntp_config().is_tiered_cloud()) {
+        auto ks = _partition->replicate_in_stages(
+          batch_id, std::move(batch), opts);
+        raft::replicate_stages out(raft::errc::success);
+        out.request_enqueued = std::move(ks.request_enqueued);
+        out.replicate_finished = ks.replicate_finished.then(
+          [](
+            result<cluster::kafka_result> r) -> result<raft::replicate_result> {
+              if (!r) {
+                  return r.error();
+              }
+              return raft::replicate_result{
+                .last_offset = kafka::offset_cast(r.value().last_offset),
+                .last_term = r.value().last_term,
+              };
+          });
+        return out;
+    }
+
     auto ctp_stm_api = make_ctp_stm_api(_partition);
     auto header = batch.header();
     chunked_vector<model::record_batch> batch_vec, to_cache;
@@ -885,7 +1004,8 @@ frontend::get_leader_epoch_last_offset(model::term_id term) const {
     if (term >= first_local_term) {
         auto last_offset = _partition->get_term_last_offset(term);
         if (last_offset) {
-            co_return ot_state->from_log_offset(*last_offset);
+            co_return model::offset_cast(
+              ot_state->from_log_offset(*last_offset));
         }
     }
 
@@ -1121,6 +1241,172 @@ auto frontend::advance_epoch(
     }
 
     co_return get_epoch_info();
+}
+
+ss::future<result<raft::replicate_result>> frontend::replicate_at_offset(
+  chunked_vector<model::record_batch> batches,
+  chunked_vector<kafka::offset> expected_base_offsets,
+  std::optional<kafka::offset> prev_log_offset,
+  model::timeout_clock::duration timeout,
+  std::optional<std::reference_wrapper<ss::abort_source>> as,
+  ss::shared_ptr<kafka::write_at_offset_stm> stm) {
+    // Only user data batches (raft_data with !is_control()) are uploaded
+    // to L0 and wrapped as ctp_placeholders. Transactional control batches
+    // (raft_data with is_control(), i.e. transaction commit/abort markers)
+    // carry their payload in the record key/value and must be passed
+    // through to the local raft log unchanged - otherwise the placeholder
+    // encoding strips the key and downstream consumers like rm_stm cannot
+    // parse them. No other batch types are expected on this path.
+    chunked_vector<model::record_batch_header> data_headers;
+    chunked_vector<model::record_batch> data_batches;
+    chunked_vector<model::record_batch> control_batches;
+    const size_t input_count = batches.size();
+    for (auto&& batch : batches) {
+        const auto& hdr = batch.header();
+        vassert(
+          hdr.type == model::record_batch_type::raft_data,
+          "Unexpected batch type {} for {} in replicate_at_offset; only "
+          "raft_data batches (data and transactional control) are supported",
+          hdr.type,
+          ntp());
+        const bool is_data = !hdr.attrs.is_control();
+        if (is_data) {
+            data_headers.push_back(hdr);
+            data_batches.push_back(std::move(batch));
+        } else {
+            control_batches.push_back(std::move(batch));
+        }
+    }
+    batches.clear();
+
+    chunked_vector<model::record_batch> placeholder_batches;
+
+    if (!data_batches.empty()) {
+        auto min_epoch = cluster_epoch(_partition->get_topic_revision_id());
+
+        // Use the std::max trick from the normal produce path to reduce
+        // the likelihood of fencing errors when shards are on different
+        // epochs.
+        auto accepted_min = _ctp_stm_api->get_max_seen_epoch(
+          _partition->term());
+        if (!accepted_min) {
+            accepted_min = _ctp_stm_api->get_max_epoch();
+        }
+        if (accepted_min) {
+            min_epoch = std::max(min_epoch, *accepted_min);
+        }
+
+        vassert(
+          min_epoch() > 0L,
+          "Unexpected invalid min epoch {} for {}",
+          min_epoch,
+          ntp());
+
+        auto staged = co_await _data_plane->stage_write(
+          std::move(data_batches));
+        if (!staged.has_value()) {
+            co_return staged.error();
+        }
+
+        auto deadline = model::timeout_clock::now() + timeout;
+        auto res = co_await _data_plane->execute_write(
+          ntp(), min_epoch, std::move(staged.value()), deadline);
+
+        if (!res.has_value()) {
+            co_return res.error();
+        }
+
+        auto batch_epoch = res.value().extents.front().id.epoch;
+
+        auto fence_fut = co_await ss::coroutine::as_future(
+          _ctp_stm_api->fence_epoch(batch_epoch));
+        if (fence_fut.failed()) {
+            auto not_leader = !_partition->is_leader();
+            auto e = fence_fut.get_exception();
+            if (not_leader) {
+                vlog(
+                  cd_log.debug,
+                  "Failed to fence epoch {} for ntp {}, not a leader",
+                  batch_epoch,
+                  ntp());
+            } else {
+                vlogl(
+                  cd_log,
+                  ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                                : ss::log_level::warn,
+                  "Failed to fence epoch {} for ntp {}, error: {}",
+                  batch_epoch,
+                  ntp(),
+                  e);
+            }
+            std::rethrow_exception(e);
+        }
+        auto fence = std::move(fence_fut.get());
+        if (!fence.has_value()) {
+            vlog(
+              cd_log.warn,
+              "Failed to fence epoch {} for ntp {}, ctp latest seen epoch "
+              "is [{}, {}]",
+              batch_epoch,
+              ntp(),
+              fence.error().window_min,
+              fence.error().window_max);
+            co_return raft::errc::not_leader;
+        }
+
+        auto placeholders = co_await convert_to_placeholders(
+          res.value().extents, data_headers);
+        placeholder_batches = chunked_vector<model::record_batch>(
+          std::make_move_iterator(placeholders.batches.begin()),
+          std::make_move_iterator(placeholders.batches.end()));
+    }
+
+    // Restore the original input order by 2-way merging placeholders and
+    // control batches on their base offsets. Both inputs preserve their
+    // relative order from `batches`, and each batch already has a unique
+    // base_offset assigned, so a merge on base_offset reproduces the
+    // original interleaving without an auxiliary order tracker.
+    chunked_vector<model::record_batch> final_batches;
+    final_batches.reserve(input_count);
+    auto ph_it = placeholder_batches.begin();
+    auto ctl_it = control_batches.begin();
+    while (ph_it != placeholder_batches.end()
+           && ctl_it != control_batches.end()) {
+        if (ph_it->base_offset() < ctl_it->base_offset()) {
+            final_batches.push_back(std::move(*ph_it++));
+        } else {
+            final_batches.push_back(std::move(*ctl_it++));
+        }
+    }
+    for (; ph_it != placeholder_batches.end(); ++ph_it) {
+        final_batches.push_back(std::move(*ph_it));
+    }
+    for (; ctl_it != control_batches.end(); ++ctl_it) {
+        final_batches.push_back(std::move(*ctl_it));
+    }
+
+    auto stages = stm->replicate(
+      std::move(final_batches),
+      std::move(expected_base_offsets),
+      prev_log_offset,
+      timeout,
+      as);
+
+    auto enqueued_fut = co_await ss::coroutine::as_future(
+      std::move(stages.request_enqueued));
+    if (enqueued_fut.failed()) {
+        auto ex = enqueued_fut.get_exception();
+        vlogl(
+          cd_log,
+          ssx::is_shutdown_exception(ex) ? ss::log_level::debug
+                                         : ss::log_level::warn,
+          "Failed to enqueue replicate request for ntp {}: {}",
+          ntp(),
+          ex);
+        // fallthrough - we expect the finish command to throw if this one did
+        // and we don't want to abandon the replicate_finished future
+    }
+    co_return co_await std::move(stages.replicate_finished);
 }
 
 fmt::iterator

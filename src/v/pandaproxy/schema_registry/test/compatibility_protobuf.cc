@@ -10,7 +10,6 @@
 #include "pandaproxy/schema_registry/test/compatibility_protobuf.h"
 
 #include "absl/container/flat_hash_set.h"
-#include "bytes/iobuf_parser.h"
 #include "pandaproxy/schema_registry/error.h"
 #include "pandaproxy/schema_registry/exceptions.h"
 #include "pandaproxy/schema_registry/protobuf.h"
@@ -26,7 +25,6 @@
 #include <fmt/core.h>
 
 #include <array>
-#include <utility>
 
 namespace pp = pandaproxy;
 namespace pps = pp::schema_registry;
@@ -1830,6 +1828,71 @@ service FooService {
   rpc Foo(.foo.Bar) returns (.foo.Baz);
 }
 )"));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_protobuf_compatibility_remove_map_field) {
+    constexpr std::string_view with_map = R"(syntax = "proto3";
+
+message Product {
+  string name = 1;
+  map<string, string> tags = 10;
+}
+)";
+    constexpr std::string_view without_map = R"(syntax = "proto3";
+
+message Product {
+  string name = 1;
+}
+)";
+
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::backward, without_map, with_map));
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::backward_transitive, without_map, with_map));
+    BOOST_REQUIRE(
+      check_compatible(pps::compatibility_level::full, without_map, with_map));
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::full_transitive, without_map, with_map));
+
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::forward, with_map, without_map));
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::forward_transitive, with_map, without_map));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_protobuf_compatibility_map_in_nested_message) {
+    constexpr std::string_view with_map = R"(syntax = "proto3";
+
+message Outer {
+  message Inner {
+    string id = 1;
+    map<string, string> tags = 2;
+  }
+  Inner inner = 1;
+}
+)";
+    constexpr std::string_view without_map = R"(syntax = "proto3";
+
+message Outer {
+  message Inner {
+    string id = 1;
+  }
+  Inner inner = 1;
+}
+)";
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::backward, without_map, with_map));
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::backward_transitive, without_map, with_map));
+    BOOST_REQUIRE(
+      check_compatible(pps::compatibility_level::full, without_map, with_map));
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::full_transitive, without_map, with_map));
+
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::forward, with_map, without_map));
+    BOOST_REQUIRE(check_compatible(
+      pps::compatibility_level::forward_transitive, with_map, without_map));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_protobuf_compatibility_message_removed) {

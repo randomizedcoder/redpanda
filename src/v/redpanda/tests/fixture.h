@@ -86,9 +86,9 @@ public:
       bool enable_data_transforms = false,
       bool enable_legacy_upload_mode = true,
       bool iceberg_enabled = false,
-      bool enable_cloud_topics = false,
       bool development_cluster_linking_enabled = false,
-      cloud_topics::test_fixture_cfg ct_test_cfg = {});
+      cloud_topics::test_fixture_cfg ct_test_cfg
+      = cloud_topics::disable_cloud_topics_test_cfg);
 
     // creates single node with default configuration
     redpanda_thread_fixture();
@@ -103,7 +103,9 @@ public:
       init_cloud_storage_tag,
       std::optional<uint16_t> port = std::nullopt,
       cloud_storage_clients::s3_url_style url_style = default_url_style,
-      model::node_id node_id = model::node_id(1));
+      model::node_id node_id = model::node_id(1),
+      cloud_topics::test_fixture_cfg ct_test_cfg
+      = cloud_topics::disable_cloud_topics_test_cfg);
 
     struct init_cloud_topics_tag {};
 
@@ -123,7 +125,9 @@ public:
     explicit redpanda_thread_fixture(
       init_cloud_storage_no_archiver_tag,
       std::optional<uint16_t> port = std::nullopt,
-      cloud_storage_clients::s3_url_style url_style = default_url_style);
+      cloud_storage_clients::s3_url_style url_style = default_url_style,
+      cloud_topics::test_fixture_cfg ct_test_cfg
+      = cloud_topics::disable_cloud_topics_test_cfg);
 
     ~redpanda_thread_fixture();
 
@@ -159,7 +163,6 @@ public:
       bool data_transforms_enabled = false,
       bool legacy_upload_mode_enabled = true,
       bool iceberg_enabled = false,
-      bool enable_cloud_topics = false,
       bool development_cluster_linking_enabled = false);
 
     YAML::Node proxy_config(uint16_t proxy_port = 8082);
@@ -197,7 +200,39 @@ public:
 
     ss::future<> delete_topic(model::topic_namespace tp_ns);
 
-    ss::future<> wait_for_partition_offset(
+    /// Wait until the partition's raft committed offset reaches \p o.
+    ///
+    /// This is a barrier on raft state only — it does not wait for any STMs
+    /// (e.g. rm_stm) layered on top of the partition to catch up. Tests that
+    /// subsequently issue Kafka requests which consult `last_stable_offset()`
+    /// (fetch, list_offsets, etc.) should prefer wait_for_lso() instead, since
+    /// rm_stm bootstrap is asynchronous with respect to the raft commit
+    /// barrier and can briefly return invalid_lso even after committed_offset
+    /// has advanced.
+    ///
+    /// Polls until the condition holds or \p tout elapses. On timeout the
+    /// surrounding test case is failed via RPTEST_FAIL_CORO — callers do not
+    /// need to assert the wait themselves.
+    ss::future<> wait_for_committed_offset(
+      model::ntp ntp,
+      model::offset o,
+      model::timeout_clock::duration tout = 3s);
+
+    /// Wait until the partition's last stable offset (LSO) reaches \p o.
+    ///
+    /// Stronger than wait_for_committed_offset(): also ensures any STM atop
+    /// the partition (rm_stm, present whenever idempotence or transactions
+    /// are enabled) has finished bootstrapping and applied entries up to \p
+    /// o. Use this for tests that subsequently issue Kafka requests
+    /// dispatched through the broker (fetch, list_offsets, produce via the
+    /// kafka client transport), since those consult `last_stable_offset()`
+    /// and will surface `offset_not_available` while rm_stm is still
+    /// bootstrapping.
+    ///
+    /// Polls until the condition holds or \p tout elapses. On timeout the
+    /// surrounding test case is failed via RPTEST_FAIL_CORO — callers do not
+    /// need to assert the wait themselves.
+    ss::future<> wait_for_lso(
       model::ntp ntp,
       model::offset o,
       model::timeout_clock::duration tout = 3s);
@@ -292,5 +327,6 @@ public:
     ss::sharded<kafka::server> proto;
     bool remove_on_shutdown;
     std::unique_ptr<::stop_signal> app_signal;
-    cloud_topics::test_fixture_cfg ct_test_cfg{};
+    cloud_topics::test_fixture_cfg ct_test_cfg{
+      cloud_topics::disable_cloud_topics_test_cfg};
 };

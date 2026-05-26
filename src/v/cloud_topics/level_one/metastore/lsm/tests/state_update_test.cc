@@ -148,8 +148,8 @@ make_add_objects_update(const term_specs& terms, Objects... objects) {
 }
 
 template<typename... Objects>
-replace_objects_db_update
-make_replace_objects_update(const compact_specs& cs, Objects... objects) {
+compact_objects_db_update
+make_compact_objects_update(const compact_specs& cs, Objects... objects) {
     chunked_hash_map<
       model::topic_id,
       chunked_hash_map<model::partition_id, compaction_state_update>>
@@ -174,9 +174,36 @@ make_replace_objects_update(const compact_specs& cs, Objects... objects) {
     }
 
     auto new_objects = make_new_objects(objects...);
-    return replace_objects_db_update{
+    return compact_objects_db_update{
       .new_objects = std::move(new_objects),
       .compaction_updates = std::move(compaction_updates),
+    };
+}
+
+struct replace_spec {
+    model::topic_id_partition tidp;
+    int64_t epoch{0};
+};
+using replace_specs = std::vector<replace_spec>;
+
+template<typename... Objects>
+replace_objects_db_update
+make_replace_objects_update(const replace_specs& rs, Objects... objects) {
+    chunked_hash_map<
+      model::topic_id,
+      chunked_hash_map<
+        model::partition_id,
+        partition_state::compaction_epoch_t>>
+      expected_epochs;
+    for (const auto& r : rs) {
+        expected_epochs[r.tidp.topic_id][r.tidp.partition]
+          = partition_state::compaction_epoch_t(r.epoch);
+    }
+
+    auto new_objects = make_new_objects(objects...);
+    return replace_objects_db_update{
+      .new_objects = std::move(new_objects),
+      .expected_epochs = std::move(expected_epochs),
     };
 }
 
@@ -215,7 +242,17 @@ protected:
         return state_reader(std::move(snap));
     }
 
+    void
+    preregister_new_objects(const chunked_vector<new_object>& new_objects) {
+        chunked_vector<object_id> oids;
+        for (const auto& o : new_objects) {
+            oids.push_back(o.oid);
+        }
+        preregister_objects(std::move(oids), model::timestamp(1000));
+    }
+
     void apply_add_update(add_objects_db_update& update) {
+        preregister_new_objects(update.new_objects);
         auto reader = make_reader();
         chunked_vector<write_batch_row> rows;
         auto result = update.build_rows(reader, rows).get();
@@ -224,12 +261,36 @@ protected:
         auto wb = db_->create_write_batch();
         auto seqno = next_seqno();
         for (const auto& row : rows) {
-            wb.put(row.key, row.value.copy(), seqno);
+            if (row.value.empty()) {
+                wb.remove(row.key, seqno);
+            } else {
+                wb.put(row.key, row.value.copy(), seqno);
+            }
         }
         db_->apply(std::move(wb)).get();
     }
 
-    void apply_replace_update(replace_objects_db_update& update) {
+    void apply_compact_update(compact_objects_db_update& update) {
+        preregister_new_objects(update.new_objects);
+        auto reader = make_reader();
+        chunked_vector<write_batch_row> rows;
+        auto result = update.build_rows(reader, rows).get();
+        ASSERT_TRUE(result.has_value());
+
+        auto seqno = next_seqno();
+        auto wb = db_->create_write_batch();
+        for (const auto& row : rows) {
+            if (row.value.empty()) {
+                wb.remove(row.key, seqno);
+            } else {
+                wb.put(row.key, row.value.copy(), seqno);
+            }
+        }
+        db_->apply(std::move(wb)).get();
+    }
+
+    void apply_replace_no_compact_update(replace_objects_db_update& update) {
+        preregister_new_objects(update.new_objects);
         auto reader = make_reader();
         chunked_vector<write_batch_row> rows;
         auto result = update.build_rows(reader, rows).get();
@@ -377,9 +438,15 @@ protected:
     }
 
     template<typename... Objects>
-    void replace_objects(compact_specs cs, Objects... objects) {
-        auto db_update = make_replace_objects_update(std::move(cs), objects...);
-        apply_replace_update(db_update);
+    void compact_objects(compact_specs cs, Objects... objects) {
+        auto db_update = make_compact_objects_update(std::move(cs), objects...);
+        apply_compact_update(db_update);
+    }
+
+    template<typename... Objects>
+    void replace_objects(replace_specs rs, Objects... objects) {
+        auto db_update = make_replace_objects_update(std::move(rs), objects...);
+        apply_replace_no_compact_update(db_update);
     }
 
     void apply_set_start_offset_update(set_start_offset_db_update& update) {
@@ -480,6 +547,85 @@ protected:
         EXPECT_FALSE(res->has_value());
     }
 
+    void apply_preregister_update(preregister_objects_db_update& update) {
+        auto reader = make_reader();
+        chunked_vector<write_batch_row> rows;
+        auto result = update.build_rows(reader, rows).get();
+        ASSERT_TRUE(result.has_value());
+
+        auto seqno = next_seqno();
+        auto wb = db_->create_write_batch();
+        for (const auto& row : rows) {
+            if (row.value.empty()) {
+                wb.remove(row.key, seqno);
+            } else {
+                wb.put(row.key, row.value.copy(), seqno);
+            }
+        }
+        db_->apply(std::move(wb)).get();
+    }
+
+    void apply_expire_preregistered_update(
+      expire_preregistered_objects_db_update& update) {
+        auto reader = make_reader();
+        chunked_vector<write_batch_row> rows;
+        auto result = update.build_rows(reader, rows).get();
+        ASSERT_TRUE(result.has_value());
+
+        auto seqno = next_seqno();
+        auto wb = db_->create_write_batch();
+        for (const auto& row : rows) {
+            if (row.value.empty()) {
+                wb.remove(row.key, seqno);
+            } else {
+                wb.put(row.key, row.value.copy(), seqno);
+            }
+        }
+        db_->apply(std::move(wb)).get();
+    }
+
+    void verify_object_preregistered(object_id oid) {
+        auto reader = make_reader();
+        auto res = reader.get_object(oid).get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_TRUE(res.value().has_value());
+        EXPECT_TRUE(res.value()->is_preregistration);
+    }
+
+    void verify_object_not_preregistered(object_id oid) {
+        auto reader = make_reader();
+        auto res = reader.get_object(oid).get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_TRUE(res.value().has_value());
+        EXPECT_FALSE(res.value()->is_preregistration);
+    }
+
+    void preregister_objects(
+      chunked_vector<object_id> oids, model::timestamp registered_at) {
+        auto update = preregister_objects_db_update{
+          .object_ids = std::move(oids),
+          .registered_at = registered_at,
+        };
+        apply_preregister_update(update);
+    }
+
+    void verify_preregistered_object_exists(object_id oid) {
+        auto reader = make_reader();
+        auto res = reader.get_object(oid).get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_TRUE(res->has_value());
+        EXPECT_TRUE(res->value().is_preregistration);
+    }
+
+    void verify_preregistered_object_missing(object_id oid) {
+        auto reader = make_reader();
+        auto res = reader.get_object(oid).get();
+        ASSERT_TRUE(res.has_value());
+        if (res->has_value()) {
+            EXPECT_FALSE(res->value().is_preregistration);
+        }
+    }
+
     std::optional<lsm::database> db_;
 };
 
@@ -540,7 +686,8 @@ TEST_F(StateUpdateTest, TestAddObjectsRejectsDuplicateObject) {
     auto result = dupe_update.build_rows(reader, rows).get();
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().e, db_update_errc::invalid_update);
-    EXPECT_THAT(fmt::format("{}", result.error()), HasSubstr("already exists"));
+    EXPECT_THAT(
+      fmt::format("{}", result.error()), HasSubstr("not pre-registered"));
 }
 
 TEST_F(StateUpdateTest, TestAddObjectsRejectsEmptyObjects) {
@@ -647,6 +794,10 @@ TEST_F(StateUpdateTest, TestAddObjectsWithCorrections) {
 
     // Try to add misaligned objects starting at offset 50 instead of 100.
     auto new_oid = make_oid();
+    chunked_vector<object_id> prereg_oids;
+    prereg_oids.push_back(new_oid);
+    preregister_objects(std::move(prereg_oids), model::timestamp(1000));
+
     auto misaligned_update = make_add_objects_update(
       {terms(tidp0, {{50, 2}})},
       make_object(new_oid, tp(tidp0, 50, 149).pos(0, 1023)));
@@ -657,12 +808,16 @@ TEST_F(StateUpdateTest, TestAddObjectsWithCorrections) {
       = misaligned_update.build_rows(reader, rows, &corrections).get();
     ASSERT_TRUE(result.has_value());
 
-    // There should be one row generated -- an object entry (checked below).
+    // There should be one row: object entry (all data marked removed).
     EXPECT_EQ(1, rows.size());
     auto wb = db_->create_write_batch();
     auto seqno = next_seqno();
     for (const auto& row : rows) {
-        wb.put(row.key, row.value.copy(), seqno);
+        if (row.value.empty()) {
+            wb.remove(row.key, seqno);
+        } else {
+            wb.put(row.key, row.value.copy(), seqno);
+        }
     }
     db_->apply(std::move(wb)).get();
 
@@ -695,7 +850,8 @@ TEST_F(StateUpdateTest, TestReplaceObjectsBasic) {
     // Create a new object that replaces the first two extents [0-199].
     auto new_oid = make_oid();
     replace_objects(
-      compact_specs{}, make_object(new_oid, tp(tidp0, 0, 199).pos(0, 2047)));
+      replace_specs{{.tidp = tidp0, .epoch = 0}},
+      make_object(new_oid, tp(tidp0, 0, 199).pos(0, 2047)));
 
     // Metadata should be unchanged.
     verify_metadata(tidp0, kafka::offset(0), kafka::offset(300));
@@ -711,8 +867,14 @@ TEST_F(StateUpdateTest, TestReplaceObjectsBasic) {
 }
 
 TEST_F(StateUpdateTest, TestReplaceObjectsRejectsMissingPartition) {
+    auto oid = make_oid();
+    chunked_vector<object_id> prereg_oids;
+    prereg_oids.push_back(oid);
+    preregister_objects(std::move(prereg_oids), model::timestamp(1000));
+
     auto db_update = make_replace_objects_update(
-      compact_specs{}, make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 1023)));
+      replace_specs{{.tidp = tidp0, .epoch = 0}},
+      make_object(oid, tp(tidp0, 0, 99).pos(0, 1023)));
     auto reader = make_reader();
     chunked_vector<write_batch_row> rows;
     auto result = db_update.build_rows(reader, rows).get();
@@ -725,7 +887,7 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsMissingPartition) {
 TEST_F(StateUpdateTest, TestReplaceObjectsRejectsEmptyObjects) {
     replace_objects_db_update update{
       .new_objects = {},
-      .compaction_updates = {},
+      .expected_epochs = {},
     };
     auto validate_res = update.validate_inputs();
     ASSERT_FALSE(validate_res.has_value());
@@ -736,11 +898,11 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsEmptyObjects) {
 }
 
 TEST_F(
-  StateUpdateTest, TestReplaceObjectsRejectsCompactionUpdateWithoutExtents) {
+  StateUpdateTest, TestCompactObjectsRejectsCompactionUpdateWithoutExtents) {
     auto tidp1 = make_tidp(1);
 
     // Compaction update for tidp1, but extents only for tidp0.
-    auto db_update = make_replace_objects_update(
+    auto db_update = make_compact_objects_update(
       {{compact_spec{
         .tidp = tidp1,
         .cleaned = {{0, 99, false}},
@@ -756,9 +918,9 @@ TEST_F(
 }
 
 TEST_F(
-  StateUpdateTest, TestReplaceObjectsRejectsCleanedRangeExceedsExtentsEnd) {
+  StateUpdateTest, TestCompactObjectsRejectsCleanedRangeExceedsExtentsEnd) {
     // Cleaned range [0-299], but extents only [0-199].
-    auto db_update = make_replace_objects_update(
+    auto db_update = make_compact_objects_update(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{0, 299, false}},
@@ -774,9 +936,9 @@ TEST_F(
 }
 
 TEST_F(
-  StateUpdateTest, TestReplaceObjectsRejectsCleanedRangeStartsBeforeExtents) {
+  StateUpdateTest, TestCompactObjectsRejectsCleanedRangeStartsBeforeExtents) {
     // Extents start at 100, but cleaned range starts at 50.
-    auto db_update = make_replace_objects_update(
+    auto db_update = make_compact_objects_update(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{50, 199, false}},
@@ -799,23 +961,25 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsDuplicateObject) {
 
     // Try to replace using an object ID that already exists.
     auto db_update = make_replace_objects_update(
-      compact_specs{}, make_object(oid, tp(tidp0, 0, 99).pos(0, 1023)));
+      replace_specs{{.tidp = tidp0, .epoch = 0}},
+      make_object(oid, tp(tidp0, 0, 99).pos(0, 1023)));
     auto reader = make_reader();
     chunked_vector<write_batch_row> rows;
     auto result = db_update.build_rows(reader, rows).get();
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().e, db_update_errc::invalid_update);
-    EXPECT_THAT(fmt::format("{}", result.error()), HasSubstr("already exists"));
+    EXPECT_THAT(
+      fmt::format("{}", result.error()), HasSubstr("not pre-registered"));
 }
 
-TEST_F(StateUpdateTest, TestReplaceObjectsRejectsOverlappingCleanedRanges) {
+TEST_F(StateUpdateTest, TestCompactObjectsRejectsOverlappingCleanedRanges) {
     // Set up partition with existing cleaned range with tombstones.
     add_objects(
       {terms(tidp0, {{0, 1}})},
       make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 1023)));
 
     // Add a cleaned range [0-49].
-    replace_objects(
+    compact_objects(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{0, 49, true}},
@@ -828,14 +992,19 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsOverlappingCleanedRanges) {
 
     // Now try to add overlapping cleaned range [49-99].
     // epoch=1 because the first compaction incremented it from 0 to 1.
-    auto db_update = make_replace_objects_update(
+    auto overlap_oid = make_oid();
+    chunked_vector<object_id> prereg_oids;
+    prereg_oids.push_back(overlap_oid);
+    preregister_objects(std::move(prereg_oids), model::timestamp(1000));
+
+    auto db_update = make_compact_objects_update(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned_at = 2000,
         .epoch = 1,
         .cleaned = {{49, 99, true}},
       }}},
-      make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 511)));
+      make_object(overlap_oid, tp(tidp0, 0, 99).pos(0, 511)));
 
     auto reader = make_reader();
     chunked_vector<write_batch_row> rows;
@@ -847,19 +1016,24 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsOverlappingCleanedRanges) {
       HasSubstr("overlaps with an existing cleaned range"));
 }
 
-TEST_F(StateUpdateTest, TestReplaceObjectsRejectsRemovingUntrackedTombstones) {
+TEST_F(StateUpdateTest, TestCompactObjectsRejectsRemovingUntrackedTombstones) {
     // Set up partition without any tombstone tracking.
     add_objects(
       {terms(tidp0, {{0, 1}})},
       make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 1023)));
 
     // Try to remove tombstones from range [0-49] which doesn't have them.
-    auto db_update = make_replace_objects_update(
+    auto tomb_oid = make_oid();
+    chunked_vector<object_id> prereg_oids;
+    prereg_oids.push_back(tomb_oid);
+    preregister_objects(std::move(prereg_oids), model::timestamp(1000));
+
+    auto db_update = make_compact_objects_update(
       {{compact_spec{
         .tidp = tidp0,
         .rm_tombstones = {{0, 49}},
       }}},
-      make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 1023)));
+      make_object(tomb_oid, tp(tidp0, 0, 99).pos(0, 1023)));
 
     auto reader = make_reader();
     chunked_vector<write_batch_row> rows;
@@ -871,16 +1045,16 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsRemovingUntrackedTombstones) {
       HasSubstr("is not tracked as having tombstones"));
 }
 
-TEST_F(StateUpdateTest, TestReplaceObjectsWithCompactionAndTombstones) {
+TEST_F(StateUpdateTest, TestCompactObjectsWithCompactionAndTombstones) {
     // Set up initial partition.
     add_objects(
       {terms(tidp0, {{0, 1}})},
       make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 2047)),
       make_object(make_oid(), tp(tidp0, 100, 199).pos(0, 2047)));
 
-    // First replace with cleaned range with tombstones [0-99].
+    // First compact with cleaned range with tombstones [0-99].
     auto new_oid1 = make_oid();
-    replace_objects(
+    compact_objects(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned_at = 1000,
@@ -897,11 +1071,11 @@ TEST_F(StateUpdateTest, TestReplaceObjectsWithCompactionAndTombstones) {
       /*expected_cleaned_ranges=*/{{0, 99}},
       /*expected_tombstone_ranges=*/{{0, 99, 1000}});
 
-    // Second replace: add non-overlapping cleaned range with tombstones
+    // Second compact: add non-overlapping cleaned range with tombstones
     // [150-199], and remove tombstones from [0-49].
     // epoch=1 because the first compaction incremented it from 0 to 1.
     auto new_oid2 = make_oid();
-    replace_objects(
+    compact_objects(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned_at = 2000,
@@ -921,7 +1095,7 @@ TEST_F(StateUpdateTest, TestReplaceObjectsWithCompactionAndTombstones) {
       /*expected_tombstone_ranges=*/{{50, 99, 1000}, {150, 199, 2000}});
 }
 
-TEST_F(StateUpdateTest, TestReplaceObjectsRejectsCleanedRangeNotAtLogStart) {
+TEST_F(StateUpdateTest, TestCompactObjectsRejectsCleanedRangeNotAtLogStart) {
     add_objects(
       {terms(tidp0, {{0, 1}})},
       make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 1023)),
@@ -929,15 +1103,20 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsCleanedRangeNotAtLogStart) {
 
     verify_metadata(tidp0, kafka::offset(0), kafka::offset(200));
 
-    // Try to replace with cleaned range [100-199], but without replacing down
+    // Try to compact with cleaned range [100-199], but without replacing down
     // to offset 0. This should be rejected because cleaning requires
     // replacing from the start of the log.
-    auto db_update = make_replace_objects_update(
+    auto partial_oid = make_oid();
+    chunked_vector<object_id> prereg_oids;
+    prereg_oids.push_back(partial_oid);
+    preregister_objects(std::move(prereg_oids), model::timestamp(1000));
+
+    auto db_update = make_compact_objects_update(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{100, 199, false}},
       }}},
-      make_object(make_oid(), tp(tidp0, 100, 199).pos(0, 1023)));
+      make_object(partial_oid, tp(tidp0, 100, 199).pos(0, 1023)));
 
     auto reader = make_reader();
     chunked_vector<write_batch_row> rows;
@@ -948,8 +1127,8 @@ TEST_F(StateUpdateTest, TestReplaceObjectsRejectsCleanedRangeNotAtLogStart) {
       fmt::format("{}", result.error()),
       HasSubstr("does not replace to the beginning of the log"));
 
-    // Now validate that replacing down to 0 works.
-    replace_objects(
+    // Now validate that compacting down to 0 works.
+    compact_objects(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{100, 199, false}},
@@ -1127,7 +1306,7 @@ TEST_F(StateUpdateTest, TestSetStartOffsetTruncatesCompactionState) {
       {terms(tidp0, {{0, 1}})},
       make_object(oid1, tp(tidp0, 0, 99).pos(0, 1023)));
 
-    replace_objects(
+    compact_objects(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{20, 80, true}},
@@ -1216,7 +1395,7 @@ TEST_F(StateUpdateTest, TestRemoveTopicsWithCompaction) {
       make_object(oid, tp(tidp0, 0, 99).pos(0, 1023)));
 
     // Add a cleaned range.
-    replace_objects(
+    compact_objects(
       {{compact_spec{
         .tidp = tidp0,
         .cleaned = {{0, 49, true}},
@@ -1394,7 +1573,8 @@ TEST_F(StateUpdateTest, TestReplaceObjectsTracksSize) {
     // Replace both extents with a single smaller extent.
     auto new_oid = make_oid();
     replace_objects(
-      compact_specs{}, make_object(new_oid, tp(tidp0, 0, 199).pos(0, 511)));
+      replace_specs{{.tidp = tidp0, .epoch = 0}},
+      make_object(new_oid, tp(tidp0, 0, 199).pos(0, 511)));
 
     // Size should be updated to the new extent size (512).
     verify_metadata_size(tidp0, 512);
@@ -1416,7 +1596,7 @@ TEST_F(StateUpdateTest, TestReplaceObjectsTracksSizeMultiplePartitions) {
 
     // Replace only tidp0's extent with a smaller one.
     replace_objects(
-      compact_specs{},
+      replace_specs{{.tidp = tidp0, .epoch = 0}},
       make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 199))); // size = 200
 
     // tidp0 should have updated size, tidp1 should be unchanged.
@@ -1465,4 +1645,336 @@ TEST_F(StateUpdateTest, TestRemoveTopicsZerosSize) {
 
     // Metadata should be removed entirely.
     verify_metadata_missing(tidp0);
+}
+
+TEST_F(StateUpdateTest, TestPreregisterObjectsBasic) {
+    auto oid1 = make_oid();
+    auto oid2 = make_oid();
+
+    preregister_objects_db_update update;
+    update.object_ids.push_back(oid1);
+    update.object_ids.push_back(oid2);
+    update.registered_at = model::timestamp::now();
+
+    auto reader = make_reader();
+    auto can_apply_res = update.can_apply(reader).get();
+    ASSERT_TRUE(can_apply_res.has_value());
+
+    apply_preregister_update(update);
+
+    verify_object_preregistered(oid1);
+    verify_object_preregistered(oid2);
+}
+
+TEST_F(StateUpdateTest, TestPreregisterObjectsRejectsDuplicate) {
+    auto oid1 = make_oid();
+
+    preregister_objects_db_update update1;
+    update1.object_ids.push_back(oid1);
+    update1.registered_at = model::timestamp::now();
+    apply_preregister_update(update1);
+
+    preregister_objects_db_update update2;
+    update2.object_ids.push_back(oid1);
+    update2.registered_at = model::timestamp::now();
+    auto reader = make_reader();
+    auto can_apply_res = update2.can_apply(reader).get();
+    EXPECT_FALSE(can_apply_res.has_value());
+}
+
+TEST_F(StateUpdateTest, TestExpirePreregisteredObjectsClearsFlag) {
+    auto oid1 = make_oid();
+    auto oid2 = make_oid();
+
+    preregister_objects_db_update prereg;
+    prereg.object_ids.push_back(oid1);
+    prereg.object_ids.push_back(oid2);
+    prereg.registered_at = model::timestamp::now();
+    apply_preregister_update(prereg);
+
+    verify_object_preregistered(oid1);
+    verify_object_preregistered(oid2);
+
+    expire_preregistered_objects_db_update expire;
+    expire.object_ids.push_back(oid1);
+    apply_expire_preregistered_update(expire);
+
+    // oid1 should have is_preregistration cleared.
+    verify_object_not_preregistered(oid1);
+    // oid2 should be unchanged.
+    verify_object_preregistered(oid2);
+}
+
+TEST_F(StateUpdateTest, TestPreregisterObjects) {
+    auto oid1 = make_oid();
+    auto oid2 = make_oid();
+
+    chunked_vector<object_id> oids;
+    oids.push_back(oid1);
+    oids.push_back(oid2);
+    preregister_objects(std::move(oids), model::timestamp(12345));
+
+    verify_preregistered_object_exists(oid1);
+    verify_preregistered_object_exists(oid2);
+}
+
+TEST_F(StateUpdateTest, TestExpirePreregisteredObjects) {
+    auto oid1 = make_oid();
+    auto oid2 = make_oid();
+
+    chunked_vector<object_id> oids;
+    oids.push_back(oid1);
+    oids.push_back(oid2);
+    preregister_objects(std::move(oids), model::timestamp(12345));
+
+    verify_preregistered_object_exists(oid1);
+    verify_preregistered_object_exists(oid2);
+
+    chunked_vector<object_id> expire_oids;
+    expire_oids.push_back(oid1);
+    expire_oids.push_back(oid2);
+    auto expire_update = expire_preregistered_objects_db_update{
+      .object_ids = std::move(expire_oids),
+    };
+    apply_expire_preregistered_update(expire_update);
+
+    // is_preregistration flag should be cleared.
+    verify_preregistered_object_missing(oid1);
+    verify_preregistered_object_missing(oid2);
+
+    // Objects remain as zero-sized entries, now eligible for GC.
+    verify_object_exists(oid1, 0);
+    verify_object_exists(oid2, 0);
+}
+
+TEST_F(StateUpdateTest, TestAddObjectsRequiresPreregistration) {
+    auto oid = make_oid();
+
+    // Attempt to add an object that has NOT been pre-registered.
+    auto update = make_add_objects_update(
+      {terms(tidp0, {{0, 1}})},
+      make_object(oid, tp(tidp0, 0, 99).pos(0, 1023)));
+    auto reader = make_reader();
+    chunked_vector<write_batch_row> rows;
+    auto result = update.build_rows(reader, rows).get();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().e, db_update_errc::invalid_update);
+}
+
+TEST_F(StateUpdateTest, TestAddObjectsWithPreregistration) {
+    auto oid = make_oid();
+
+    // Pre-register the object first.
+    chunked_vector<object_id> oids;
+    oids.push_back(oid);
+    preregister_objects(std::move(oids), model::timestamp(12345));
+    verify_preregistered_object_exists(oid);
+
+    // Now add the object — call build_rows directly since oid is already
+    // preregistered (add_objects() would preregister again, which is invalid).
+    {
+        auto db_update = make_add_objects_update(
+          {terms(tidp0, {{0, 1}})},
+          make_object(oid, tp(tidp0, 0, 99).pos(0, 1023)));
+        auto reader = make_reader();
+        chunked_vector<write_batch_row> rows;
+        ASSERT_TRUE(db_update.build_rows(reader, rows).get().has_value());
+        auto wb = db_->create_write_batch();
+        auto seqno = next_seqno();
+        for (const auto& row : rows) {
+            if (row.value.empty()) {
+                wb.remove(row.key, seqno);
+            } else {
+                wb.put(row.key, row.value.copy(), seqno);
+            }
+        }
+        db_->apply(std::move(wb)).get();
+    }
+
+    verify_metadata(tidp0, kafka::offset(0), kafka::offset(100));
+    verify_object_exists(oid, 1024);
+
+    // Preregistered row should be cleaned up.
+    verify_preregistered_object_missing(oid);
+}
+
+TEST_F(StateUpdateTest, TestDiscoverTruncatedObjectIds) {
+    auto oid1 = make_oid();
+    auto oid2 = make_oid();
+    auto oid3 = make_oid();
+    add_objects(
+      {terms(tidp0, {{0, 1}})},
+      make_object(oid1, tp(tidp0, 0, 99).pos(0, 1023)),
+      make_object(oid2, tp(tidp0, 100, 199).pos(0, 1023)),
+      make_object(oid3, tp(tidp0, 200, 299).pos(0, 1023)));
+
+    // Discover objects below offset 200: should find oid1 and oid2.
+    auto update = set_start_offset_db_update{
+      .tp = tidp0,
+      .new_start_offset = kafka::offset(200),
+    };
+    auto reader = make_reader();
+    auto result = update.discover_truncated_object_ids(reader).get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value().size(), 2);
+    EXPECT_TRUE(result.value().contains(oid1));
+    EXPECT_TRUE(result.value().contains(oid2));
+    EXPECT_FALSE(result.value().contains(oid3));
+}
+
+TEST_F(StateUpdateTest, TestDiscoverReplacedObjectIds) {
+    auto old_oid1 = make_oid();
+    auto old_oid2 = make_oid();
+    auto old_oid3 = make_oid();
+    add_objects(
+      {terms(tidp0, {{0, 1}})},
+      make_object(old_oid1, tp(tidp0, 0, 99).pos(0, 1023)),
+      make_object(old_oid2, tp(tidp0, 100, 199).pos(0, 1023)),
+      make_object(old_oid3, tp(tidp0, 200, 299).pos(0, 1023)));
+
+    // Build a replace update that replaces extents [0-199]. Discovery
+    // should find old_oid1 and old_oid2 but not old_oid3.
+    auto new_oid = make_oid();
+    auto db_update = make_replace_objects_update(
+      replace_specs{{.tidp = tidp0, .epoch = 0}},
+      make_object(new_oid, tp(tidp0, 0, 199).pos(0, 2047)));
+
+    // Preregister the new object so validate_inputs passes.
+    preregister_new_objects(db_update.new_objects);
+
+    auto reader = make_reader();
+    auto result = db_update.discover_replaced_object_ids(reader).get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value().size(), 2);
+    EXPECT_TRUE(result.value().contains(old_oid1));
+    EXPECT_TRUE(result.value().contains(old_oid2));
+    EXPECT_FALSE(result.value().contains(old_oid3));
+}
+
+TEST_F(StateUpdateTest, TestDiscoverRemoveTopicsObjectIds) {
+    // Use a different topic_id for the second topic.
+    auto other_tidp = model::topic_id_partition(
+      model::topic_id(
+        uuid_t::from_string("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")),
+      model::partition_id(0));
+
+    auto oid1 = make_oid();
+    auto oid2 = make_oid();
+    auto oid3 = make_oid();
+    add_objects(
+      {terms(tidp0, {{0, 1}})},
+      make_object(oid1, tp(tidp0, 0, 99).pos(0, 1023)),
+      make_object(oid2, tp(tidp0, 100, 199).pos(0, 1023)));
+    add_objects(
+      {terms(other_tidp, {{0, 1}})},
+      make_object(oid3, tp(other_tidp, 0, 99).pos(0, 1023)));
+
+    // Discover objects for tidp0's topic only — should find oid1 and oid2
+    // but not oid3 (different topic).
+    auto update = remove_topics_db_update{
+      .topics = chunked_vector<model::topic_id>::single(tidp0.topic_id),
+    };
+    auto reader = make_reader();
+    auto result = update.discover_object_ids(reader).get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value().size(), 2);
+    EXPECT_TRUE(result.value().contains(oid1));
+    EXPECT_TRUE(result.value().contains(oid2));
+    EXPECT_FALSE(result.value().contains(oid3));
+}
+
+TEST_F(StateUpdateTest, TestReplaceObjectsEpochMismatchRejectedAtBuildRows) {
+    // Set up a partition at epoch 0.
+    add_objects(
+      {terms(tidp0, {{0, 1}})},
+      make_object(make_oid(), tp(tidp0, 0, 99).pos(0, 1023)));
+
+    verify_metadata(tidp0, kafka::offset(0), kafka::offset(100));
+
+    // Build a replace_objects_db_update with expected_epoch = 1, but
+    // the actual epoch is still 0.
+    auto new_oid = make_oid();
+    chunked_vector<object_id> prereg_oids;
+    prereg_oids.push_back(new_oid);
+    preregister_objects(std::move(prereg_oids), model::timestamp(1000));
+
+    chunked_hash_map<
+      model::topic_id,
+      chunked_hash_map<
+        model::partition_id,
+        partition_state::compaction_epoch_t>>
+      expected_epochs;
+    expected_epochs[tidp0.topic_id][tidp0.partition]
+      = partition_state::compaction_epoch_t{1};
+
+    replace_objects_db_update db_update{
+      .new_objects = make_new_objects(
+        make_object(new_oid, tp(tidp0, 0, 99).pos(0, 1023))),
+      .expected_epochs = std::move(expected_epochs),
+    };
+
+    auto reader = make_reader();
+    chunked_vector<write_batch_row> rows;
+    auto result = db_update.build_rows(reader, rows).get();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().e, db_update_errc::invalid_update);
+    EXPECT_THAT(
+      fmt::format("{}", result.error()),
+      HasSubstr("Compaction epoch mismatch"));
+}
+
+TEST_F(StateUpdateTest, TestReplaceObjectsRejectsExtentsWithoutEpochEntry) {
+    // Build a replace_objects_db_update with new_objects but empty
+    // expected_epochs. validate_inputs should reject it because the
+    // bidirectional invariant requires an expected_epochs entry for every
+    // partition that has new extents.
+    auto oid = make_oid();
+    replace_objects_db_update db_update{
+      .new_objects = make_new_objects(
+        make_object(oid, tp(tidp0, 0, 99).pos(0, 1023))),
+      .expected_epochs = {},
+    };
+    auto result = db_update.validate_inputs();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().e, db_update_errc::invalid_input);
+    EXPECT_THAT(
+      fmt::format("{}", result.error()), HasSubstr("no expected_epochs entry"));
+}
+
+TEST_F(StateUpdateTest, TestReplaceObjectsRejectsEpochEntryWithoutExtents) {
+    // Build a replace_objects_db_update where expected_epochs
+    // contains an entry for a partition that has no corresponding new extents.
+    // validate_inputs should reject it (bidirectional invariant).
+    auto oid = make_oid();
+
+    chunked_hash_map<
+      model::topic_id,
+      chunked_hash_map<
+        model::partition_id,
+        partition_state::compaction_epoch_t>>
+      expected_epochs;
+
+    // tidp0 has extents.
+    expected_epochs[tidp0.topic_id][tidp0.partition]
+      = partition_state::compaction_epoch_t{0};
+
+    // Add an entry for a different partition that has no extents.
+    auto other_tidp = model::topic_id_partition(
+      model::topic_id(
+        uuid_t::from_string("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")),
+      model::partition_id(0));
+    expected_epochs[other_tidp.topic_id][other_tidp.partition]
+      = partition_state::compaction_epoch_t{0};
+
+    replace_objects_db_update db_update{
+      .new_objects = make_new_objects(
+        make_object(oid, tp(tidp0, 0, 99).pos(0, 1023))),
+      .expected_epochs = std::move(expected_epochs),
+    };
+    auto result = db_update.validate_inputs();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().e, db_update_errc::invalid_input);
+    EXPECT_THAT(
+      fmt::format("{}", result.error()),
+      HasSubstr("expected_epochs entry for"));
 }

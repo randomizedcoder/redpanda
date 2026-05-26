@@ -12,6 +12,7 @@
 
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
+#include "base/format_to.h"
 #include "cluster/errc.h"
 #include "container/chunked_hash_map.h"
 #include "model/fundamental.h"
@@ -42,7 +43,7 @@ struct node_disk_space {
 
     double final_used_ratio() const;
 
-    friend std::ostream& operator<<(std::ostream& o, const node_disk_space& d);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct partition_balancer_violations
@@ -61,13 +62,12 @@ struct partition_balancer_violations
         unavailable_node() noexcept = default;
         unavailable_node(model::node_id id, model::timestamp unavailable_since);
 
-        friend std::ostream&
-        operator<<(std::ostream& o, const unavailable_node& u);
+        fmt::iterator format_to(fmt::iterator it) const;
 
         auto serde_fields() { return std::tie(id, unavailable_since); }
 
-        friend bool operator==(const unavailable_node&, const unavailable_node&)
-          = default;
+        friend bool
+        operator==(const unavailable_node&, const unavailable_node&) = default;
     };
 
     struct full_node
@@ -79,7 +79,7 @@ struct partition_balancer_violations
         full_node() noexcept = default;
         full_node(model::node_id id, uint32_t disk_used_percent);
 
-        friend std::ostream& operator<<(std::ostream& o, const full_node& f);
+        fmt::iterator format_to(fmt::iterator it) const;
 
         auto serde_fields() { return std::tie(id, disk_used_percent); }
 
@@ -94,15 +94,13 @@ struct partition_balancer_violations
     partition_balancer_violations(
       std::vector<unavailable_node> un, std::vector<full_node> fn);
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const partition_balancer_violations& v);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     auto serde_fields() { return std::tie(unavailable_nodes, full_nodes); }
 
     friend bool operator==(
       const partition_balancer_violations&,
-      const partition_balancer_violations&)
-      = default;
+      const partition_balancer_violations&) = default;
 
     bool is_empty() const {
         return unavailable_nodes.empty() && full_nodes.empty();
@@ -117,15 +115,14 @@ enum class partition_balancer_status {
     stalled,
 };
 
-std::ostream& operator<<(std::ostream& os, partition_balancer_status status);
+fmt::iterator format_to(partition_balancer_status status, fmt::iterator);
 
 struct partition_balancer_overview_request
   : serde::envelope<
       partition_balancer_overview_request,
       serde::version<0>,
       serde::compat_version<0>> {
-    friend std::ostream&
-    operator<<(std::ostream& o, const partition_balancer_overview_request&);
+    fmt::iterator format_to(fmt::iterator it) const;
     auto serde_fields() { return std::tie(); }
 };
 
@@ -140,7 +137,7 @@ enum class change_reason {
     disk_full,
 };
 
-std::ostream& operator<<(std::ostream& o, change_reason rep);
+fmt::iterator format_to(change_reason rep, fmt::iterator);
 /**
  * Enum providing a details about partition replica reallocation failure.
  */
@@ -156,7 +153,7 @@ enum class reallocation_error : int8_t {
     unknown_error,
 };
 
-std::ostream& operator<<(std::ostream& o, reallocation_error rep);
+fmt::iterator format_to(reallocation_error rep, fmt::iterator);
 
 /**
  * Struct providing details about partition replica reallocation failure.
@@ -174,11 +171,10 @@ struct reallocation_failure_details
 
     auto serde_fields() { return std::tie(replica_to_move, reason, error); }
     friend bool operator==(
-      const reallocation_failure_details&, const reallocation_failure_details&)
-      = default;
+      const reallocation_failure_details&,
+      const reallocation_failure_details&) = default;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const reallocation_failure_details& rep);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct partition_balancer_overview_reply
@@ -192,11 +188,9 @@ struct partition_balancer_overview_reply
     partition_balancer_overview_reply(partition_balancer_overview_reply&&)
       = default;
     partition_balancer_overview_reply&
-    operator=(const partition_balancer_overview_reply&)
-      = delete;
+    operator=(const partition_balancer_overview_reply&) = delete;
     partition_balancer_overview_reply&
-    operator=(partition_balancer_overview_reply&&)
-      = default;
+    operator=(partition_balancer_overview_reply&&) = default;
 
     errc error;
     model::timestamp last_tick_time;
@@ -227,11 +221,9 @@ struct partition_balancer_overview_reply
 
     friend bool operator==(
       const partition_balancer_overview_reply&,
-      const partition_balancer_overview_reply&)
-      = default;
+      const partition_balancer_overview_reply&) = default;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const partition_balancer_overview_reply& rep);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     partition_balancer_overview_reply copy() const;
 };

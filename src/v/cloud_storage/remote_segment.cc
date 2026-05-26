@@ -17,7 +17,6 @@
 #include "cloud_storage/download_exception.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/materialized_resources.h"
-#include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/remote_segment_index.h"
 #include "cloud_storage/segment_chunk_data_source.h"
 #include "cloud_storage/tx_range_manifest.h"
@@ -39,14 +38,11 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/core/queue.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/when_all.hh>
-#include <seastar/coroutine/all.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
@@ -418,7 +414,7 @@ ss::future<uint64_t> remote_segment::put_segment_in_cache_and_create_index(
           _ctxlog.warn,
           "Failed to write a segment file to cache, error: {}",
           put_exception);
-        std::rethrow_exception(put_exception);
+        co_await ss::coroutine::return_exception_ptr(std::move(put_exception));
     }
     if (index_prepared) {
         auto index_reservation = co_await _cache.reserve_space(
@@ -499,7 +495,8 @@ ss::future<> remote_segment::do_hydrate_segment() {
           "invoked",
           _path,
           _wait_list.size());
-        throw download_exception(res, _path);
+        co_await ss::coroutine::return_exception(
+          download_exception(res, _path));
     }
 }
 
@@ -520,7 +517,8 @@ ss::future<> remote_segment::do_hydrate_index() {
       _bucket, remote_segment_path{_index_path}, ix, local_rtc);
 
     if (result != download_result::success) {
-        throw download_exception(result, _index_path);
+        co_await ss::coroutine::return_exception(
+          download_exception(result, _index_path));
     }
 
     _index = std::move(ix);
@@ -567,7 +565,8 @@ ss::future<> remote_segment::do_hydrate_txrange() {
 
         if (
           res != download_result::success && res != download_result::notfound) {
-            throw download_exception(res, _path);
+            co_await ss::coroutine::return_exception(
+              download_exception(res, _path));
         }
 
         auto [stream, size] = co_await manifest.serialize();
@@ -843,8 +842,9 @@ ss::future<> remote_segment::run_hydrate_bg() {
                 co_await hydration.hydrate(_wait_list.size());
                 err = hydration.current_error();
                 if (!err) {
-                    if (auto mat_res = co_await hydration.materialize();
-                        !mat_res) {
+                    if (
+                      auto mat_res = co_await hydration.materialize();
+                      !mat_res) {
                         continue;
                     }
                 }
@@ -1031,13 +1031,21 @@ ss::future<> remote_segment::do_hydrate(
             // download failed, we may not be able to progress. So we
             // fallback to old format where the full segment was downloaded,
             // and try to hydrate again.
-            if (ex.path == _index_path && !_fallback_mode) {
-                vlog(
-                  _ctxlog.info,
-                  "failed to download index with error [{}], switching to "
-                  "fallback mode and retrying hydration.",
-                  ex);
-                switch_to_legacy_mode();
+            if (ex.path == _index_path) {
+                if (!_fallback_mode) {
+                    vlog(
+                      _ctxlog.info,
+                      "failed to download index with error [{}], switching to "
+                      "fallback mode and retrying hydration.",
+                      ex);
+                    switch_to_legacy_mode();
+                }
+                // In legacy mode the index is never downloaded. So if
+                // `_fallback_mode = fallback_mode::yes` here its because we are
+                // racing with a concurrent hydration request. Hence it should
+                // be fine to re-enter the wait list so we can be notified when
+                // the legacy hydration finishes.
+
                 return do_hydrate(as, deadline).then([] {
                     // This is an empty file to match the type returned by
                     // `fut`. The result is discarded immediately so it is
@@ -1047,9 +1055,7 @@ ss::future<> remote_segment::do_hydrate(
             }
 
             // If the download failure was something other than the index,
-            // OR if we are in the fallback mode already or if we are
-            // working with old format, rethrow the exception and let the
-            // upper layer handle it.
+            // rethrow the exception and let the upper layer handle it.
             return ss::make_exception_future<ss::file>(ex);
         })
       .discard_result();
@@ -1086,8 +1092,9 @@ ss::future<> remote_segment::hydrate(model::opt_abort_source_t as) {
 
 ss::future<> remote_segment::hydrate_chunk(chunk_start_offset_t start_offset) {
     const auto path_to_start = get_path_to_chunk(start_offset);
-    if (const auto status = co_await _cache.is_cached(path_to_start);
-        status == cloud_io::cache_element_status::available) {
+    if (
+      const auto status = co_await _cache.is_cached(path_to_start);
+      status == cloud_io::cache_element_status::available) {
         vlog(
           _ctxlog.debug,
           "skipping chunk hydration for chunk path {}, it is already in "
@@ -1128,6 +1135,14 @@ ss::future<> remote_segment::hydrate_chunk(chunk_start_offset_t start_offset) {
 
     _probe.chunk_size(space_required);
     _ts_probe.on_chunks_hydration(1);
+}
+
+ss::future<> remote_segment::prefetch_first_chunk() {
+    if (!is_legacy_mode_engaged() && _chunks_api.has_value()) {
+        return _chunks_api->hydrate_chunk(chunk_start_offset_t{0})
+          .discard_result();
+    }
+    return ss::now();
 }
 
 ss::future<ss::file>
@@ -1310,8 +1325,8 @@ public:
 
         // The segment can be scanned from the begining so we should skip
         // irrelevant batches.
-        if (unlikely(
-              rp_to_kafka(header.last_offset()) < _config.start_offset)) {
+        if (
+          unlikely(rp_to_kafka(header.last_offset()) < _config.start_offset)) {
             vlog(
               _ctxlog.debug,
               "[{}] accept_batch_start skip because "
@@ -1436,8 +1451,8 @@ public:
         co_return stop_parser::no;
     }
 
-    void print(std::ostream& o) const override {
-        o << "remote_segment_batch_consumer";
+    fmt::iterator format_to(fmt::iterator it) const override {
+        return fmt::format_to(it, "remote_segment_batch_consumer");
     }
 
 private:
@@ -1611,17 +1626,6 @@ remote_segment_batch_reader::~remote_segment_batch_reader() noexcept {
     _ts_probe.segment_reader_destroyed();
 }
 
-std::ostream& operator<<(std::ostream& os, hydration_request::kind kind) {
-    switch (kind) {
-    case hydration_request::kind::segment:
-        return os << "segment";
-    case hydration_request::kind::tx:
-        return os << "tx-range";
-    case hydration_request::kind::index:
-        return os << "index";
-    }
-}
-
 hydration_loop_state::hydration_loop_state(
   cloud_io::cache& c, remote_segment_path root, retry_chain_logger& ctxlog)
   : _cache{c}
@@ -1635,11 +1639,12 @@ void hydration_loop_state::add_request(
   hydration_request::kind path_kind) {
     // Do not re-add the path. A path may be added conditionally in a
     // loop, we should only add it the first time it is requested.
-    if (auto it = std::find_if(
-          _states.cbegin(),
-          _states.cend(),
-          [&p](const auto& st) { return st.path == p; });
-        it != _states.end()) {
+    if (
+      auto it = std::find_if(
+        _states.cbegin(),
+        _states.cend(),
+        [&p](const auto& st) { return st.path == p; });
+      it != _states.end()) {
         return;
     }
 

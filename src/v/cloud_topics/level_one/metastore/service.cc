@@ -27,9 +27,15 @@ service::add_objects(add_objects_request request, ::rpc::streaming_context&) {
       std::move(request), leader_router::local_only::yes);
 }
 
-ss::future<replace_objects_reply> service::replace_objects(
+ss::future<replace_objects_reply> service::replace_objects_no_compact(
   replace_objects_request request, ::rpc::streaming_context&) {
     return _leader_router->local().replace_objects(
+      std::move(request), leader_router::local_only::yes);
+}
+
+ss::future<compact_objects_reply> service::compact_objects(
+  compact_objects_request request, ::rpc::streaming_context&) {
+    return _leader_router->local().compact_objects(
       std::move(request), leader_router::local_only::yes);
 }
 
@@ -100,6 +106,12 @@ ss::future<get_compaction_infos_reply> service::get_compaction_infos(
       std::move(request), leader_router::local_only::yes);
 }
 
+ss::future<get_leveling_infos_reply> service::get_leveling_infos(
+  get_leveling_infos_request request, ::rpc::streaming_context&) {
+    return _leader_router->local().get_leveling_infos(
+      std::move(request), leader_router::local_only::yes);
+}
+
 ss::future<get_extent_metadata_reply> service::get_extent_metadata(
   get_extent_metadata_request request, ::rpc::streaming_context&) {
     return _leader_router->local().get_extent_metadata(
@@ -115,6 +127,12 @@ service::flush_domain(flush_domain_request request, ::rpc::streaming_context&) {
 ss::future<restore_domain_reply> service::restore_domain(
   restore_domain_request request, ::rpc::streaming_context&) {
     return _leader_router->local().restore_domain(
+      std::move(request), leader_router::local_only::yes);
+}
+
+ss::future<preregister_objects_reply> service::preregister_objects(
+  preregister_objects_request request, ::rpc::streaming_context&) {
+    return _leader_router->local().preregister_objects(
       std::move(request), leader_router::local_only::yes);
 }
 

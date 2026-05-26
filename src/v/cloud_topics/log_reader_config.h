@@ -11,6 +11,7 @@
 #pragma once
 
 #include "base/format_to.h"
+#include "cloud_topics/types.h"
 #include "model/fundamental.h"
 #include "model/record_batch_types.h"
 #include "model/timestamp.h"
@@ -29,7 +30,7 @@ struct cloud_topic_log_reader_config {
       size_t min_bytes,
       size_t max_bytes,
       std::optional<model::record_batch_type> type_filter,
-      std::optional<model::timestamp> time,
+      std::optional<model::timestamp> first_timestamp,
       model::opt_abort_source_t as,
       model::opt_client_address_t client_addr = std::nullopt,
       bool strict_max_bytes = false)
@@ -38,7 +39,7 @@ struct cloud_topic_log_reader_config {
       , min_bytes(min_bytes)
       , max_bytes(max_bytes)
       , type_filter(type_filter)
-      , first_timestamp(time)
+      , first_timestamp(first_timestamp)
       , abort_source(as)
       , client_address(std::move(client_addr))
       , strict_max_bytes(strict_max_bytes) {}
@@ -49,6 +50,7 @@ struct cloud_topic_log_reader_config {
     cloud_topic_log_reader_config(
       kafka::offset start_offset,
       kafka::offset max_offset,
+      std::optional<model::timestamp> first_timestamp = std::nullopt,
       model::opt_abort_source_t as = std::nullopt,
       model::opt_client_address_t client_addr = std::nullopt)
       : cloud_topic_log_reader_config(
@@ -57,7 +59,7 @@ struct cloud_topic_log_reader_config {
           0,
           std::numeric_limits<size_t>::max(),
           std::nullopt,
-          std::nullopt,
+          first_timestamp,
           as,
           std::move(client_addr),
           false) {}
@@ -85,6 +87,19 @@ struct cloud_topic_log_reader_config {
     bool strict_max_bytes{false};
 
     bool skip_cache{false};
+
+    // When set, the reader tolerates download_not_found (404) errors during
+    // extent materialization. Failed extents are skipped and produce no
+    // batches, allowing the reconciler to advance past deleted L0 objects.
+    allow_materialization_failure allow_mat_failure;
+
+    // Number of objects to look ahead when fetching object metadata from
+    // the metastore. 0 (default) means no lookahead and is equivalent to 1:
+    // fetch one object's metadata at a time. Values > 1 batch-fetch multiple
+    // objects' metadata in a single metastore RPC.
+    //
+    // NB: Applies to the L1 reader only.
+    size_t lookahead_objects{0};
 
     fmt::iterator format_to(fmt::iterator it) const;
 };

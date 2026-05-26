@@ -12,7 +12,9 @@
 #pragma once
 #include "bytes/iobuf_parser.h"
 #include "cluster/client_quota_serde.h"
+#include "cluster/cluster_link_rpc_types.h"
 #include "cluster/data_migration_types.h"
+#include "cluster/security_types.h"
 #include "cluster/simple_batch_builder.h"
 #include "cluster/types.h"
 #include "cluster_link/model/types.h"
@@ -33,6 +35,8 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/when_all.hh>
 
+#include <concepts>
+
 namespace cluster {
 
 using command_type = named_type<int8_t, struct command_type_tag>;
@@ -45,6 +49,21 @@ enum class serde_opts {
     // when all nodes are on a Redpanda version that supports serde.
     serde_only = 1,
 };
+
+// Deep-copies cmd. Prefers an explicit copy() method, falls back to the copy
+// ctor. The copy() check must come first: is_copy_constructible_v is true even
+// for types whose copy ctor only fails at instantiation, e.g. std::vector of a
+// move-only element.
+template<typename T>
+T copy_cmd(const T& cmd) {
+    if constexpr (requires {
+                      { cmd.copy() } -> std::same_as<T>;
+                  }) {
+        return cmd.copy();
+    } else {
+        return T(cmd);
+    }
+}
 
 // Controller state updates are represented in terms of commands. Each
 // command represent different type of action that is going to be executed
@@ -82,6 +101,11 @@ struct controller_command {
     controller_command(K k, V v)
       : key(std::move(k))
       , value(std::move(v)) {}
+
+    // Deep copy. Required because some command data types are move-only.
+    controller_command copy() const {
+        return controller_command(copy_cmd(key), copy_cmd(value));
+    }
 
     key_t key; // we use key to leverage kafka key based compaction
     value_t value;
@@ -161,6 +185,8 @@ inline constexpr int8_t cluster_link_update_mirror_topic_properties_cmd_type
 inline constexpr int8_t cluster_link_update_cluster_link_configuration_cmd_type
   = 5;
 inline constexpr int8_t cluster_link_delete_mirror_topic_cmd_type = 6;
+inline constexpr int8_t cluster_link_batch_update_mirror_topic_state_cmd_type
+  = 7;
 
 using create_topic_cmd = controller_command<
   model::topic_namespace,
@@ -493,6 +519,13 @@ using cluster_link_update_mirror_topic_status_cmd = controller_command<
   model::record_batch_type::cluster_link,
   serde_opts::serde_only>;
 
+using cluster_link_batch_update_mirror_topic_status_cmd = controller_command<
+  ::cluster_link::model::id_t,
+  ::cluster_link::model::batch_update_mirror_topic_status_cmd,
+  cluster_link_batch_update_mirror_topic_state_cmd_type,
+  model::record_batch_type::cluster_link,
+  serde_opts::serde_only>;
+
 using cluster_link_update_mirror_topic_properties_cmd = controller_command<
   ::cluster_link::model::id_t,
   ::cluster_link::model::update_mirror_topic_properties_cmd,
@@ -580,7 +613,9 @@ struct deserializer {
                 auto results = co_await ss::when_all_succeed(
                   reflection::async_adl<key_t>{}.from(k_parser),
                   reflection::async_adl<value_t>{}.from(v_parser));
-                co_return Cmd(std::get<0>(results), std::get<1>(results));
+                co_return Cmd(
+                  std::move(std::get<0>(results)),
+                  std::move(std::get<1>(results)));
             }
         }
         vassert(use_serde, "Requested to ADL serialize a serde-only type");

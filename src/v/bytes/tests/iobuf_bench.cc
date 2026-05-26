@@ -36,6 +36,32 @@ iobuf make_iobuf(size_t size, bool reverse = false) {
     return iobuf::from(generated);
 }
 
+// Make an iobuf with many small fragments.
+iobuf make_fragmented_iobuf(size_t num_frags, size_t frag_size) {
+    iobuf result;
+    auto data = std::string(frag_size, 'x');
+    for (size_t i = 0; i < num_frags; ++i) {
+        iobuf frag;
+        frag.append(data.data(), data.size());
+        result.append_fragments(std::move(frag));
+    }
+    return result;
+}
+
+// Deep-copy an iobuf preserving its fragment structure. iobuf::copy() reflows
+// through the standard allocator, coalescing many small fragments into fewer
+// large ones; this helper appends each source fragment as its own fragment in
+// the result so fragment count is preserved.
+iobuf deep_copy_keep_frags(const iobuf& src) {
+    iobuf result;
+    for (const auto& frag : src) {
+        iobuf tmp;
+        tmp.append(frag.get(), frag.size());
+        result.append_fragments(std::move(tmp));
+    }
+    return result;
+}
+
 template<size_t Size>
 size_t move_bench() {
     iobuf buffer = make_iobuf(Size);
@@ -168,6 +194,54 @@ PERF_TEST(iobuf, eq_bench_large_same) {
 PERF_TEST(iobuf, append_bench_small) { return append_bench<1'000, 4>(); }
 PERF_TEST(iobuf, append_bench_medium) { return append_bench<1'000, 40_KiB>(); }
 PERF_TEST(iobuf, append_bench_large) { return append_bench<1'000, 400_KiB>(); }
+
+namespace {
+// Build n deep copies of source upfront so each iteration consumes a fresh
+// iobuf via the destructive as_scattered() &&. inputs and outputs are
+// explicitly cleared inside the timed region so any deferred cleanup work
+// (fragment disposal, underlying-buffer frees) is included in the
+// measurement, regardless of whether the as_scattered() implementation
+// performs that work eagerly or defers it to ~iobuf / ~temporary_buffer.
+//
+// The batch size scales inversely with input size to cap upfront allocation
+// at ~100 MiB (10% of the 1 GiB budget allocated to the test).
+size_t as_scattered_bench(const iobuf& source) {
+    constexpr size_t budget = 100_MiB;
+    const size_t per_input = std::max<size_t>(source.size_bytes(), 1);
+    const size_t n = std::clamp<size_t>(budget / per_input, 1, inner_iters);
+
+    std::vector<iobuf> inputs;
+    inputs.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        inputs.push_back(deep_copy_keep_frags(source));
+    }
+    std::vector<scattered_buffer> outputs;
+    outputs.reserve(n);
+
+    perf_tests::start_measuring_time();
+    for (auto& buf : inputs) {
+        outputs.push_back(std::move(buf).as_scattered());
+    }
+    perf_tests::do_not_optimize(outputs);
+    outputs.clear();
+    inputs.clear();
+    perf_tests::stop_measuring_time();
+    return n;
+}
+
+} // namespace
+
+PERF_TEST(iobuf, as_scattered_small) {
+    return as_scattered_bench(make_iobuf(71));
+}
+
+PERF_TEST(iobuf, as_scattered_large) {
+    return as_scattered_bench(make_iobuf(965_KiB));
+}
+
+PERF_TEST(iobuf, as_scattered_many_frags) {
+    return as_scattered_bench(make_fragmented_iobuf(1000, 10));
+}
 
 // iobuf vs string_view comparisons
 // clang-format off

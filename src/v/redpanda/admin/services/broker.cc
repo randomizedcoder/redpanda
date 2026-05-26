@@ -11,7 +11,6 @@
 
 #include "redpanda/admin/services/broker.h"
 
-#include "redpanda/admin/services/utils.h"
 #include "serde/protobuf/rpc.h"
 #include "version/version.h"
 
@@ -61,6 +60,11 @@ broker_service_impl::list_brokers(
     for (auto& [node_id, _] : clients) {
         auto& broker = list_resp.get_brokers().emplace_back();
         broker.set_node_id(node_id());
+
+        // Populate build_info for all brokers with this broker's version for
+        // backwards compatibility with rpk's cluster connections list version
+        // compatibility check.
+        broker.set_build_info(std::move(self_broker().get_build_info()));
     }
     co_return list_resp;
 }

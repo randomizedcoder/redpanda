@@ -33,7 +33,7 @@ class consensus;
  *
  * The process goes like this: storage layer will send a "deletion notification"
  * - a request to evict log up to a certain offset. log_eviction_stm will then
- * adjust that offset with _stm_manager->max_removable_local_log_offset(), write
+ * adjust that offset with _stm_hookset->max_removable_local_log_offset(), write
  * the raft snapshot and notify the storage layer that log eviction can safely
  * proceed up to the adjusted offset.
  *
@@ -42,8 +42,14 @@ class consensus;
  * stm will be searching for. Upon processing of this record a new snapshot will
  * be written which may also trigger deletion of data on disk.
  */
+namespace testing {
+class log_eviction_stm_accessor;
+} // namespace testing
+
 class log_eviction_stm
   : public raft::persisted_stm<raft::kvstore_backed_stm_snapshot> {
+    friend class testing::log_eviction_stm_accessor;
+
 public:
     static constexpr std::string_view name = "log_eviction_stm";
 
@@ -157,7 +163,36 @@ private:
 
     // Kafka offset of the last `prefix_truncate_record` applied to this stm.
     kafka::offset _cached_kafka_start_offset_override;
+
+    ss::gate& gate() { return _gate; }
 };
+
+namespace testing {
+
+/// Test-only accessor for log_eviction_stm internals. Allows tests to
+/// simulate a stopped STM (gate closed) and then reset it for clean teardown.
+class log_eviction_stm_accessor {
+public:
+    static ss::future<> close_gate(log_eviction_stm& stm) {
+        return stm.gate().close();
+    }
+
+    static void reset_gate(log_eviction_stm& stm) { stm.gate() = ss::gate{}; }
+
+    static void request_abort(log_eviction_stm& stm) {
+        stm._as.request_abort();
+    }
+
+    static void reset_abort_source(log_eviction_stm& stm) {
+        stm._as = ss::abort_source{};
+    }
+
+    static void break_has_pending_truncation(log_eviction_stm& stm) {
+        stm._has_pending_truncation.broken();
+    }
+};
+
+} // namespace testing
 
 class log_eviction_stm_factory : public state_machine_factory {
 public:

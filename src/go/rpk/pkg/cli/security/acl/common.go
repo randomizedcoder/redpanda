@@ -12,6 +12,7 @@ package acl
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/redpanda-data/common-go/rpsr"
@@ -76,14 +77,14 @@ type (
 		Permission          string `json:"permission"`
 	}
 	aclWithMessage struct {
-		Principal           string `json:"principal"`
-		Host                string `json:"host"`
-		ResourceType        string `json:"resource_type"`
-		ResourceName        string `json:"resource_name"`
-		ResourcePatternType string `json:"resource_pattern_type"`
-		Operation           string `json:"operation"`
-		Permission          string `json:"permission"`
-		Message             string `json:"message"`
+		Principal           string `json:"principal" yaml:"principal"`
+		Host                string `json:"host" yaml:"host"`
+		ResourceType        string `json:"resource_type" yaml:"resource_type"`
+		ResourceName        string `json:"resource_name" yaml:"resource_name"`
+		ResourcePatternType string `json:"resource_pattern_type" yaml:"resource_pattern_type"`
+		Operation           string `json:"operation" yaml:"operation"`
+		Permission          string `json:"permission" yaml:"permission"`
+		Message             string `json:"message" yaml:"message"`
 	}
 )
 
@@ -568,17 +569,11 @@ func kafkaOrSRFilters(cmd *cobra.Command, checkSubsystem bool) (isKafka, isSR bo
 		// If both kafka and registry are included, fall through to flag-based detection.
 	}
 
-	for _, flag := range kFlags {
-		if cmd.Flags().Changed(flag) {
-			isKafka = true
-			break
-		}
+	if slices.ContainsFunc(kFlags, cmd.Flags().Changed) {
+		isKafka = true
 	}
-	for _, flag := range srFlags {
-		if cmd.Flags().Changed(flag) {
-			isSR = true
-			break
-		}
+	if slices.ContainsFunc(srFlags, cmd.Flags().Changed) {
+		isSR = true
 	}
 	return isKafka, isSR, nil
 }

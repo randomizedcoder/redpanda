@@ -17,10 +17,7 @@
 #include "test_utils/async.h"
 #include "test_utils/boost_fixture.h"
 
-#include <seastar/core/smp.hh>
-
 #include <chrono>
-#include <limits>
 
 using namespace std::chrono_literals;
 
@@ -214,7 +211,7 @@ FIXTURE_TEST(list_offsets_by_time, redpanda_thread_fixture) {
       model::partition_id(0));
 
     add_topic(model::topic_namespace_view{ntp}, 1).get();
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     auto client = make_kafka_client().get();
     client.connect().get();

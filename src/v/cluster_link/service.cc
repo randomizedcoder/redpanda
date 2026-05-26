@@ -34,10 +34,11 @@
 #include "cluster_link/source_topic_syncer.h"
 #include "config/node_config.h"
 #include "kafka/client/direct_consumer/direct_consumer.h"
+#include "kafka/data/make_exact_offset_replicator.h"
 #include "kafka/data/partition_proxy.h"
 #include "kafka/server/group_router.h"
 #include "kafka/server/snc_quota_manager.h"
-#include "kafka/server/write_at_offset_stm.h"
+#include "model/fundamental.h"
 
 #include <seastar/coroutine/switch_to.hh>
 
@@ -251,10 +252,12 @@ make_remote_consumer_configuration(const model::connection_config& conn_cfg) {
     dc_configuration.partition_max_bytes
       = conn_cfg.get_fetch_partition_max_bytes();
 
+    const size_t partition_max_buffered
+      = 2 * conn_cfg.get_fetch_partition_max_bytes();
     return replication::mux_remote_consumer::configuration{
       .client_id = conn_cfg.client_id,
       .direct_consumer_configuration = dc_configuration,
-      .partition_max_buffered = max_buffered_bytes,
+      .partition_max_buffered = partition_max_buffered,
       .fetch_max_wait = max_wait_time,
     };
 }
@@ -397,15 +400,13 @@ public:
       ss::lw_shared_ptr<cluster::partition> partition,
       const cluster::metadata_cache& md_cache,
       cluster::id_allocator_frontend& id_alloc)
-      : _partition(std::move(partition))
+      : _partition(partition)
       , _metadata_cache{md_cache}
       , _id_allocator_frontend(id_alloc)
-      , _stm(_partition->raft()
-               ->stm_manager()
-               ->get<kafka::write_at_offset_stm>()) {
+      , _replicator(kafka::make_exact_offset_replicator(partition)) {
         vassert(
-          _stm,
-          "write_at_offset_stm not attached to partition {}",
+          _replicator,
+          "exact_offset_replicator not available for partition {}",
           _partition->ntp());
     }
     ss::future<> start() final { return initialize(); }
@@ -488,7 +489,7 @@ public:
           batches.back().header(),
           _last_replicated_offset,
           new_last_replicated_end);
-        auto stages = _stm->replicate(
+        auto stages = _replicator->replicate(
           std::move(batches),
           std::move(expected_offsets),
           _last_replicated_offset,
@@ -529,7 +530,22 @@ public:
 
     bool can_prefix_truncate() const final {
         _gate.check();
-        return _partition->get_ntp_config().is_locally_collectable();
+        const auto& cfg = _partition->get_ntp_config();
+        // Cloud topics manage local retention via L1, so
+        // is_locally_collectable() returns false. However, prefix
+        // truncation is still supported through the cloud-topics
+        // frontend, so we fall back to is_remotely_collectable().
+        // We also require the cloud-topics subsystem to be
+        // initialized — after a node restart it may not be ready
+        // yet, and make_partition_proxy() would throw.
+        if (cfg.cloud_topic_enabled()) {
+            auto ct_state = _partition->get_cloud_topics_state();
+            if (!ct_state || !ct_state->local_is_initialized()) {
+                return false;
+            }
+            return cfg.is_remotely_collectable();
+        }
+        return cfg.is_locally_collectable();
     }
 
     ss::future<kafka::error_code> prefix_truncate(
@@ -539,16 +555,16 @@ public:
         auto timeout
           = std::chrono::duration_cast<::model::timeout_clock::duration>(
             deadline - ss::lowres_clock::now());
-        auto err = co_await _stm->ensure_truncatable(
+        auto err = co_await _replicator->ensure_truncatable(
           truncation_offset, timeout);
-        if (err != kafka::write_at_offset_stm::errc::success) {
+        if (err) {
             vlog(
               cllog.warn,
               "[{}] Failed to ensure truncatable offset {}: {}, will be "
               "retried later",
               _partition->ntp(),
               truncation_offset,
-              err);
+              err.message());
             // a blanket error to trigger a retry later
             co_return kafka::error_code::offset_out_of_range;
         }
@@ -602,8 +618,7 @@ public:
 private:
     ss::future<> initialize() {
         auto holder = _gate.hold();
-        auto sync_offset = co_await _stm->get_expected_last_offset(
-          sync_timeout);
+        auto sync_offset = co_await _replicator->get_last_offset(sync_timeout);
         if (sync_offset.has_error()) {
             throw std::runtime_error(
               fmt::format(
@@ -623,7 +638,7 @@ private:
     ss::lw_shared_ptr<cluster::partition> _partition;
     const cluster::metadata_cache& _metadata_cache;
     cluster::id_allocator_frontend& _id_allocator_frontend;
-    ss::shared_ptr<kafka::write_at_offset_stm> _stm;
+    std::unique_ptr<kafka::exact_offset_replicator> _replicator;
     // set in start();
     std::optional<kafka::offset> _last_replicated_offset;
     ::model::producer_id _highest_seen_pid{::model::no_producer_id};
@@ -735,7 +750,9 @@ public:
     }
 
 private:
-    ss::future<std::optional<kafka::offset>> fetch_offset_for_timestamp(
+    /// Dispatch a ListOffsets request for the given timestamp and return the
+    /// offset from the response. Returns std::nullopt on transient errors.
+    ss::future<std::optional<kafka::offset>> dispatch_list_offsets(
       retry_chain_node& rcn,
       const ::model::topic_partition& tp,
       ::model::timestamp ts) {
@@ -799,13 +816,43 @@ private:
               partition.error_code);
             co_return std::nullopt;
         }
-        vlog(
-          cllog.debug,
-          "[{}] Fetched offset {} for timestamp {}",
-          tp,
-          partition.offset,
-          ts);
-        co_return partition.offset;
+        co_return ::model::offset_cast(partition.offset);
+    }
+
+    ss::future<std::optional<kafka::offset>> fetch_offset_for_timestamp(
+      retry_chain_node& rcn,
+      const ::model::topic_partition& tp,
+      ::model::timestamp ts) {
+        auto offset = co_await dispatch_list_offsets(rcn, tp, ts);
+        if (!offset) {
+            co_return std::nullopt;
+        }
+        if (*offset >= kafka::offset{0}) {
+            vlog(
+              cllog.debug,
+              "[{}] Fetched offset {} for timestamp {}",
+              tp,
+              *offset,
+              ts);
+            co_return offset;
+        }
+        // ListOffsets returns offset -1 when the timestamp is past the end
+        // of the log (or the partition is empty). Fall back to the last
+        // stable offset (LSO) so we start replicating only new committed
+        // data. We query with latest_timestamp which, combined with our
+        // read_committed isolation level, returns the LSO.
+        auto lso = co_await dispatch_list_offsets(
+          rcn, tp, kafka::list_offsets_request::latest_timestamp);
+        if (lso) {
+            vlog(
+              cllog.info,
+              "[{}] Timestamp {} is past the end of the source log, "
+              "falling back to last stable offset {}",
+              tp,
+              ts,
+              *lso);
+        }
+        co_return lso;
     }
 
     ss::future<std::optional<kafka::api_version>>

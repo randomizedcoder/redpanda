@@ -1,13 +1,10 @@
-/*
- * Copyright 2025 Redpanda Data, Inc.
- *
- * Use of this software is governed by the Business Source License
- * included in the file licenses/BSL.md
- *
- * As of the Change Date specified in that file, in accordance with
- * the Business Source License, use of this software will be governed
- * by the Apache License, Version 2.0
- */
+// Copyright (c) 2014 The LevelDB Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found at https://github.com/google/leveldb/blob/main/LICENSE. See
+// https://github.com/google/leveldb/blob/main/AUTHORS for names of
+// contributors.
+//
+// Modifications copyright 2025 Redpanda Data, Inc.
 
 #pragma once
 
@@ -174,6 +171,12 @@ struct options {
     // The size of a single block within an SST file.
     constexpr static size_t default_sst_block_size = 16_KiB;
     size_t sst_block_size = default_sst_block_size;
+
+    // The amount of extra data to read ahead when reading SST data blocks
+    // during compaction. Buffered data is served to subsequent sequential
+    // reads without I/O. Set to 0 to disable readahead.
+    constexpr static size_t default_compaction_readahead_size = 256_KiB;
+    size_t compaction_readahead_size = default_compaction_readahead_size;
 
     // The frequency at which to generate a new bloom filter.
     //

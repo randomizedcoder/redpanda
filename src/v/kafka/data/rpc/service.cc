@@ -11,23 +11,21 @@
 
 #include "kafka/data/rpc/service.h"
 
+#include "cluster/errc.h"
 #include "kafka/data/log_reader_config.h"
 #include "kafka/data/partition_proxy.h"
 #include "logger.h"
 #include "model/ktp.h"
-#include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/timeout_clock.h"
 #include "raft/errc.h"
-#include "utils/uuid.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/coroutine/switch_to.hh>
 
 #include <iterator>
@@ -36,6 +34,9 @@
 #include <utility>
 
 namespace kafka::data::rpc {
+
+using namespace std::chrono_literals;
+
 namespace {
 
 raft::replicate_options
@@ -247,9 +248,36 @@ local_service::consume(
 ss::future<kafka_topic_data_result> local_service::produce(
   kafka_topic_data data, model::timeout_clock::duration timeout) {
     auto ktp = model::ktp(data.tp.topic, data.tp.partition);
+    // Count records before moving batches — needed to convert the
+    // last_offset returned by replicate() into a base_offset.
+    // Same arithmetic as kafka/server/handlers/produce.cc. Int64
+    // accumulator because record_count() returns int32_t per batch and
+    // a produce request may include many batches.
+    int64_t total_records = 0;
+    for (const auto& b : data.batches) {
+        total_records += b.record_count();
+    }
     auto result = co_await produce(ktp, std::move(data.batches), timeout);
-    auto ec = result.has_error() ? result.error() : cluster::errc::success;
-    co_return kafka_topic_data_result(data.tp, ec);
+    if (result.has_error()) {
+        co_return kafka_topic_data_result(std::move(data.tp), result.error());
+    }
+    if (total_records == 0) {
+        co_return kafka_topic_data_result(
+          std::move(data.tp), cluster::errc::success);
+    }
+    auto last_offset = result.value();
+    // The raft replicate batcher assigns contiguous offsets to all records
+    // in a single replicate() call (see replicate_batcher::propagate_result).
+    auto base_offset = model::offset{last_offset() - (total_records - 1)};
+    vassert(
+      base_offset >= model::offset{0},
+      "derived base_offset {} underflowed from last_offset {} and "
+      "total_records {}",
+      base_offset,
+      last_offset,
+      total_records);
+    co_return kafka_topic_data_result(
+      std::move(data.tp), cluster::errc::success, base_offset, last_offset);
 }
 
 ss::future<result<model::offset, cluster::errc>> local_service::produce(
@@ -311,6 +339,30 @@ ss::future<result<model::offset, cluster::errc>> local_service::produce(
 
 ss::future<produce_reply>
 network_service::produce(produce_request req, ::rpc::streaming_context&) {
+    static constexpr size_t memory_pressure_denominator = 10;
+    if (_server_memory != nullptr) {
+        auto available = _server_memory->current();
+        if (available <= _server_memory_total / memory_pressure_denominator) {
+            thread_local static ss::logger::rate_limit rate(1s);
+            log.log(
+              ss::log_level::warn,
+              rate,
+              "Rejecting produce request: RPC server memory pressure "
+              "(available={}, total={})",
+              available,
+              _server_memory_total);
+            produce_reply reply;
+            for (auto& td : req.topic_data) {
+                // errc::timeout is used here becuase clients already treat it
+                // as a retryable error. for a future major release, it would be
+                // better to add some explicit backoff advice to the produce
+                // response, similar to how the real kafka API works. for a
+                // serde-compatible OOM backstop, this is good enough.
+                reply.results.emplace_back(td.tp, cluster::errc::timeout);
+            }
+            co_return reply;
+        }
+    }
     co_await ss::coroutine::switch_to(get_scheduling_group());
     auto results = co_await _service->local().produce(
       std::move(req.topic_data), req.timeout);

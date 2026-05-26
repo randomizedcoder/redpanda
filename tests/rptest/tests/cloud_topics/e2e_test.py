@@ -7,6 +7,8 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
+import time
+
 from ducktape.tests.test import TestContext
 from typing import Any
 from ducktape.utils.util import wait_until
@@ -26,7 +28,6 @@ from rptest.services.redpanda import (
     SISettings,
     make_redpanda_service,
     MetricsEndpoint,
-    CLOUD_TOPICS_CONFIG_STR,
 )
 from rptest.tests.end_to_end import EndToEndTest
 from rptest.util import Scale
@@ -60,7 +61,6 @@ class EndToEndCloudTopicsBase(EndToEndTest):
         self.topic = self.s3_topic_name
 
         conf = {
-            CLOUD_TOPICS_CONFIG_STR: True,
             "enable_cluster_metadata_upload_loop": False,
         }
 
@@ -95,9 +95,18 @@ class EndToEndCloudTopicsBase(EndToEndTest):
     def setUp(self):
         assert self.redpanda
         self.redpanda.start()
+        # Allow tests to select storage mode via @matrix(storage_mode=...).
+        # Default to cloud if not specified.
+        storage_mode = (self.test_context.injected_args or {}).get(
+            "storage_mode", TopicSpec.STORAGE_MODE_CLOUD
+        )
+        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+            self.redpanda.set_feature_active(
+                "tiered_cloud_topics", True, timeout_sec=30
+            )
         for topic in self.topics:
             config = {
-                TopicSpec.PROPERTY_STORAGE_MODE: TopicSpec.STORAGE_MODE_CLOUD,
+                TopicSpec.PROPERTY_STORAGE_MODE: storage_mode,
                 "cleanup.policy": topic.cleanup_policy,
             }
             if topic.min_cleanable_dirty_ratio is not None:
@@ -168,7 +177,13 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
         )
 
     @cluster(num_nodes=5)
-    def test_write(self):
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+        ],
+    )
+    def test_write(self, storage_mode: str):
         self.start_producer()
 
         self.await_num_produced(min_records=50000)
@@ -179,7 +194,13 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
         self.wait_until_all_reconciled()
 
     @cluster(num_nodes=5)
-    def test_delete_records(self):
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+        ],
+    )
+    def test_delete_records(self, storage_mode: str):
         self.start_producer()
         self.await_num_produced(min_records=50000)
         self.producer.stop()
@@ -203,7 +224,13 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
         self.wait_until_all_reconciled()
 
     @cluster(num_nodes=4)
-    def test_get_size(self):
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+        ],
+    )
+    def test_get_size(self, storage_mode: str):
         """
         Test that the metastore GetSize RPC returns the correct partition size.
 
@@ -239,6 +266,99 @@ class EndToEndCloudTopicsTest(EndToEndCloudTopicsBase):
         ct_utils.wait_until_l1_partition_size(
             self.admin, topic, partition, lambda size: size > 0
         )
+
+
+class EndToEndCloudTopicsStorageModeToggleTest(EndToEndCloudTopicsBase):
+    """Exercise toggling a topic between 'cloud' and 'tiered_cloud' storage
+    modes while a rate-limited producer is running, then validate the
+    resulting log with a sequential consumer."""
+
+    topics = (
+        TopicSpec(
+            name=EndToEndCloudTopicsBase.s3_topic_name,
+            partition_count=5,
+            replication_factor=3,
+        ),
+    )
+
+    def __init__(self, test_context, extra_rp_conf=None, env=None):
+        super(EndToEndCloudTopicsStorageModeToggleTest, self).__init__(
+            test_context, extra_rp_conf, env
+        )
+        self.msg_size = 16 * 1024
+        # Size the workload so the producer is still sending when the
+        # toggle window ends: at ~10 MB/s with 16 KiB messages this is
+        # ~400s of traffic, vs. a 5-minute toggle window.
+        self.msg_count = 250_000
+        self.rate_limit_bps = 10 * 1024 * 1024  # 10 MB/s
+        self.toggle_duration_sec = 5 * 60
+        self.toggle_interval_sec = 5
+
+    @cluster(num_nodes=5)
+    def test_toggle_storage_mode(self):
+        assert self.redpanda is not None
+        assert self.topic is not None
+        # Enable tiered cloud topics so we can flip into that mode. The
+        # topic is created in 'cloud' mode by the base setUp.
+        self.redpanda.set_feature_active("tiered_cloud_topics", True, timeout_sec=30)
+
+        producer = KgoVerifierProducer(
+            self.test_context,
+            self.redpanda,
+            self.topic,
+            msg_size=self.msg_size,
+            msg_count=self.msg_count,
+            rate_limit_bps=self.rate_limit_bps,
+            tolerate_failed_produce=True,
+        )
+        consumer = KgoVerifierSeqConsumer(
+            self.test_context,
+            self.redpanda,
+            self.topic,
+            self.msg_size,
+            loop=False,
+            producer=producer,
+        )
+        try:
+            producer.start()
+
+            start = time.time()
+            mode = TopicSpec.STORAGE_MODE_CLOUD
+            while time.time() - start < self.toggle_duration_sec:
+                time.sleep(self.toggle_interval_sec)
+                mode = (
+                    TopicSpec.STORAGE_MODE_TIERED_CLOUD
+                    if mode == TopicSpec.STORAGE_MODE_CLOUD
+                    else TopicSpec.STORAGE_MODE_CLOUD
+                )
+                self.rpk.alter_topic_config(
+                    self.topic, TopicSpec.PROPERTY_STORAGE_MODE, mode
+                )
+                self.logger.info(
+                    f"switched storage mode of {self.topic} to {mode} "
+                    f"(acked={producer.produce_status.acked})"
+                )
+
+            # Let the producer run to completion so the consumer has a
+            # natural stopping point.
+            producer.wait(timeout_sec=10 * 60)
+            self.logger.info(
+                f"producer finished with acked={producer.produce_status.acked}, "
+                f"bad_offsets={producer.produce_status.bad_offsets}"
+            )
+
+            # Passing the producer to the consumer makes wait() block
+            # until the consumer has read every produced offset and
+            # validates reads internally.
+            consumer.start(clean=False)
+            consumer.wait(timeout_sec=10 * 60)
+
+            self.wait_until_all_reconciled()
+        finally:
+            producer.stop()
+            consumer.stop()
+            producer.free()
+            consumer.free()
 
 
 class EndToEndCloudTopicsTxTest(EndToEndCloudTopicsBase):
@@ -298,7 +418,13 @@ class EndToEndCloudTopicsTxTest(EndToEndCloudTopicsBase):
         self.kgo_consumer.wait()
 
     @cluster(num_nodes=4)
-    def test_write(self):
+    @matrix(
+        storage_mode=[
+            TopicSpec.STORAGE_MODE_CLOUD,
+            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+        ],
+    )
+    def test_write(self, storage_mode: str):
         self.start_producer_with_tx()
         self.start_consumer_with_tx()
         # Validate by checking stats
@@ -359,12 +485,12 @@ class EndToEndCloudTopicsCompactionTest(EndToEndCloudTopicsBase):
 
     def get_removed_records(self):
         return self._metric_sum(
-            "vectorized_cloud_topics_compaction_worker_records_removed"
+            "vectorized_cloud_topics_compaction_worker_records_removed_total"
         )
 
     def get_log_compactions(self):
         return self._metric_sum(
-            "vectorized_cloud_topics_compaction_scheduler_log_compactions"
+            "vectorized_cloud_topics_compaction_scheduler_log_compactions_total"
         )
 
     def get_managed_logs(self):

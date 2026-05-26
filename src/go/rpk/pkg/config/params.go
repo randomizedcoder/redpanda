@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,8 +102,8 @@ type xflag struct {
 
 func splitCommaIntoStrings(in string, dst *[]string) error {
 	*dst = nil
-	split := strings.Split(in, ",")
-	for _, on := range split {
+	split := strings.SplitSeq(in, ",")
+	for on := range split {
 		on = strings.TrimSpace(on)
 		if len(on) == 0 {
 			return fmt.Errorf("invalid empty value in %q", in)
@@ -688,10 +689,12 @@ tls.key=/path/to/key.pem
   API listeners with mTLS.
 
 sasl.mechanism=SCRAM-SHA-256
-  The SASL mechanism to use for authentication. This can be either SCRAM-SHA-256
-  or SCRAM-SHA-512. Note that with Redpanda, the Admin API can be configured to
-  require basic authentication with your Kafka API SASL credentials. This
-  defaults to SCRAM-SHA-256 if no mechanism is specified.
+  The SASL mechanism to use for authentication. This can be SCRAM-SHA-256,
+  SCRAM-SHA-512, PLAIN, or OAUTHBEARER. For OAUTHBEARER, pass the token via
+  the pass field (optionally prefixed with "token:"). Note that with Redpanda,
+  the Admin API can be configured to require basic authentication with your
+  Kafka API SASL credentials. This defaults to SCRAM-SHA-256 if no mechanism
+  is specified.
 
 user=username
   The SASL username to use for authentication. This is also used for the admin
@@ -814,7 +817,7 @@ tls.insecure_skip_verify=boolean
 tls.ca=/path/to/ca.pem
 tls.cert=/path/to/cert.pem
 tls.key=/path/to/key.pem
-sasl.mechanism=SCRAM-SHA-256 or SCRAM-SHA-512
+sasl.mechanism=SCRAM-SHA-256, SCRAM-SHA-512, PLAIN, or OAUTHBEARER
 user=username
 pass=password
 admin.hosts=comma,delimited,host:ports
@@ -870,7 +873,7 @@ func (p *Params) InstallSASLFlags(cmd *cobra.Command) {
 
 	pf.StringVar(&p.user, FlagSASLUser, "", "SASL user to be used for authentication")
 	pf.StringVar(&p.password, "password", "", "SASL password to be used for authentication")
-	pf.StringVar(&p.saslMechanism, "sasl-mechanism", "", "The authentication mechanism to use (SCRAM-SHA-256, SCRAM-SHA-512)")
+	pf.StringVar(&p.saslMechanism, "sasl-mechanism", "", "The authentication mechanism to use (SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER)")
 
 	pf.MarkHidden(FlagSASLUser)
 	pf.MarkHidden("password")
@@ -1270,12 +1273,7 @@ func (c *Config) promptDeleteOldRpkYaml(fs afero.Fs) error {
 	var deleteAuthNames []string
 	var deleteProfileNames []string
 	containsAuth := func(name string) bool {
-		for _, delName := range deleteAuthNames {
-			if delName == name {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(deleteAuthNames, name)
 	}
 	for _, a := range c.rpkYamlActual.CloudAuths {
 		if a.Organization == "" || a.OrgID == "" {
@@ -2171,7 +2169,7 @@ func getField(tags []string, parentRawTag string, v reflect.Value) (field reflec
 
 	// If is a nil pointer we assign the zero value, and we reassign v to the
 	// value that v points to
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))
 		}
@@ -2228,11 +2226,8 @@ func getFieldByTag(tag string, v reflect.Value) (newV reflect.Value, otherV refl
 		if ft == tag {
 			return v.Field(i), reflect.Value{}, nil
 		}
-		for _, p := range pieces {
-			if p == "inline" {
-				inlines = append(inlines, i)
-				break
-			}
+		if slices.Contains(pieces, "inline") {
+			inlines = append(inlines, i)
 		}
 	}
 

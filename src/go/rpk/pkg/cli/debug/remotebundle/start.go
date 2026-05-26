@@ -250,9 +250,12 @@ func (o *remoteBundleOptions) toRpadminOptions(p *config.RpkProfile) []rpadmin.D
 		}
 		opts = append(opts, rpadmin.WithLabelSelector(dbls))
 	}
-	if p.HasSASLCredentials() {
-		s := p.KafkaAPI.SASL
-		opts = append(opts, rpadmin.WithSCRAMAuthentication(s.User, s.Password, s.Mechanism))
+	if s := p.KafkaAPI.SASL; s != nil {
+		if strings.EqualFold(s.Mechanism, adminapi.OAuthBearer) {
+			opts = append(opts, rpadmin.WithOAuthBearerAuthentication(adminapi.OAuthBearerToken(s.Password)))
+		} else if p.HasSASLCredentials() {
+			opts = append(opts, rpadmin.WithSCRAMAuthentication(s.User, s.Password, s.Mechanism))
+		}
 	}
 	if tls := p.KafkaAPI.TLS; tls != nil {
 		opts = append(opts, rpadmin.WithTLS(true, tls.InsecureSkipVerify))

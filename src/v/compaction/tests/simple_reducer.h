@@ -37,15 +37,15 @@ private:
     ss::future<> maybe_index_offset_delta(
       const model::record_batch& b,
       const model::record& r,
-      std::vector<int32_t>& offset_deltas) const {
+      chunked_vector<int32_t>& offset_deltas) const {
         if (co_await is_latest_record_for_key(_map, b, r)) {
             offset_deltas.push_back(r.offset_delta());
         }
     }
 
-    ss::future<std::vector<int32_t>>
+    ss::future<chunked_vector<int32_t>>
     compute_offset_deltas_to_keep(const model::record_batch& b) const final {
-        std::vector<int32_t> offset_deltas;
+        chunked_vector<int32_t> offset_deltas;
         offset_deltas.reserve(b.record_count());
 
         co_await b.for_each_record_async(
@@ -58,7 +58,8 @@ private:
 
     ss::future<std::optional<model::record_batch>>
     filter_batch_with_offset_deltas(
-      model::record_batch b, std::vector<int32_t> offset_deltas) const final {
+      model::record_batch b,
+      chunked_vector<int32_t> offset_deltas) const final {
         co_return co_await do_filter_batch(
           std::move(b), std::move(offset_deltas));
     }
@@ -76,13 +77,17 @@ public:
         co_return true;
     }
 
-    ss::future<ss::stop_iteration>
-    operator()(model::record_batch b, model::compression) final {
+    ss::future<ss::stop_iteration> operator()(model::record_batch b) final {
         _output_batches.push_back(std::move(b));
         co_return ss::stop_iteration::no;
     }
 
-    ss::future<> finalize() final { co_return; }
+    ss::future<> finalize(bool /*success*/) final { co_return; }
+
+    ss::future<> prepare_iteration(kafka::offset) final { co_return; }
+    ss::future<> finish_iteration(kafka::offset, kafka::offset) final {
+        co_return;
+    }
 
     chunked_circular_buffer<model::record_batch>& _output_batches;
 };

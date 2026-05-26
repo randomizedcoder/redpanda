@@ -69,6 +69,9 @@ public:
       model::record_batch,
       raft::replicate_options) final;
 
+    std::unique_ptr<exact_offset_replicator> make_exact_offset_replicator()
+      && final;
+
     ss::future<storage::translating_reader>
     make_reader(kafka::log_reader_config cfg) final;
 
@@ -104,6 +107,8 @@ public:
     size_t local_size_bytes() const override;
     ss::future<std::optional<size_t>> cloud_size_bytes() const override;
     model::offset offset_lag() const override;
+    ss::future<cluster::partition_cloud_storage_status>
+    get_cloud_storage_status() const override;
 
 private:
     // Returns the Kafka offset corresponding to the lowest offset in the

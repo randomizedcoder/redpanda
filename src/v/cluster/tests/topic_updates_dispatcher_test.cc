@@ -12,8 +12,7 @@
 #include "cluster/topic_updates_dispatcher.h"
 #include "model/metadata.h"
 #include "test_utils/boost_fixture.h"
-
-#include <seastar/testing/thread_test_case.hh>
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 
 #include <cstdint>
 using namespace std::chrono_literals;

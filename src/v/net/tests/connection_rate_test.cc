@@ -11,10 +11,8 @@
 #include "base/seastarx.h"
 #include "net/connection_rate.h"
 
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/manual_clock.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/testing/thread_test_case.hh>
 
@@ -129,10 +127,11 @@ SEASTAR_THREAD_TEST_CASE(overrides_rate_test) {
     while (!need_stop) {
         need_stop = true;
         for (auto& override : overrides_map) {
-            if (std::all_of(
-                  override.second.futures.begin(),
-                  override.second.futures.end(),
-                  [](ss::future<>& f) { return f.available(); })) {
+            if (
+              std::all_of(
+                override.second.futures.begin(),
+                override.second.futures.end(),
+                [](ss::future<>& f) { return f.available(); })) {
                 int64_t expected_time = ((max_threads
                                           - override.second.max_rate)
                                          / override.second.max_rate)

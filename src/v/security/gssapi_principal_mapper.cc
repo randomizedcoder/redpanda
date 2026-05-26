@@ -15,11 +15,8 @@
 #include "re2/re2.h"
 #include "security/logger.h"
 
-#include <boost/algorithm/string/case_conv.hpp>
 #include <fmt/format.h>
-#include <fmt/ostream.h>
-
-#include <charconv>
+#include <fmt/ranges.h>
 
 /*
  * some older versions of re2 don't have operator for implicit cast to
@@ -60,13 +57,14 @@ std::optional<gssapi_name> gssapi_name::parse(std::string_view principal_name) {
 
     re2::StringPiece primary, host_name, realm;
 
-    if (re2::RE2::FullMatch(
-          principal_name,
-          gssapi_name_regex,
-          &primary,
-          nullptr,
-          &host_name,
-          &realm)) {
+    if (
+      re2::RE2::FullMatch(
+        principal_name,
+        gssapi_name_regex,
+        &primary,
+        nullptr,
+        &host_name,
+        &realm)) {
         return gssapi_name(
           ss::sstring(spv(primary)),
           ss::sstring(spv(host_name)),
@@ -126,16 +124,6 @@ std::optional<ss::sstring> gssapi_principal_mapper::apply(
 
     vlog(seclog.warn, "No rules apply to {}, rules: {}", name, rules);
     return std::nullopt;
-}
-
-std::ostream& operator<<(std::ostream& os, const gssapi_name& n) {
-    fmt::print(os, "{}", n);
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const gssapi_principal_mapper& m) {
-    fmt::print(os, "{}", m);
-    return os;
 }
 
 } // namespace security

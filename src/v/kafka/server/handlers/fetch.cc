@@ -45,13 +45,10 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
-#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/util/log.hh>
 
 #include <boost/range/irange.hpp>
-#include <fmt/ostream.h>
 
 #include <chrono>
 #include <exception>
@@ -193,7 +190,7 @@ static ss::future<read_result> read_from_partition(
     co_await std::move(rdr.reader).release()->finally();
 
     if (e) {
-        std::rethrow_exception(e);
+        co_await ss::coroutine::return_exception_ptr(std::move(e));
     }
 
     co_return read_result(
@@ -317,24 +314,12 @@ static ss::future<read_result> do_read_from_ntp(
               preferred_replica);
         }
     }
-    auto res_fut = co_await ss::coroutine::as_future(read_from_partition(
-      std::move(*kafka_partition),
-      maybe_lso.value(),
-      ntp_config.cfg,
-      deadline));
-    if (res_fut.failed()) {
-        auto ex = res_fut.get_exception();
-        if (ssx::is_shutdown_exception(ex)) {
-            co_return make_errored_read_result(
-              md_cache, ntp_config.ktp(), error_code::not_leader_for_partition);
-        }
-        std::rethrow_exception(ex);
-    }
+    auto result = co_await read_from_partition(
+      std::move(*kafka_partition), maybe_lso.value(), ntp_config.cfg, deadline);
 
     // Note that units can be both increased and decreassed here. Increases
     // happen because there is no strict limit on read size when reading the
     // obligatory batch.
-    auto result = std::move(res_fut.get());
     memory_units.adjust_units(result.data_size_bytes());
     result.memory_units = std::move(memory_units);
     co_return result;
@@ -460,7 +445,13 @@ static void fill_fetch_responses(
             resp_units = std::move(res.memory_units);
             resp.records = batch_reader(std::move(res).release_data());
         } else {
-            // TODO: add probe to measure how much of read data is discarded
+            if (res.has_data()) {
+                // Data was read from cloud storage but cannot fit in the
+                // response budget. This is pure read amplification: S3 bytes
+                // were downloaded, materialized, and now dropped.
+                octx.rctx.probe().add_fetch_response_dropped_bytes(
+                  res.data_size_bytes());
+            }
             resp.records = batch_reader();
         }
 
@@ -549,6 +540,22 @@ static ss::future<chunked_vector<read_result>> fetch_ntps(
                       res.delta_from_tip_ms.value());
                 }
 
+                results[cfg_idx] = std::move(res);
+            })
+            .handle_exception([&, cfg_idx](const std::exception_ptr& e) {
+                bool is_shutdown = ssx::is_shutdown_exception(e);
+                // Return not_leader_for_partition error to force clients retry
+                // for potential transient errors.
+                auto ec = error_code::not_leader_for_partition;
+                vlogl(
+                  klog,
+                  is_shutdown ? ss::log_level::debug : ss::log_level::warn,
+                  "ntp {}: caught unhandled exception {} in fetch path",
+                  ntp_cfg.ktp(),
+                  e);
+                auto res = make_errored_read_result(
+                  md_cache, ntp_cfg.ktp(), ec);
+                res.partition = ntp_cfg.ktp().get_partition();
                 results[cfg_idx] = std::move(res);
             });
       });
@@ -886,7 +893,7 @@ private:
 class nonpolling_fetch_plan_executor final : public fetch_plan_executor::impl {
 public:
     nonpolling_fetch_plan_executor()
-      : _last_result_size(ss::smp::count, 0)
+      : _last_result_size(ss::this_smp_shard_count(), 0)
       , _fetch_timeout{[this] { _has_progress.signal(); }} {}
 
     /**
@@ -941,9 +948,9 @@ private:
         // start fetching from a random shard to make sure that we fetch data
         // from all the partitions even if we reach fetch message size limit
         const ss::shard_id start_shard_idx = random_generators::get_int(
-          ss::smp::count - 1);
-        for (size_t i = 0; i < ss::smp::count; ++i) {
-            auto shard = (start_shard_idx + i) % ss::smp::count;
+          ss::this_smp_shard_count() - 1);
+        for (size_t i = 0; i < ss::this_smp_shard_count(); ++i) {
+            auto shard = (start_shard_idx + i) % ss::this_smp_shard_count();
 
             ssx::spawn_with_gate(_workers_gate, [&]() mutable {
                 return handle_exceptions(start_shard_fetch_worker(
@@ -1221,7 +1228,7 @@ void for_each_fetch_partition(const op_context& octx, const Func& f) {
 
 class simple_fetch_planner final : public fetch_planner::impl {
     fetch_plan create_plan(op_context& octx) final {
-        fetch_plan plan(ss::smp::count);
+        fetch_plan plan(ss::this_smp_shard_count());
         auto resp_it = octx.response_begin();
         auto bytes_left_in_plan = octx.bytes_left;
 
@@ -1264,10 +1271,11 @@ class simple_fetch_planner final : public fetch_planner::impl {
                * If not authorized do not include into a plan.
                * We audit successful messages only on the initial fetch.
                */
-              if (unlikely(!octx.rctx.authorized(
-                    security::acl_operation::read,
-                    topic,
-                    audit_on_success{octx.initial_fetch}))) {
+              if (
+                unlikely(!octx.rctx.authorized(
+                  security::acl_operation::read,
+                  topic,
+                  audit_on_success{octx.initial_fetch}))) {
                   return fail_all_partitions(
                     error_code::topic_authorization_failed);
               }
@@ -1276,9 +1284,10 @@ class simple_fetch_planner final : public fetch_planner::impl {
                * in sanction mode (without an enterprise license), the audit
                * log topic is not consumable
                */
-              if (unlikely(
-                    topic == model::kafka_audit_logging_topic
-                    && octx.rctx.feature_table().local().should_sanction())) {
+              if (
+                unlikely(
+                  topic == model::kafka_audit_logging_topic
+                  && octx.rctx.feature_table().local().should_sanction())) {
                   thread_local static ss::logger::rate_limit rate(1s);
                   vloglr(
                     klog,
@@ -1332,8 +1341,9 @@ class simple_fetch_planner final : public fetch_planner::impl {
                   const auto partition_id = kitp.get_partition();
                   model::ktp_with_hash ktp{kitp.get_topic(), partition_id};
 
-                  if (unlikely(
-                        metadata_cache.is_disabled(tn_view, partition_id))) {
+                  if (
+                    unlikely(
+                      metadata_cache.is_disabled(tn_view, partition_id))) {
                       resp_it->set(
                         make_partition_response_error(
                           partition_id, error_code::replica_not_available),
@@ -1675,8 +1685,9 @@ ss::future<response_ptr> op_context::send_response() && {
           resp_it->partition->topic_id,
           resp_it->partition->topic,
           resp_it->partition_response->partition_index);
-        if (auto sp_it = session_partitions.find(key);
-            sp_it != session_partitions.end()) {
+        if (
+          auto sp_it = session_partitions.find(key);
+          sp_it != session_partitions.end()) {
             update_session_partition(
               *resp_it->partition_response, sp_it->second->partition);
         }
@@ -1806,8 +1817,9 @@ void op_context::response_placeholder::set(
           _it->partition->topic,
           _it->partition_response->partition_index);
 
-        if (auto it = session_partitions.find(key);
-            it != session_partitions.end()) {
+        if (
+          auto it = session_partitions.find(key);
+          it != session_partitions.end()) {
             auto has_to_be_included = partition_has_changes(
               *_it->partition_response, it->second->partition);
             /**
@@ -1898,8 +1910,8 @@ fetch_scheduling_group_provider(const connection_context& conn_ctx) {
     return conn_ctx.server().fetch_scheduling_group();
 }
 
-std::ostream& operator<<(std::ostream& o, const consumer_info& ci) {
-    fmt::print(o, "rack_id: {}, fetch_offset: {}", ci.rack_id, ci.fetch_offset);
-    return o;
+fmt::iterator consumer_info::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it, "rack_id: {}, fetch_offset: {}", rack_id, fetch_offset);
 }
 } // namespace kafka

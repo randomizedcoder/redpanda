@@ -7,25 +7,19 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "cloud_topics/level_zero/pipeline/event_filter.h"
-#include "cloud_topics/level_zero/pipeline/pipeline_stage.h"
 #include "cloud_topics/level_zero/write_request_scheduler/write_request_scheduler.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/record.h"
-#include "model/record_batch_reader.h"
 #include "model/tests/random_batch.h"
 #include "test_utils/test.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/manual_clock.hh>
-#include <seastar/coroutine/as_future.hh>
 
 #include <chrono>
-#include <exception>
 #include <limits>
 #include <map>
 #include <random>
@@ -92,7 +86,7 @@ struct pipeline_sink {
                         continue;
                     }
                 }
-                r.set_value(chunked_vector<extent_meta>{});
+                r.set_value(upload_meta{});
                 write_requests_acked++;
                 vlog(
                   test_log.debug,
@@ -187,9 +181,7 @@ static ss::future<size_t> write_until_threshold(
   write_request_balancer_fixture& fix, size_t size_threshold) {
     size_t num_requests_sent = 0;
     size_t total_size = 0;
-    std::vector<
-      ss::future<std::expected<chunked_vector<extent_meta>, std::error_code>>>
-      wd;
+    std::vector<ss::future<std::expected<upload_meta, std::error_code>>> wd;
     while (total_size < size_threshold) {
         auto buf = co_await model::test::make_random_batches();
         chunked_vector<model::record_batch> batches;
@@ -248,7 +240,7 @@ static auto make_random_batches(size_t num_batches, size_t batch_size) {
 TEST_F_CORO(write_request_balancer_fixture, time_deadline_test) {
     // This test produces some batches and expects the time deadline
     // to trigger the upload.
-    ASSERT_TRUE_CORO(ss::smp::count > 1);
+    ASSERT_TRUE_CORO(ss::this_smp_shard_count() > 1);
 
     co_await start(false);
 
@@ -273,7 +265,7 @@ TEST_F_CORO(write_request_balancer_fixture, test_core_affinity) {
     // the unified scheduling policy to trigger the upload. It expects
     // that write requests to land on one shard using round-robin scheduling.
     // With round-robin, shard 0 will handle the first upload (ix=0).
-    ASSERT_TRUE_CORO(ss::smp::count > 1);
+    ASSERT_TRUE_CORO(ss::this_smp_shard_count() > 1);
 
     co_await start(false);
 
@@ -314,7 +306,7 @@ TEST_F_CORO(write_request_balancer_fixture, test_core_affinity) {
 
 TEST_F_CORO(write_request_balancer_fixture, data_threshold_test) {
     // Single shard produces enough data to trigger L0 upload
-    ASSERT_TRUE_CORO(ss::smp::count > 1);
+    ASSERT_TRUE_CORO(ss::this_smp_shard_count() > 1);
     auto size_threshold
       = config::shard_local_cfg()
           .cloud_topics_produce_batching_size_threshold.value();
@@ -341,7 +333,7 @@ TEST_F_CORO(write_request_balancer_fixture, test_data_threshold_with_failover) {
     // alternates between shards. This test verifies that all requests are
     // eventually acknowledged regardless of which shard handles the upload.
 
-    ASSERT_TRUE_CORO(ss::smp::count > 1);
+    ASSERT_TRUE_CORO(ss::this_smp_shard_count() > 1);
     auto size_threshold
       = config::shard_local_cfg()
           .cloud_topics_produce_batching_size_threshold.value();
@@ -381,7 +373,7 @@ TEST_F_CORO(
     // uploads. With round-robin scheduling, the target shard is selected based
     // on the ix counter, not on data volume. The test verifies that failures
     // are correctly propagated regardless of which shard handles the upload.
-    ASSERT_TRUE_CORO(ss::smp::count > 1);
+    ASSERT_TRUE_CORO(ss::this_smp_shard_count() > 1);
     static constexpr size_t batch_size = 0x1000;
 
     co_await start(false);
@@ -549,6 +541,8 @@ public:
     void set_next_stage_backlog(size_t shard, size_t bytes) {
         next_stage_counters[shard]->store(bytes);
     }
+
+    l0::write_request_scheduler_probe probe{true};
 };
 
 TEST_F(scheduler_context_test, test_initial_state) {
@@ -767,9 +761,10 @@ TEST_F(scheduler_context_test, test_try_schedule_upload_triggers_split) {
     auto ctx = make_context(4);
 
     // Group has 4 shards, max_buffer_size = 4 MiB
-    // Split threshold = 4 MiB × 4 = 16 MiB
-    constexpr size_t max_buffer_size = 4 * 1024 * 1024;              // 4 MiB
-    constexpr size_t expected_split_threshold = max_buffer_size * 4; // 16 MiB
+    // Split threshold = 2 × 4 MiB × 4 = 32 MiB
+    constexpr size_t max_buffer_size = 4 * 1024 * 1024; // 4 MiB
+    constexpr size_t expected_split_threshold = 2 * max_buffer_size
+                                                * 4; // 32 MiB
 
     // Set high next stage backlog to trigger split
     set_next_stage_backlog(0, expected_split_threshold + 1);
@@ -785,7 +780,7 @@ TEST_F(scheduler_context_test, test_try_schedule_upload_triggers_split) {
 
     // Shard 0 is first in group, should evaluate and trigger split
     auto result = ctx->try_schedule_upload(
-      ss::shard_id(0), max_buffer_size, 100ms, clock_type::now());
+      ss::shard_id(0), max_buffer_size, 100ms, clock_type::now(), probe);
 
     // After split, shards 0,1 should be in group 0, shards 2,3 in group 2
     EXPECT_EQ(ctx->shard_to_group[0].load(), l0::group_id{0});
@@ -818,7 +813,8 @@ TEST_F(scheduler_context_test, test_try_schedule_upload_triggers_merge) {
       ss::shard_id(0),
       500, // max_buffer_size
       100ms,
-      clock_type::now());
+      clock_type::now(),
+      probe);
 
     // After merge, all shards should be in group 0
     EXPECT_EQ(ctx->shard_to_group[0].load(), l0::group_id{0});
@@ -840,7 +836,7 @@ TEST_F(scheduler_context_test, test_round_robin_within_group) {
 
     // Round-robin counter starts at 0, so shard 0 should be selected first
     auto result0 = ctx->try_schedule_upload(
-      ss::shard_id(0), 500, 100ms, clock_type::now());
+      ss::shard_id(0), 500, 100ms, clock_type::now(), probe);
     EXPECT_EQ(result0.action, l0::schedule_action::upload);
 
     // Release the lock before checking next shard (simulates upload completion)
@@ -848,11 +844,11 @@ TEST_F(scheduler_context_test, test_round_robin_within_group) {
 
     // After upload, ix is incremented, so shard 1 should be selected next
     auto result1_skip = ctx->try_schedule_upload(
-      ss::shard_id(0), 500, 100ms, clock_type::now());
+      ss::shard_id(0), 500, 100ms, clock_type::now(), probe);
     EXPECT_EQ(result1_skip.action, l0::schedule_action::skip);
 
     auto result1 = ctx->try_schedule_upload(
-      ss::shard_id(1), 500, 100ms, clock_type::now());
+      ss::shard_id(1), 500, 100ms, clock_type::now(), probe);
     EXPECT_EQ(result1.action, l0::schedule_action::upload);
 }
 
@@ -933,6 +929,8 @@ public:
     void add_next_stage_backlog(size_t shard, size_t bytes) {
         next_stage_counters[shard]->fetch_add(bytes);
     }
+
+    l0::write_request_scheduler_probe probe{true};
 
     // Simulate ingestion: add random bytes to current stage backlog
     void simulate_ingestion() {
@@ -1050,7 +1048,8 @@ TEST_F(scheduler_context_fuzz_test, test_random_workload) {
               ss::shard_id(shard),
               max_buffer_size,
               scheduling_interval,
-              simulated_time);
+              simulated_time,
+              probe);
 
             if (result.action == l0::schedule_action::upload) {
                 // Deposit bytes from current stage to next stage
@@ -1105,7 +1104,8 @@ TEST_F(scheduler_context_fuzz_test, test_high_load_causes_splits) {
               ss::shard_id(shard),
               max_buffer_size,
               scheduling_interval,
-              simulated_time);
+              simulated_time,
+              probe);
 
             if (result.action == l0::schedule_action::upload) {
                 deposit_to_next_stage(*ctx, result.gid);
@@ -1187,7 +1187,8 @@ TEST_F(scheduler_context_fuzz_test, test_low_load_causes_merges) {
               ss::shard_id(shard),
               max_buffer_size,
               scheduling_interval,
-              simulated_time);
+              simulated_time,
+              probe);
 
             if (result.action == l0::schedule_action::upload) {
                 deposit_to_next_stage(*ctx, result.gid);

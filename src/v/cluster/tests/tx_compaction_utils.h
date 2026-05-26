@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cluster/logger.h"
 #include "cluster/rm_stm.h"
 #include "model/record.h"
@@ -71,17 +72,16 @@ public:
         bool _interleave = false;
         bool _compact = true;
 
-        friend std::ostream& operator<<(std::ostream& os, const spec& s) {
-            fmt::print(
-              os,
+        fmt::iterator format_to(fmt::iterator it) const {
+            return fmt::format_to(
+              it,
               "{{ num_txes: {}, num_rolls: {}, type: {}, interleave: {}, "
               "compact: {} }}",
-              s._num_txes,
-              s._num_rolls,
-              s._types,
-              s._interleave,
-              s._compact);
-            return os;
+              _num_txes,
+              _num_rolls,
+              static_cast<int>(_types),
+              _interleave,
+              _compact);
         }
     };
 
@@ -109,9 +109,9 @@ public:
                       model::timestamp(
                         model::timestamp::now().value() - ret_duration.count()),
                       std::nullopt,
-                      log->stm_manager()->max_removable_local_log_offset(),
-                      log->stm_manager()->max_tombstone_remove_offset(),
-                      log->stm_manager()->max_tx_end_remove_offset(),
+                      log->stm_hookset()->max_removable_local_log_offset(),
+                      log->stm_hookset()->max_tombstone_remove_offset(),
+                      log->stm_hookset()->max_tx_end_remove_offset(),
                       std::nullopt,
                       std::nullopt,
                       std::chrono::milliseconds{0},

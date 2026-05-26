@@ -15,8 +15,8 @@ redpanda_cc_library(
         "auto_fmt.h",
     ],
     deps = [
-        "//src/v/reflection:to_tuple",
-        "@fmt",
+        "//src/v/base",
+        "//src/v/reflection:arity",
     ],
 )
 
@@ -689,6 +689,21 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "device_utils",
+    srcs = [
+        "device_utils.cc",
+    ],
+    hdrs = [
+        "device_utils.h",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/ssx:sformat",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "offset_monitor",
     hdrs = [
         "offset_monitor.h",
@@ -697,6 +712,23 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/model",
         "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "xml",
+    srcs = [
+        "xml.cc",
+    ],
+    hdrs = [
+        "xml.h",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:streambuf",
+        "@boost//:property_tree",
         "@seastar",
     ],
 )

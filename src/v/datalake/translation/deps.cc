@@ -12,6 +12,7 @@
 
 #include "cluster/notification.h"
 #include "cluster/partition.h"
+#include "datalake/coordinator/catalog_config.h"
 #include "datalake/coordinator/frontend.h"
 #include "datalake/local_parquet_file_writer.h"
 #include "datalake/logger.h"
@@ -19,8 +20,8 @@
 #include "datalake/record_translator.h"
 #include "datalake/serde_parquet_writer.h"
 #include "datalake/translation/state_machine.h"
-#include "datalake/translation/utils.h"
 #include "datalake/translation_task.h"
+#include "iceberg/field_name_comparison.h"
 #include "kafka/data/partition_proxy.h"
 #include "kafka/utils/txn_reader.h"
 #include "utils/human.h"
@@ -317,13 +318,10 @@ struct timestamped_offset {
     kafka::offset offset;
     model::timestamp ts;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const timestamped_offset& to);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "{{offset: {}, timestamp: {}}}", offset, ts);
+    }
 };
-std::ostream& operator<<(std::ostream& o, const timestamped_offset& to) {
-    fmt::print(o, "{{offset: {}, timestamp: {}}}", to.offset, to.ts);
-    return o;
-}
 
 } // namespace
 
@@ -443,31 +441,6 @@ std::unique_ptr<data_source> data_source::make_default_data_source(
     return std::make_unique<partition_data_source>(std::move(partition));
 }
 
-std::ostream& operator<<(std::ostream& o, translation_errc ec) {
-    switch (ec) {
-    case no_data:
-        return o << "translation_errc::no_data";
-    case file_io_error:
-        return o << "translation_errc::file_io_error";
-    case cloud_io_error:
-        return o << "translation_errc::cloud_io_error";
-    case flush_error:
-        return o << "translation_errc::flush_error";
-    case discard_error:
-        return o << "translation_errc::discard_error";
-    case oom_error:
-        return o << "translation_errc::oom_error";
-    case time_limit_exceeded:
-        return o << "translation_errc::time_limit_exceeded";
-    case shutting_down:
-        return o << "translation_errc::shutting_down";
-    case out_of_disk:
-        return o << "translation_errc::out_of_disk";
-    case type_resolution_error:
-        return o << "translation_errc::type_resolution_error";
-    }
-}
-
 class partition_translation_context : public translation_context {
 public:
     explicit partition_translation_context(
@@ -498,6 +471,7 @@ public:
       , _features(features->local())
       , _probe(std::move(probe))
       , _invalid_record_action(compute_invalid_record_action())
+      , _norm(compute_field_name_comparison())
       , _cp_enabled(
           translation_task::custom_partitioning_enabled{
             _features.is_active(features::feature::datalake_iceberg_ga)})
@@ -520,6 +494,7 @@ public:
                 *_record_translator,
                 *_table_creator,
                 _invalid_record_action,
+                _norm,
                 _location_provider,
                 *_probe});
         }
@@ -656,6 +631,10 @@ private:
           default_action);
     }
 
+    iceberg::field_name_comparison compute_field_name_comparison() const {
+        return coordinator::resolve_field_name_comparison();
+    }
+
     local_path _writer_scratch_space;
     const model::ntp& _ntp;
     model::revision_id _topic_revision;
@@ -670,6 +649,7 @@ private:
     features::feature_table& _features;
     ss::lw_shared_ptr<translation_probe> _probe;
     model::iceberg_invalid_record_action _invalid_record_action;
+    iceberg::field_name_comparison _norm;
     translation_task::custom_partitioning_enabled _cp_enabled;
     translator_mem_tracker _mem_tracker;
     std::optional<translation_task> _in_progress_translation;

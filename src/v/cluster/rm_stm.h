@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
+#include "base/format_to.h"
 #include "bytes/iobuf.h"
 #include "cluster/fwd.h"
 #include "cluster/producer_state.h"
@@ -37,6 +38,7 @@
 #include <string_view>
 
 struct rm_stm_test_fixture;
+struct rm_stm_multinode_fixture;
 
 namespace cluster {
 
@@ -367,7 +369,7 @@ private:
 
     uint8_t active_snapshot_version();
 
-    friend std::ostream& operator<<(std::ostream&, const aborted_tx_state&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     // Defines the commit offset range for the stm bootstrap.
     // Set on first apply upcall and used to identify if the
@@ -432,19 +434,31 @@ private:
     ss::gate _gate;
     // Highest producer ID applied to this stm.
     model::producer_id _highest_producer_id;
+    // Tracks the last offset of the batch/snapshot being applied. Updated
+    // inside do_apply/apply_raft_snapshot before set_next runs, so it is
+    // always >= last_applied_offset() during the apply window.
+    model::offset _apply_watermark;
     // for monotonicity of computed LSO.
     model::offset _last_known_lso{model::invalid_lso};
     /**
-     * LSO lock protects the LSO from being exposed before transaction begin
-     * batch is applied.
+     * LSO lock protects from incorrect LSO calculation based on applied data
+     * when transaction begin batch has been accepted but not yet applied.
      *
-     * The lock is acquired in write mode when a begin transaction batch is
-     * being handled protecting exposure of potentially invalid LSO until the
-     * begin batch is applied.
+     * The lock is acquired in write mode during LSO calculation. The lock is
+     * acquired in read mode when a begin transaction batch is being replicated.
+     *
+     * This lock mode choice does not reflect any entity being written into or
+     * read from, but purely to enforce necessary isolation:
+     * - concurrent begin batch processing is allowed;
+     * - but no LSO recalculation is allowed during this.
+     *
+     * Write lock contention is not an issue, as calculation is done in a
+     * synchronous function. Should this change, a bimodal lock should be used.
      */
     ss::rwlock _lso_lock;
 
     friend struct ::rm_stm_test_fixture;
+    friend struct ::rm_stm_multinode_fixture;
 };
 
 class rm_stm_factory : public state_machine_factory {

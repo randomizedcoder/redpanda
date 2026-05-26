@@ -13,9 +13,12 @@
 #include "cluster/client_quota_frontend.h"
 #include "cluster/client_quota_serde.h"
 #include "cluster/cluster_link/frontend.h"
+#include "cluster/cluster_link_rpc_types.h"
+#include "cluster/cluster_utils.h"
 #include "cluster/config_frontend.h"
 #include "cluster/controller.h"
 #include "cluster/controller_api.h"
+#include "cluster/controller_utils.h"
 #include "cluster/errc.h"
 #include "cluster/feature_manager.h"
 #include "cluster/fwd.h"
@@ -28,6 +31,7 @@
 #include "cluster/node_status_backend.h"
 #include "cluster/partition_manager.h"
 #include "cluster/plugin_frontend.h"
+#include "cluster/plugin_rpc_types.h"
 #include "cluster/security_frontend.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
@@ -37,7 +41,6 @@
 #include "rpc/connection_cache.h"
 #include "rpc/errc.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/coroutine/switch_to.hh>
@@ -266,7 +269,7 @@ service::create_acls(create_acls_request request, rpc::streaming_context&) {
                  return _security_frontend.local().create_acls(
                    std::move(r.data.bindings), r.timeout);
              })
-      .then([](std::vector<errc> results) {
+      .then([](chunked_vector<errc> results) {
           return create_acls_reply{.results = std::move(results)};
       });
 }
@@ -279,7 +282,7 @@ service::delete_acls(delete_acls_request request, rpc::streaming_context&) {
                  return _security_frontend.local().delete_acls(
                    std::move(r.data.filters), r.timeout);
              })
-      .then([](std::vector<delete_acls_result> results) {
+      .then([](chunked_vector<delete_acls_result> results) {
           return delete_acls_reply{.results = std::move(results)};
       });
 }
@@ -892,6 +895,16 @@ service::update_mirror_topic_status(
       = co_await _cluster_link_frontend.local().update_mirror_topic_status(
         req.link_id, std::move(req.cmd), deadline);
     co_return update_mirror_topic_status_response{.ec = result};
+}
+
+ss::future<batch_update_mirror_topic_status_response>
+service::batch_update_mirror_topic_status(
+  batch_update_mirror_topic_status_request req, rpc::streaming_context&) {
+    auto deadline = model::timeout_clock::now() + req.timeout;
+    auto result = co_await _cluster_link_frontend.local()
+                    .batch_update_mirror_topic_status(
+                      req.link_id, std::move(req.cmd), deadline);
+    co_return batch_update_mirror_topic_status_response{.ec = result};
 }
 
 ss::future<update_mirror_topic_properties_response>

@@ -13,10 +13,9 @@
 #include "pandaproxy/test/pandaproxy_fixture.h"
 #include "pandaproxy/test/utils.h"
 #include "test_utils/boost_fixture.h"
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 
-#include <boost/beast/http/field.hpp>
 #include <boost/beast/http/status.hpp>
-#include <boost/beast/http/verb.hpp>
 #include <boost/test/tools/old/interface.hpp>
 
 namespace pp = pandaproxy;

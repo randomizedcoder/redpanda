@@ -13,7 +13,6 @@
 #include "compaction/utils.h"
 #include "model/fundamental.h"
 #include "model/timeout_clock.h"
-#include "model/timestamp.h"
 #include "storage/compacted_index.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/compaction_key.h"
@@ -21,7 +20,6 @@
 #include "storage/exceptions.h"
 #include "storage/index_state.h"
 #include "storage/probe.h"
-#include "storage/scoped_file_tracker.h"
 #include "storage/segment.h"
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
@@ -31,6 +29,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 
 #include <exception>
 #include <optional>
@@ -96,7 +95,7 @@ ss::future<bool> build_offset_map_for_segment(
           "Error building offset map for segment {}: {}",
           seg.path(),
           eptr);
-        std::rethrow_exception(eptr);
+        co_await ss::coroutine::return_exception_ptr(std::move(eptr));
     }
     bool fully_indexed = true;
     co_await rdr.for_each_async(
@@ -110,7 +109,7 @@ ss::future<bool> build_offset_map_for_segment(
 ss::future<model::offset> build_offset_map(
   const compaction::compaction_config& cfg,
   const segment_set& segs,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   storage_resources& resources,
   storage::probe& probe,
   compaction::key_offset_map& m,
@@ -151,7 +150,7 @@ ss::future<model::offset> build_offset_map(
             auto read_lock = co_await seg->read_lock();
             co_await internal::maybe_rebuild_compaction_index(
               seg,
-              stm_manager,
+              stm_hookset,
               cfg,
               read_lock,
               resources,
@@ -194,7 +193,7 @@ ss::future<index_state> deduplicate_segment(
   ss::lw_shared_ptr<storage::segment> seg,
   segment_appender& appender,
   compacted_index_writer& cmp_idx_writer,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   probe& probe,
   offset_delta_time should_offset_delta_times,
   ss::sharded<features::feature_table>& feature_table,
@@ -268,7 +267,7 @@ ss::future<index_state> deduplicate_segment(
       segment_last_offset,
       compaction_placeholder_enabled,
       tx_batch_compaction_enabled,
-      stm_manager,
+      stm_hookset,
       &cmp_idx_writer,
       inject_reader_failure,
       cfg.asrc);

@@ -98,7 +98,7 @@ parse_v1_header(ss::input_stream<char>& src) {
 }
 
 ss::future<std::optional<request_header>>
-parse_header(ss::input_stream<char>& src) {
+parse_header(ss::input_stream<char>& src, size_t request_size) {
     auto header = co_await parse_v1_header(src);
     if (header) {
         /// Conditionally handle v1 (flex) header
@@ -106,9 +106,9 @@ parse_header(ss::input_stream<char>& src) {
             /// User provided unsupported an invalid key that does not map
             /// to any known kafka requests, code will throw when it eventually
             /// reaches the request router
-        } else if (flex_versions::is_flexible_request(
-                     header->key, header->version)) {
-            auto [tags, bytes_read] = co_await parse_tags(src);
+        } else if (
+          flex_versions::is_flexible_request(header->key, header->version)) {
+            auto [tags, bytes_read] = co_await parse_tags(src, request_size);
             header->tags = std::move(tags);
             header->tags_size_bytes = bytes_read;
         }
@@ -116,7 +116,7 @@ parse_header(ss::input_stream<char>& src) {
     co_return header;
 }
 
-ss::scattered_message<char> response_as_scattered(response_ptr response) {
+scattered_buffer response_as_scattered(response_ptr response) {
     /*
      * response header:
      *   - int32_t: size (correlation + response size)
@@ -140,24 +140,8 @@ ss::scattered_message<char> response_as_scattered(response_ptr response) {
 
     auto& buf = response->buf();
     buf.prepend(std::move(header));
-    ss::scattered_message<char> msg;
-    auto in = iobuf::iterator_consumer(buf.cbegin(), buf.cend());
-    int32_t chunk_no = 0;
-    in.consume(
-      buf.size_bytes(), [&msg, &chunk_no, &buf](const char* src, size_t sz) {
-          ++chunk_no;
-          vassert(
-            chunk_no <= std::numeric_limits<int16_t>::max(),
-            "Invalid construction of scattered_message. max count:{}. Usually "
-            "a bug with small append() to iobuf. {}",
-            chunk_no,
-            buf);
-          msg.append_static(src, sz);
-          return ss::stop_iteration::no;
-      });
-    // MUST be the foreign ptr not the iobuf
-    msg.on_delete([response = std::move(response)] {});
-    return msg;
+
+    return std::move(buf).as_scattered();
 }
 
 } // namespace kafka

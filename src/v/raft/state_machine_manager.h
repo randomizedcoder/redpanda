@@ -155,8 +155,8 @@ private:
           serde::version<0>,
           serde::compat_version<0>> {
         friend bool operator==(
-          const initial_recovery_snapshot&, const initial_recovery_snapshot&)
-          = default;
+          const initial_recovery_snapshot&,
+          const initial_recovery_snapshot&) = default;
 
         auto serde_fields() { return std::tie(initial_recovery_next_offsets); }
 
@@ -164,10 +164,14 @@ private:
         // each state machine that has been added to the manager.
         absl::flat_hash_map<ss::sstring, model::offset>
           initial_recovery_next_offsets;
-    };
 
-    friend std::ostream&
-    operator<<(std::ostream&, const initial_recovery_snapshot&);
+        fmt::iterator format_to(fmt::iterator it) const {
+            return fmt::format_to(
+              it,
+              "{{initial_recovery_next_offsets: {}}}",
+              initial_recovery_next_offsets);
+        }
+    };
 
     state_machine_manager(
       consensus* raft,
@@ -188,8 +192,8 @@ private:
         state_machine_entry(state_machine_entry&&) noexcept = default;
         state_machine_entry(const state_machine_entry&) noexcept = delete;
         state_machine_entry& operator=(state_machine_entry&&) noexcept = delete;
-        state_machine_entry& operator=(const state_machine_entry&) noexcept
-          = delete;
+        state_machine_entry&
+        operator=(const state_machine_entry&) noexcept = delete;
         ~state_machine_entry() = default;
 
         ss::sstring name;
@@ -241,8 +245,8 @@ private:
           serde::compat_version<0>> {
         absl::flat_hash_map<ss::sstring, iobuf> snapshot_map;
 
-        friend bool operator==(const managed_snapshot&, const managed_snapshot&)
-          = default;
+        friend bool
+        operator==(const managed_snapshot&, const managed_snapshot&) = default;
 
         auto serde_fields() { return std::tie(snapshot_map); }
     };

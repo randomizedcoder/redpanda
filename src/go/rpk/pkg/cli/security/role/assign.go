@@ -14,6 +14,7 @@ import (
 
 	dataplanev1 "buf.build/gen/go/redpandadata/dataplane/protocolbuffers/go/redpanda/api/dataplane/v1"
 	"connectrpc.com/connect"
+	"github.com/redpanda-data/common-go/rpadmin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
@@ -40,6 +41,9 @@ Assign role "redpanda-admin" to user "red"
 
 Assign role "redpanda-admin" to users "red" and "panda"
   rpk security role assign redpanda-admin --principal red,panda
+
+Assign role "redpanda-admin" to group "pandas"
+  rpk security role assign redpanda-admin --principal Group:pandas
 `,
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
@@ -52,34 +56,41 @@ Assign role "redpanda-admin" to users "red" and "panda"
 			config.CheckExitServerlessAdmin(prof)
 
 			roleName := args[0]
-			toAdd := parseRoleMember(principals)
 
-			if prof.CheckFromCloud() {
-				cl, err := publicapi.DataplaneClientFromRpkProfile(prof)
-				out.MaybeDie(err, "unable to initialize cloud API client: %v", err)
+			// Handle principals (cloud+local).
+			var toAdd []rpadmin.RoleMember
+			if len(principals) > 0 {
+				toAdd = parseRoleMember(principals)
+				if prof.CheckFromCloud() {
+					cl, err := publicapi.DataplaneClientFromRpkProfile(prof)
+					out.MaybeDie(err, "unable to initialize cloud API client: %v", err)
 
-				_, err = cl.Security.UpdateRoleMembership(cmd.Context(), connect.NewRequest(&dataplanev1.UpdateRoleMembershipRequest{
-					RoleName: roleName,
-					Add:      roleMemberToMembership(toAdd),
-				}))
-				out.MaybeDie(err, "unable to assign role %q to principal(s) %v: %v", roleName, principals, err)
-			} else {
-				cl, err := adminapi.NewClient(cmd.Context(), fs, prof)
-				out.MaybeDie(err, "unable to initialize admin api client: %v", err)
+					_, err = cl.Security.UpdateRoleMembership(cmd.Context(), connect.NewRequest(&dataplanev1.UpdateRoleMembershipRequest{
+						RoleName: roleName,
+						Add:      roleMemberToMembership(toAdd),
+					}))
+					out.MaybeDie(err, "unable to assign role %q to principal(s) %v: %v", roleName, principals, err)
+				} else {
+					cl, err := adminapi.NewClient(cmd.Context(), fs, prof)
+					out.MaybeDie(err, "unable to initialize admin api client: %v", err)
 
-				_, err = cl.AssignRole(cmd.Context(), roleName, toAdd)
-				out.MaybeDie(err, "unable to assign role %q to principal(s) %v: %v", roleName, principals, err)
+					_, err = cl.AssignRole(cmd.Context(), roleName, toAdd)
+					out.MaybeDie(err, "unable to assign role %q to principal(s) %v: %v", roleName, principals, err)
+				}
 			}
 
-			if isText, _, s, err := f.Format(toAdd); !isText {
-				out.MaybeDie(err, "unable to print in the required format %q: %v", f.Kind, err)
-				out.Exit(s)
-			}
-			fmt.Printf("Successfully assigned role %q to\n", roleName)
-			tw := out.NewTable("NAME", "PRINCIPAL-TYPE")
-			defer tw.Flush()
-			for _, m := range toAdd {
-				tw.PrintStructFields(m)
+			// Output principals.
+			if len(toAdd) > 0 {
+				if isText, _, s, err := f.Format(toAdd); !isText {
+					out.MaybeDie(err, "unable to print in the required format %q: %v", f.Kind, err)
+					out.Exit(s)
+				}
+				fmt.Printf("Successfully assigned role %q to\n", roleName)
+				tw := out.NewTable("NAME", "PRINCIPAL-TYPE")
+				defer tw.Flush()
+				for _, m := range toAdd {
+					tw.PrintStructFields(m)
+				}
 			}
 		},
 	}

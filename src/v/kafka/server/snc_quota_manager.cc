@@ -14,17 +14,14 @@
 #include "metrics/prometheus_sanitize.h"
 #include "ssx/future-util.h"
 #include "ssx/sharded_ptr.h"
-#include "utils/tristate.h"
 
 #include <seastar/core/metrics.hh>
 
-#include <fmt/core.h>
 #include <fmt/ranges.h>
 
 #include <chrono>
 #include <iterator>
 #include <memory>
-#include <numeric>
 
 using namespace std::chrono_literals;
 
@@ -65,7 +62,7 @@ void snc_quotas_probe::setup_metrics() {
           "Currently effective quota, in bytes/s");
         static constexpr auto calc_quota = [](const std::optional<int64_t>& q) {
             if (q.has_value()) {
-                return q.value() / ss::smp::count;
+                return q.value() / ss::this_smp_shard_count();
             }
             constexpr int64_t max_without_conversion_error
               = std::numeric_limits<int64_t>::max() / 1024 * 1024;

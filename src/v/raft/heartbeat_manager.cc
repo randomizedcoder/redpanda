@@ -25,12 +25,8 @@
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/with_timeout.hh>
-
-#include <bits/stdint-uintn.h>
-#include <boost/range/iterator_range.hpp>
 
 namespace raft {
 ss::logger hbeatlog{"r/heartbeat"};
@@ -76,9 +72,10 @@ void heartbeat_manager::fetch_heartbeats_for_raft_group(
             continue;
         }
 
-        if (unlikely(
-              !_enable_lw_heartbeat()
-              && follower_metadata.has_inflight_appends())) {
+        if (
+          unlikely(
+            !_enable_lw_heartbeat()
+            && follower_metadata.has_inflight_appends())) {
             // Revert back to old behavior of heartbeat suppression during
             // inflight appends as we cannot make use of lw heartbeats
             // optitmization. This is unlikely in practice  because lw
@@ -101,11 +98,12 @@ void heartbeat_manager::fetch_heartbeats_for_raft_group(
         const auto raft_metadata = raft_group->meta();
 
         // lightweight heartbeat optimization, requires less data
-        if (should_lw_heartbeat(
-              raft_group,
-              follower_metadata,
-              raft_metadata,
-              raft_group->flushed_offset())) {
+        if (
+          should_lw_heartbeat(
+            raft_group,
+            follower_metadata,
+            raft_metadata,
+            raft_group->flushed_offset())) {
             raft_group->_probe->lw_heartbeat();
             // we do not fill the dirty offset and follower request
             // sequence here as those fields are not used to process
@@ -278,6 +276,12 @@ ss::future<> heartbeat_manager::do_dispatch_heartbeats() {
         if (co_await _client_protocol.ensure_disconnect(node_id)) {
             vlog(
               hbeatlog.info, "Closed unresponsive connection to {}", node_id);
+            // Clear failures attributed to the replaced transport.
+            co_await ssx::async_for_each<loop_traits>(
+              _consensus_groups,
+              [node_id](ss::lw_shared_ptr<consensus>& raft_group) {
+                  raft_group->reset_heartbeat_failures(node_id);
+              });
         };
     }
 

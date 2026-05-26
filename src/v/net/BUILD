@@ -53,7 +53,9 @@ redpanda_cc_library(
         "transport.h",
     ],
     implementation_deps = [
+        "//src/v/bytes:iobuf",
         "//src/v/strings:utf8",
+        "@openssl",
     ],
     visibility = ["//visibility:public"],
     deps = [

@@ -17,6 +17,7 @@
 #include "utils/retry_chain_node.h"
 
 #include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 
 #include <exception>
 #include <utility>
@@ -72,9 +73,49 @@ level_one_log_reader_impl::do_load_slice(
     }
 }
 
+ss::future<std::expected<std::monostate, l1::io::errc>>
+level_one_log_reader_impl::open_reader_at(
+  l1::object_id oid,
+  kafka::offset last_object_offset,
+  size_t extent_position,
+  size_t extent_size) {
+    l1::object_extent extent{
+      .id = oid,
+      .position = extent_position,
+      .size = extent_size,
+    };
+    ss::abort_source default_abort_source;
+    auto* abort_source = _config.abort_source
+                           ? &_config.abort_source.value().get()
+                           : &default_abort_source;
+    auto stream_fut = co_await ss::coroutine::as_future(
+      _io->read_object(extent, abort_source));
+    if (stream_fut.failed()) {
+        auto ex = stream_fut.get_exception();
+        vlog(
+          _log.error, "Exception opening stream for L1 object {}: {}", oid, ex);
+        std::rethrow_exception(ex);
+    }
+    auto stream_result = stream_fut.get();
+    if (!stream_result.has_value()) {
+        co_return std::unexpected(stream_result.error());
+    }
+    _current_stream = open_stream{
+      .oid = oid,
+      .last_object_offset = last_object_offset,
+      .reader = l1::object_reader::create(std::move(stream_result).value()),
+    };
+    co_return std::monostate{};
+}
+
 ss::future<model::record_batch_reader::storage_t>
 level_one_log_reader_impl::read_some(
   model::timeout_clock::time_point deadline) {
+    if (_config.strict_max_bytes && _config.max_bytes == 0) {
+        set_end_of_stream();
+        co_await close_current_stream();
+        co_return model::record_batch_reader::storage_t{};
+    }
     while (true) {
         if (_next_offset > _config.max_offset) {
             vlog(
@@ -87,52 +128,107 @@ level_one_log_reader_impl::read_some(
             co_return model::record_batch_reader::storage_t{};
         }
 
-        auto object = co_await lookup_object_for_offset(_next_offset, deadline);
-        if (!object.has_value()) {
-            set_end_of_stream();
-            co_return model::record_batch_reader::storage_t{};
-        }
+        chunked_circular_buffer<model::record_batch> batches;
 
-        auto batches = co_await materialize_batches_from_object_offset(
-          object.value(), _next_offset, deadline);
+        if (_current_stream) {
+            // Reuse the inline stream from a previous read_some iteration
+            // or from a prior materialize call.
+            vlog(
+              _log.debug,
+              "Reusing open stream for offset {} (object {})",
+              _next_offset,
+              _current_stream->oid);
 
-        /*
-         * When EOS is reached this reader is done. So we don't need to worry
-         * about what is in batches. If it's empty, the reader will yield no
-         * batches. Otherwise the batches will be consumed but we don't need to
-         * worry about incrementing the next offset.
-         */
-        if (is_end_of_stream()) {
-            co_return batches;
-        }
-
-        /*
-         * If we didn't read any batches, then start again past the end of the
-         * object. Otherwise start again after the range that was read.
-         */
-        if (batches.empty()) {
-            _next_offset = kafka::next_offset(object.value().last_offset);
+            auto read_fut = co_await ss::coroutine::as_future(
+              read_batches(*_current_stream->reader));
+            if (read_fut.failed()) {
+                auto ex = read_fut.get_exception();
+                vlog(
+                  _log.error,
+                  "Exception reading from open stream (object {}): {}",
+                  _current_stream->oid,
+                  ex);
+                co_await close_current_stream();
+                std::rethrow_exception(ex);
+            }
+            batches = read_fut.get();
         } else {
-            _next_offset = kafka::next_offset(
-              model::offset_cast(batches.back().last_offset()));
+            auto object = co_await lookup_object_for_offset(
+              _next_offset, deadline);
+            if (!object.has_value()) {
+                set_end_of_stream();
+                co_return model::record_batch_reader::storage_t{};
+            }
+
+            auto mat = co_await materialize_batches_from_object_offset(
+              object.value(), _next_offset, deadline);
+            batches = std::move(mat.batches);
+
+            // When materialize found no data (npos), advance past the
+            // object so the loop doesn't spin.
+            if (batches.empty() && !_current_stream) {
+                _next_offset = kafka::next_offset(mat.last_object_offset);
+                continue;
+            }
+        }
+
+        if (is_end_of_stream()) {
+            if (!batches.empty()) {
+                _next_offset = kafka::next_offset(
+                  model::offset_cast(batches.back().last_offset()));
+            }
             co_return batches;
         }
+
+        if (batches.empty()) {
+            if (_current_stream) {
+                _next_offset = kafka::next_offset(
+                  _current_stream->last_object_offset);
+                co_await close_current_stream();
+            }
+            continue;
+        }
+
+        _next_offset = kafka::next_offset(
+          model::offset_cast(batches.back().last_offset()));
+
+        co_return batches;
     }
 }
 
-ss::future<std::optional<level_one_log_reader_impl::object_info>>
-level_one_log_reader_impl::lookup_object_for_offset(
-  kafka::offset offset, model::timeout_clock::time_point /*deadline*/) {
+std::optional<l1::metastore::object_response>
+level_one_log_reader_impl::consume_lookahead_buffer(kafka::offset offset) {
+    // Discard stale entries whose data is entirely before the requested
+    // offset.
+    while (!_lookahead_buffer.empty()
+           && _lookahead_buffer.front().last_offset < offset) {
+        _lookahead_buffer.pop_front();
+    }
+    if (_lookahead_buffer.empty()) {
+        return std::nullopt;
+    }
+    auto entry = std::move(_lookahead_buffer.front());
+    _lookahead_buffer.pop_front();
+    return entry;
+}
+
+ss::future<> level_one_log_reader_impl::fill_lookahead_buffer(
+  kafka::offset offset, size_t num_objects) {
     ss::abort_source default_abort_source;
     auto* abort_source = _config.abort_source
                            ? &_config.abort_source.value().get()
                            : &default_abort_source;
     retry_chain_node rtc = l1::make_default_metastore_rtc(*abort_source);
     auto response = co_await l1::retry_metastore_op(
-      [this, offset]
-      -> ss::future<
-        std::expected<l1::metastore::object_response, l1::metastore::errc>> {
-          return _metastore->get_first_ge(_tidp, offset);
+      [this, offset, num_objects] -> ss::future<std::expected<
+                                    l1::metastore::extent_metadata_response,
+                                    l1::metastore::errc>> {
+          return _metastore->get_extent_metadata_forwards(
+            _tidp,
+            offset,
+            kafka::offset::max(),
+            num_objects,
+            l1::metastore::include_object_metadata::yes);
       },
       rtc);
     if (!response.has_value()) {
@@ -140,12 +236,10 @@ level_one_log_reader_impl::lookup_object_for_offset(
         case l1::metastore::errc::out_of_range:
             vlog(
               _log.debug, "No L1 objects found at offset {} or later", offset);
-            co_return std::nullopt;
-
+            co_return;
         case l1::metastore::errc::missing_ntp:
             vlog(_log.debug, "Partition not tracked in metastore");
-            co_return std::nullopt;
-
+            co_return;
         default:
             throw std::runtime_error(_log.format(
               "Metastore query failed offset {}: {}",
@@ -154,7 +248,36 @@ level_one_log_reader_impl::lookup_object_for_offset(
         }
     }
 
-    auto& obj = response.value();
+    for (auto& em : response.value().extents) {
+        vassert(
+          em.object_info.has_value(),
+          "extent metadata missing object_info for offsets ({}~{})",
+          em.base_offset,
+          em.last_offset);
+        _lookahead_buffer.push_back(
+          l1::metastore::object_response{
+            .oid = em.object_info->oid,
+            .footer_pos = em.object_info->footer_pos,
+            .object_size = em.object_info->object_size,
+            .first_offset = em.base_offset,
+            .last_offset = em.last_offset,
+          });
+    }
+}
+
+ss::future<std::optional<level_one_log_reader_impl::object_info>>
+level_one_log_reader_impl::lookup_object_for_offset(
+  kafka::offset offset, model::timeout_clock::time_point /*deadline*/) {
+    if (_lookahead_buffer.empty()) {
+        auto num_objects = std::max<size_t>(1, _config.lookahead_objects);
+        co_await fill_lookahead_buffer(offset, num_objects);
+    }
+    auto obj_resp = consume_lookahead_buffer(offset);
+    if (!obj_resp.has_value()) {
+        co_return std::nullopt;
+    }
+
+    auto& obj = obj_resp.value();
     vlog(_log.debug, "Found L1 object {} at offset {}", obj.oid, offset);
 
     auto footer = co_await read_footer(
@@ -245,36 +368,37 @@ level_one_log_reader_impl::read_batches(l1::object_reader& reader) {
     size_t bytes_skipped = 0;
 
     while (true) {
-        auto result = co_await reader.read_next();
-
-        if (std::holds_alternative<model::record_batch>(result)) {
-            auto batch = std::move(std::get<model::record_batch>(result));
-
-            // Skip batches before our start offset.
-            if (batch.last_offset() < kafka::offset_cast(_next_offset)) {
-                bytes_skipped += batch.size_bytes();
-                continue;
-            }
-
-            // Stop if we've gone beyond our max offset.
-            if (batch.base_offset() > kafka::offset_cast(_config.max_offset)) {
-                break;
-            }
-
-            auto batch_size = batch.size_bytes();
-            if (is_over_limit_with_bytes(batch_size)) {
-                set_end_of_stream();
-                break;
-            }
-            _bytes_consumed += batch_size;
-            bytes_read += batch_size;
-
-            batches.push_back(std::move(batch));
-
-        } else {
-            // End of data.
+        auto peeked = co_await reader.peek();
+        auto* hdr = std::get_if<model::record_batch_header>(&peeked);
+        if (!hdr) {
             break;
         }
+
+        // Stop before consuming the batch body when the batch is past
+        // max_offset or would exceed the byte budget. The stream stays
+        // positioned after the header, so a cached reader can resume
+        // from this point on the next fetch.
+        if (hdr->base_offset > kafka::offset_cast(_config.max_offset)) {
+            break;
+        }
+        if (is_over_limit_with_bytes(hdr->size_bytes)) {
+            set_end_of_stream();
+            break;
+        }
+
+        // Accept — consume the batch body.
+        auto result = co_await reader.read_next();
+        auto batch = std::move(std::get<model::record_batch>(result));
+
+        if (batch.last_offset() < kafka::offset_cast(_next_offset)) {
+            bytes_skipped += batch.size_bytes();
+            continue;
+        }
+
+        auto batch_size = batch.size_bytes();
+        _bytes_consumed += batch_size;
+        bytes_read += batch_size;
+        batches.push_back(std::move(batch));
     }
 
     if (_probe != nullptr) {
@@ -284,13 +408,33 @@ level_one_log_reader_impl::read_batches(l1::object_reader& reader) {
     co_return batches;
 }
 
-ss::future<chunked_circular_buffer<model::record_batch>>
+ss::future<level_one_log_reader_impl::materialize_result>
 level_one_log_reader_impl::materialize_batches_from_object_offset(
   const object_info& object,
   kafka::offset offset,
   model::timeout_clock::time_point /*deadline*/) {
-    auto seek_res = object.footer.file_position_before_kafka_offset(
-      _tidp, offset);
+    // When a timestamp hint is available, use the footer's timestamp index
+    // to narrow the seek position. Both offset and timestamp constraints
+    // must hold, so we start at whichever position is further into the
+    // file.
+    auto seek_res = [&] {
+        auto offset_seek = object.footer.file_position_before_kafka_offset(
+          _tidp, offset);
+        if (!_config.first_timestamp) {
+            return offset_seek;
+        }
+        auto time_seek = object.footer.file_position_before_max_timestamp(
+          _tidp, *_config.first_timestamp);
+        if (time_seek == l1::footer::npos) {
+            return offset_seek;
+        }
+        if (offset_seek == l1::footer::npos) {
+            return time_seek;
+        }
+        return time_seek.file_position > offset_seek.file_position
+                 ? time_seek
+                 : offset_seek;
+    }();
     if (seek_res == l1::footer::npos) {
         // Perhaps this object spans offsets in the metastore but has
         // no data because of compaction.
@@ -298,68 +442,61 @@ level_one_log_reader_impl::materialize_batches_from_object_offset(
           _log.debug,
           "No data in object {}: materializing 0 batches",
           object.oid);
-        co_return chunked_circular_buffer<model::record_batch>{};
+        co_return materialize_result{
+          .last_object_offset = object.last_offset,
+        };
     }
 
-    l1::object_extent extent{
-      .id = object.oid,
-      .position = seek_res.file_position,
-      .size = seek_res.length,
-    };
-    ss::abort_source default_abort_source;
-    auto* abort_source = _config.abort_source
-                           ? &_config.abort_source.value().get()
-                           : &default_abort_source;
-    auto stream_fut = co_await ss::coroutine::as_future(
-      _io->read_object(extent, abort_source));
-    if (stream_fut.failed()) {
-        auto ex = stream_fut.get_exception();
-        vlog(
-          _log.error,
-          "Exception opening stream for L1 object {}: {}",
-          object.oid,
-          ex);
-        std::rethrow_exception(ex);
-    }
-    auto stream_result = stream_fut.get();
-    if (!stream_result.has_value()) {
+    auto reader_result = co_await open_reader_at(
+      object.oid, object.last_offset, seek_res.file_position, seek_res.length);
+    if (!reader_result.has_value()) {
         vlog(
           _log.warn,
           "Failed to open stream for L1 object {} reading offset {}: {}",
           object.oid,
           offset,
-          std::to_underlying(stream_result.error()));
-        throw std::runtime_error(_log.format(
-          "Failed to open stream for L1 object {}: {}",
-          object.oid,
-          std::to_underlying(stream_result.error())));
+          reader_result.error());
+        co_await ss::coroutine::return_exception(
+          std::runtime_error(_log.format(
+            "Failed to open stream for L1 object {}: {}",
+            object.oid,
+            reader_result.error())));
     }
 
-    auto reader = l1::object_reader::create(std::move(stream_result).value());
-    auto read_fut = co_await ss::coroutine::as_future(read_batches(*reader));
+    // _current_stream is now populated by open_reader_at.
+    auto read_fut = co_await ss::coroutine::as_future(
+      read_batches(*_current_stream->reader));
     if (read_fut.failed()) {
         auto ex = read_fut.get_exception();
         vlog(_log.error, "Exception reading L1 object {}: {}", object.oid, ex);
-        co_await close_reader_safe(*reader);
-        std::rethrow_exception(ex);
+        co_await close_current_stream();
+        co_await ss::coroutine::return_exception_ptr(std::move(ex));
     }
-
-    co_await close_reader_safe(*reader);
 
     auto batches = read_fut.get();
 
-    // Note that it's possible to materialize zero batches.
     vlog(
       _log.debug,
       "Materialized {} batches from L1 object {}",
       batches.size(),
       object.oid);
 
-    co_return batches;
+    co_return materialize_result{
+      .batches = std::move(batches),
+      .last_object_offset = object.last_offset,
+    };
 }
 
-void level_one_log_reader_impl::print(std::ostream& o) {
-    o << "level_one_cloud_topics_reader";
+ss::future<> level_one_log_reader_impl::close_current_stream() {
+    if (!_current_stream) {
+        co_return;
+    }
+    co_await close_reader_safe(*_current_stream->reader);
+    _current_stream.reset();
+}
+
+fmt::iterator level_one_log_reader_impl::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "level_one_cloud_topics_reader");
 }
 
 void level_one_log_reader_impl::set_end_of_stream() { _end_of_stream = true; }
@@ -368,9 +505,41 @@ bool level_one_log_reader_impl::is_end_of_stream() const {
     return _end_of_stream;
 }
 
+ss::future<> level_one_log_reader_impl::finally() noexcept {
+    return close_current_stream();
+}
+
+std::optional<level_one_log_reader_impl::private_flags>
+level_one_log_reader_impl::get_flags() const {
+    return private_flags{
+      .is_reusable = is_reusable(),
+      .was_cached = _was_cached,
+    };
+}
+
+void level_one_log_reader_impl::reset_config(
+  const cloud_topic_log_reader_config& cfg) {
+    vassert(
+      cfg.start_offset == _next_offset,
+      "reset_config: start_offset {} != next_offset {}",
+      cfg.start_offset,
+      _next_offset);
+    _config = cfg;
+    _end_of_stream = false;
+    _bytes_consumed = 0;
+    _was_cached = true;
+}
+
+bool level_one_log_reader_impl::is_reusable() const {
+    return _current_stream.has_value() || !_lookahead_buffer.empty();
+}
+
 bool level_one_log_reader_impl::is_over_limit_with_bytes(size_t size) const {
-    return (_config.strict_max_bytes || _bytes_consumed > 0)
-           && (_bytes_consumed + size) > _config.max_bytes;
+    // Always accept the first batch to guarantee progress.
+    if (_bytes_consumed == 0) {
+        return false;
+    }
+    return (_bytes_consumed + size) > _config.max_bytes;
 }
 
 } // namespace cloud_topics

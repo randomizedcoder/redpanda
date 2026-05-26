@@ -9,14 +9,25 @@
 
 #include "cluster/config_frontend.h"
 #include "cluster/controller.h"
+#include "config/configuration.h"
 #include "kafka/client/transport.h"
 #include "kafka/protocol/create_partitions.h"
 #include "kafka/protocol/create_topics.h"
 #include "redpanda/tests/fixture.h"
+#include "test_utils/async.h"
 
 class topic_properties_test_fixture : public redpanda_thread_fixture {
 public:
     topic_properties_test_fixture() { wait_for_controller_leadership().get(); }
+
+    void wait_for_license_init() {
+        tests::cooperative_spin_wait_with_timeout(5s, [this] {
+            return app.controller->get_feature_table()
+              .local()
+              .get_license()
+              .has_value();
+        }).get();
+    }
 
     void revoke_license() {
         app.controller->get_feature_table()
@@ -41,6 +52,11 @@ public:
             },
             model::timeout_clock::now() + 5s)
           .get();
+        // Tests have no restart mechanism, so promote pending values
+        // immediately so that needs_restart properties take effect.
+        ss::smp::invoke_on_all([] {
+            config::shard_local_cfg().promote_pending();
+        }).get();
     }
 
     template<typename Func>

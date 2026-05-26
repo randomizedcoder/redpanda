@@ -23,6 +23,8 @@
 #include "cluster/controller.h"
 #include "cluster/controller_api.h"
 #include "cluster/controller_stm.h"
+#include "cluster/drain_manager.h"
+#include "cluster/drain_status.h"
 #include "cluster/errc.h"
 #include "cluster/feature_manager.h"
 #include "cluster/fwd.h"
@@ -59,6 +61,7 @@
 #include "json/stringbuffer.h"
 #include "json/validator.h"
 #include "json/writer.h"
+#include "kafka/data/partition_proxy.h"
 #include "metrics/metrics.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -100,8 +103,6 @@
 #include "utils/unresolved_address.h"
 #include "wasm/errc.h"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/map_reduce.hh>
 #include <seastar/core/prometheus.hh>
@@ -113,7 +114,6 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/with_scheduling_group.hh>
-#include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/http/api_docs.hh>
 #include <seastar/http/common.hh>
@@ -122,31 +122,25 @@
 #include <seastar/http/json_path.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/http/request.hh>
-#include <seastar/http/url.hh>
 #include <seastar/json/json_elements.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/tls.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/short_streams.hh>
-#include <seastar/util/variant_utils.hh>
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/lexical_cast/bad_lexical_cast.hpp>
 #include <fmt/core.h>
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <exception>
 #include <iterator>
-#include <limits>
 #include <memory>
-#include <numeric>
 #include <ranges>
 #include <stdexcept>
 #include <system_error>
@@ -403,7 +397,6 @@ public:
               std::current_exception());
             rep = serde::pb::rpc::internal_exception().handle(std::move(rep));
         }
-        rep->done();
         co_return rep;
     }
 
@@ -1162,8 +1155,7 @@ map_partition_results(std::vector<cluster::move_cancellation_result> results) {
 }
 
 ss::httpd::broker_json::maintenance_status fill_maintenance_status(
-  const cluster::broker_state& b_state,
-  const cluster::drain_manager::drain_status& s) {
+  const cluster::broker_state& b_state, const cluster::drain_status& s) {
     ss::httpd::broker_json::maintenance_status ret;
     ret.draining = b_state.get_maintenance_state()
                    == model::maintenance_state::active;
@@ -1555,12 +1547,17 @@ void admin_server::register_config_routes() {
               include_defaults = str_to_bool(include_defaults_str);
           }
 
+          auto pending = config::use_pending::yes;
+          if (get_boolean_query_param(req, "suppress_pending")) {
+              pending = config::use_pending::no;
+          }
+
           auto key_str = req.get_query_param("key");
           if (!key_str.empty()) {
               // Write a single key to json.
               try {
                   config::shard_local_cfg().to_json_single_key(
-                    writer, config::redact_secrets::yes, key_str);
+                    writer, config::redact_secrets::yes, key_str, pending);
               } catch (const std::out_of_range&) {
                   throw ss::httpd::bad_param_exception(
                     fmt::format("Unknown property {{{}}}", key_str));
@@ -1570,9 +1567,15 @@ void admin_server::register_config_routes() {
               config::shard_local_cfg().to_json(
                 writer,
                 config::redact_secrets::yes,
-                [include_defaults](config::base_property& p) {
-                    return include_defaults || !p.is_default();
-                });
+                [include_defaults, pending](config::base_property& p) {
+                    if (include_defaults) {
+                        return true;
+                    }
+                    return pending == config::use_pending::yes
+                             ? !p.is_default_pending()
+                             : !p.is_default();
+                },
+                pending);
           }
 
           reply.set_status(ss::http::reply::status_type::ok, buf.GetString());
@@ -2017,9 +2020,10 @@ void config_multi_property_validation(
     }
 
     // cloud_storage_cache_size/size_percent validation
-    if (auto invalid_cache = cloud_io::cache::validate_cache_config(
-          updated_config);
-        invalid_cache.has_value()) {
+    if (
+      auto invalid_cache = cloud_io::cache::validate_cache_config(
+        updated_config);
+      invalid_cache.has_value()) {
         auto name = ss::sstring(updated_config.cloud_storage_cache_size.name());
         errors[name] = invalid_cache.value();
     }
@@ -2063,6 +2067,12 @@ void config_multi_property_validation(
         errors[ss::sstring{updated_config.default_redpanda_storage_mode.name()}]
           = storage_mode_err.value();
     }
+
+    auto oidc_proxy_err = config::validate_oidc_http_proxy_url(updated_config);
+    if (oidc_proxy_err.has_value()) {
+        errors[ss::sstring{updated_config.oidc_http_proxy_url.name()}]
+          = oidc_proxy_err.value();
+    }
 }
 } // namespace
 
@@ -2076,7 +2086,13 @@ void admin_server::check_license(const ss::sstring& msg) const {
 void admin_server::register_cluster_config_routes() {
     register_route<superuser>(
       ss::httpd::cluster_config_json::get_cluster_config_status,
-      [this](std::unique_ptr<ss::http::request>) {
+      [this](std::unique_ptr<ss::http::request> req) {
+          auto local_node = _controller->self();
+          auto show_pending = get_boolean_query_param(*req, "show_pending");
+          auto local_pending
+            = show_pending
+                ? config::shard_local_cfg().properties_pending_restart()
+                : std::vector<ss::sstring>{};
           auto& cfg = _controller->get_config_manager();
           return cfg
             .invoke_on(
@@ -2084,7 +2100,8 @@ void admin_server::register_cluster_config_routes() {
               [](cluster::config_manager& manager) {
                   return manager.get_projected_status();
               })
-            .then([](auto statuses) {
+            .then([local_node,
+                   local_pending = std::move(local_pending)](auto statuses) {
                 std::vector<
                   ss::httpd::cluster_config_json::cluster_config_status>
                   res;
@@ -2102,9 +2119,19 @@ void admin_server::register_cluster_config_routes() {
                     // is then cleared in the subsequent operator=).
                     rs.invalid.push(ss::sstring("hack"));
                     rs.unknown.push(ss::sstring("hack"));
+                    rs.pending.push(ss::sstring("hack"));
 
                     rs.invalid = s.second.invalid;
                     rs.unknown = s.second.unknown;
+
+                    if (s.first == local_node) {
+                        rs.pending = local_pending;
+                    } else {
+                        // TODO: Pending state is local-only: extending
+                        // config_status (on-wire type) is needed to
+                        // propagate pending info from remote nodes.
+                        rs.pending = std::vector<ss::sstring>{};
+                    }
                 }
 
                 return ss::json::json_return_type(res);
@@ -2231,8 +2258,9 @@ admin_server::patch_cluster_config_handler(
                       yaml_name,
                       property.format_raw(yaml_value),
                       validation_err.value().error_message());
-                } else if (auto restricted_err = property.check_restricted(val);
-                           restricted_err.has_value() && should_sanction) {
+                } else if (
+                  auto restricted_err = property.check_restricted(val);
+                  restricted_err.has_value() && should_sanction) {
                     errors[yaml_name] = restricted_err.value().error_message();
                     vlog(
                       adminlog.warn,
@@ -2302,8 +2330,6 @@ admin_server::patch_cluster_config_handler(
         for (const auto& key : update.remove) {
             if (cfg->contains(key)) {
                 cfg->get(key).reset();
-            } else {
-                errors[key] = "Unknown property";
             }
         }
 
@@ -2650,7 +2676,7 @@ admin_server::put_license_handler(std::unique_ptr<ss::http::request> req) {
             /// Loaded license is idential to license in request, do
             /// nothing and return 200(OK) for idempotence
             vlog(
-              adminlog.info,
+              adminlog.debug,
               "Attempted to load identical license, doing nothing: {}",
               license);
             co_return ss::json::json_void();
@@ -2926,7 +2952,7 @@ admin_server::get_decommission_progress_handler(
         f_details.ns = ntp.ns;
         f_details.topic = ntp.tp.topic;
         f_details.partition = ntp.tp.partition;
-        f_details.error = fmt::to_string(details.error);
+        f_details.error = fmt::format("{}", details.error);
 
         ret.reallocation_failure_details.push(f_details);
     }
@@ -3400,7 +3426,7 @@ admin_server::self_test_start_handler(std::unique_ptr<ss::http::request> req) {
               return self_test_frontend.start_test(r, ids);
           });
         vlog(adminlog.info, "Request to start self test succeeded: {}", tid);
-        co_return ss::json::json_return_type(tid);
+        co_return ss::json::json_return_type(ss::sstring(tid));
     } catch (const std::exception& ex) {
         throw ss::httpd::base_exception(
           fmt::format("Failed to start self test, reason: {}", ex),
@@ -3610,8 +3636,9 @@ admin_server::get_partition_balancer_status_handler(
       });
 
     cluster::partition_balancer_overview_reply overview;
-    if (std::holds_alternative<cluster::partition_balancer_overview_reply>(
-          result)) {
+    if (
+      std::holds_alternative<cluster::partition_balancer_overview_reply>(
+        result)) {
         overview = std::move(
           std::get<cluster::partition_balancer_overview_reply>(result));
     } else if (std::holds_alternative<model::node_id>(result)) {
@@ -3965,9 +3992,10 @@ admin_server::get_cluster_partitions_handler(
     std::sort(topics.begin(), topics.end());
 
     std::optional<cluster::cluster_health_report> health_report;
-    if (_controller->get_topics_frontend()
-          .local()
-          .node_local_core_assignment_enabled()) {
+    if (
+      _controller->get_topics_frontend()
+        .local()
+        .node_local_core_assignment_enabled()) {
         // We'll need to get core assignments from the health report
         auto hr_result = co_await _controller->get_health_monitor()
                            .local()
@@ -4046,9 +4074,10 @@ admin_server::get_cluster_partitions_topic_handler(
       topics_state.get_topic_disabled_set(ns_tp),
       disabled_filter);
 
-    if (_controller->get_topics_frontend()
-          .local()
-          .node_local_core_assignment_enabled()) {
+    if (
+      _controller->get_topics_frontend()
+        .local()
+        .node_local_core_assignment_enabled()) {
         // We'll need to get core assignments from the health report
         auto hr_result = co_await _controller->get_health_monitor()
                            .local()
@@ -4396,9 +4425,10 @@ admin_server::query_automated_recovery(std::unique_ptr<ss::http::request> req) {
           cluster::map_log_to_response(std::move(status_log)), extended);
     }
 
-    if (auto status = co_await _topic_recovery_status_frontend.local().status(
-          controller_leader.value());
-        status.has_value()) {
+    if (
+      auto status = co_await _topic_recovery_status_frontend.local().status(
+        controller_leader.value());
+      status.has_value()) {
         co_return serialize_topic_recovery_status(status.value(), extended);
     }
 
@@ -4668,16 +4698,16 @@ admin_server::get_partition_cloud_storage_status(
 
     auto status = co_await _partition_manager.invoke_on(
       *shard,
-      [&ntp](const auto& pm)
-        -> std::optional<cluster::partition_cloud_storage_status> {
+      [&ntp](this auto, const auto& pm)
+        -> ss::future<std::optional<cluster::partition_cloud_storage_status>> {
           const auto& partitions = pm.partitions();
           auto partition_iter = partitions.find(ntp);
 
           if (partition_iter == partitions.end()) {
-              return std::nullopt;
+              co_return std::nullopt;
           }
-
-          return partition_iter->second->get_cloud_storage_status();
+          auto pp = kafka::make_partition_proxy(partition_iter->second);
+          co_return co_await pp.get_cloud_storage_status();
       });
 
     if (!status) {
@@ -5057,6 +5087,10 @@ constexpr std::string_view to_string_view(service_kind kind) {
         return "http-proxy";
     }
     return "invalid";
+}
+
+fmt::iterator format_to(service_kind kind, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(kind));
 }
 
 template<typename E>

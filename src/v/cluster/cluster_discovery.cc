@@ -12,14 +12,14 @@
 #include "base/seastarx.h"
 #include "cluster/bootstrap_types.h"
 #include "cluster/cluster_bootstrap_service.h"
-#include "cluster/cluster_utils.h"
 #include "cluster/controller_service.h"
 #include "cluster/logger.h"
+#include "cluster/rpc_utils.h"
 #include "config/node_config.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "storage/kvstore.h"
+#include "storage/api.h"
 #include "utils/directory_walker.h"
 
 #include <seastar/core/seastar.hh>
@@ -465,9 +465,10 @@ ss::future<> cluster_discovery::discover_founding_brokers() {
             broker = std::move(reply.broker);
             node_uuid = reply.node_uuid;
         }
-        if (const auto [i, inserted] = node_ids.try_emplace(
-              std::move(node_uuid), broker.id());
-            !inserted) {
+        if (
+          const auto [i, inserted] = node_ids.try_emplace(
+            std::move(node_uuid), broker.id());
+          !inserted) {
             vlog(clusterlog.error, "Duplicate node UUID: {}", i->first);
             failed = true;
         }

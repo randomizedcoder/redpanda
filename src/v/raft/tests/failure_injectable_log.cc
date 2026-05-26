@@ -137,9 +137,8 @@ model::timestamp failure_injectable_log::start_timestamp() const {
     return _underlying_log->start_timestamp();
 }
 
-std::ostream&
-failure_injectable_log::failure_injectable_log::print(std::ostream& o) const {
-    return _underlying_log->print(o);
+fmt::iterator failure_injectable_log::format_to(fmt::iterator it) const {
+    return _underlying_log->format_to(it);
 }
 
 std::optional<model::term_id>
@@ -284,6 +283,10 @@ model::offset failure_injectable_log::transaction_free_prefix_offset() const {
 
 bool failure_injectable_log::needs_compaction() const {
     return _underlying_log->needs_compaction();
+}
+
+ss::lw_shared_ptr<storage::stm_hookset> failure_injectable_log::stm_hookset() {
+    return _underlying_log->stm_hookset();
 }
 
 } // namespace raft

@@ -20,6 +20,7 @@
 #include "datalake/tests/test_data_writer.h"
 #include "datalake/tests/test_utils.h"
 #include "features/feature_table.h"
+#include "iceberg/field_name_comparison.h"
 #include "model/batch_compression.h"
 #include "model/compression.h"
 #include "model/record.h"
@@ -394,8 +395,9 @@ class record_multiplexer_bench_fixture
 public:
     record_multiplexer_bench_fixture()
       : _schema_cache({10, 5})
+      , _resolved_type_cache({10, 5})
       , _schema_mgr(catalog, &_features)
-      , _type_resolver(registry, _schema_cache)
+      , _type_resolver(registry, _schema_cache, _resolved_type_cache)
       , _record_gen(&registry)
       , _table_creator(_type_resolver, _schema_mgr) {
         _features.testing_activate_all();
@@ -422,8 +424,8 @@ public:
               schema,
               {0},
               gen_config);
-        } else if constexpr (std::
-                               is_same_v<T, ::testing::avro_generator_config>) {
+        } else if constexpr (
+          std::is_same_v<T, ::testing::avro_generator_config>) {
             _batch_data = co_await generate_avro_batches(
               records_per_batch,
               batches,
@@ -550,6 +552,7 @@ private:
     std::unordered_set<std::string> _added_names;
     features::feature_table _features;
     datalake::chunked_schema_cache _schema_cache;
+    datalake::chunked_resolved_type_cache _resolved_type_cache;
     datalake::catalog_schema_manager _schema_mgr;
     datalake::record_schema_resolver _type_resolver;
     datalake::tests::record_generator _record_gen;
@@ -569,6 +572,7 @@ private:
           _translator,
           _table_creator,
           model::iceberg_invalid_record_action::dlq_table,
+          iceberg::field_name_comparison::verbatim,
           datalake::location_provider(
             scoped_remote->remote.local().provider(), bucket_name),
           _translation_probe,

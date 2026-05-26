@@ -11,12 +11,14 @@
 
 #include "base/type_traits.h"
 #include "cloud_storage/remote.h"
-#include "cloud_storage_clients/configuration.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_service.h"
 #include "cluster/controller_stm.h"
+#include "cluster/controller_utils.h"
+#include "cluster/data_migration_types.h"
 #include "cluster/errc.h"
+#include "cluster/fwd.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/health_monitor_types.h"
 #include "cluster/logger.h"
@@ -29,6 +31,8 @@
 #include "cluster/scheduling/partition_allocator.h"
 #include "cluster/shard_balancer.h"
 #include "cluster/shard_table.h"
+#include "cluster/topic_configuration.h"
+#include "cluster/topic_properties.h"
 #include "cluster/topic_recovery_validator.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
@@ -36,37 +40,29 @@
 #include "data_migration_types.h"
 #include "features/enterprise_feature_messages.h"
 #include "features/feature_table.h"
-#include "fwd.h"
 #include "model/errc.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
 #include "model/validation.h"
-#include "raft/consensus_client_protocol.h"
 #include "raft/errc.h"
-#include "raft/fundamental.h"
 #include "random/generators.h"
+#include "rpc/connection_cache.h"
 #include "rpc/errc.h"
 #include "rpc/types.h"
 #include "scheduling/types.h"
 #include "ssx/future-util.h"
 #include "ssx/sformat.h"
-#include "topic_configuration.h"
-#include "topic_properties.h"
 #include "topic_rules.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include <algorithm>
 #include <iterator>
-#include <memory>
 #include <regex>
-#include <sstream>
 #include <system_error>
 
 namespace {
@@ -89,6 +85,9 @@ get_enterprise_features(const cluster::topic_configuration& cfg) {
         if (cfg.is_read_replica()) {
             features.emplace_back("remote read replicas");
         }
+        if (cfg.is_cloud_topic()) {
+            features.emplace_back("cloud topics");
+        }
     }
 
     // Only enforce schema ID validation topic configs if Schema ID validation
@@ -100,23 +99,17 @@ get_enterprise_features(const cluster::topic_configuration& cfg) {
     }
 
     // We are always enforcing leadership preference restrictions
-    if (const auto& leaders_pref = cfg.properties.leaders_preference;
-        leaders_pref.has_value()
-        && config::shard_local_cfg()
-             .default_leaders_preference.check_restricted(
-               leaders_pref.value())) {
+    if (
+      const auto& leaders_pref = cfg.properties.leaders_preference;
+      leaders_pref.has_value()
+      && config::shard_local_cfg().default_leaders_preference.check_restricted(
+        leaders_pref.value())) {
         features.emplace_back("leadership pinning");
     }
 
     if (config::shard_local_cfg().iceberg_enabled.is_restricted()) {
         if (cfg.properties.iceberg_mode != model::iceberg_mode::disabled) {
             features.emplace_back("iceberg");
-        }
-    }
-    if (config::shard_local_cfg().cloud_topics_enabled.is_restricted()) {
-        if (
-          cfg.properties.storage_mode == model::redpanda_storage_mode::cloud) {
-            features.emplace_back("cloud topics");
         }
     }
     return features;
@@ -152,6 +145,9 @@ std::vector<std::string_view> get_enterprise_features(
           || (old_storage_mode != tiered && new_storage_mode == tiered)
           || (properties.remote_delete < updated_properties.remote_delete)) {
             features.emplace_back("tiered storage");
+        }
+        if (updated_properties.is_cloud_topic()) {
+            features.emplace_back("cloud topics");
         }
     }
 
@@ -212,22 +208,18 @@ std::vector<std::string_view> get_enterprise_features(
         }
     }
 
-    if (const auto& updated_pref = updated_properties.leaders_preference;
-        updated_pref != properties.leaders_preference
-        && updated_pref.has_value()
-        && config::shard_local_cfg()
-             .default_leaders_preference.check_restricted(
-               updated_pref.value())) {
+    if (
+      const auto& updated_pref = updated_properties.leaders_preference;
+      updated_pref != properties.leaders_preference && updated_pref.has_value()
+      && config::shard_local_cfg().default_leaders_preference.check_restricted(
+        updated_pref.value())) {
         features.emplace_back("leadership pinning");
     }
     if (config::shard_local_cfg().iceberg_enabled.is_restricted()) {
-        if (properties.iceberg_mode != model::iceberg_mode::disabled) {
+        if (
+          properties.iceberg_mode == model::iceberg_mode::disabled
+          && updated_properties.iceberg_mode != model::iceberg_mode::disabled) {
             features.emplace_back("iceberg");
-        }
-    }
-    if (config::shard_local_cfg().cloud_topics_enabled.is_restricted()) {
-        if (properties.storage_mode == model::redpanda_storage_mode::cloud) {
-            features.emplace_back("cloud topics");
         }
     }
     return features;
@@ -487,8 +479,9 @@ topics_frontend::update_topic_properties(
               if (
                 _features.local().should_sanction()
                 && is_user_topic(update.tp_ns)) {
-                  if (auto f = get_enterprise_features(_metadata_cache, update);
-                      !f.empty()) {
+                  if (
+                    auto f = get_enterprise_features(_metadata_cache, update);
+                    !f.empty()) {
                       auto msg
                         = features::enterprise_error_message::topic_property(f);
                       vlog(clusterlog.warn, "{}", msg);
@@ -653,15 +646,14 @@ topic_result topics_frontend::validate_topic_configuration(
           errc::topic_invalid_config, "Tiered storage is not enabled");
     }
 
-    // the only way that cloud topics can be enabled on a topic is if the cloud
-    // topics development feature is also enabled.
-    if (!config::shard_local_cfg().cloud_topics_enabled()) {
+    // the only way that cloud topics can be enabled on a topic is if cloud
+    // storage is also enabled.
+    if (!config::shard_local_cfg().cloud_storage_enabled()) {
         if (
           assignable_config.cfg.properties.storage_mode
           == model::redpanda_storage_mode::cloud) {
             auto msg = ssx::sformat(
-              "Cloud storage mode on {} is set but development feature is "
-              "disabled",
+              "Cloud storage mode on {} is set but cloud storage is disabled",
               assignable_config.cfg.tp_ns);
             vlog(clusterlog.error, "{}", msg);
             return make_result(errc::topic_invalid_config, std::move(msg));
@@ -671,8 +663,8 @@ topic_result topics_frontend::validate_topic_configuration(
     if (
       _features.local().should_sanction()
       && is_user_topic(assignable_config.cfg.tp_ns)) {
-        if (auto f = get_enterprise_features(assignable_config.cfg);
-            !f.empty()) {
+        if (
+          auto f = get_enterprise_features(assignable_config.cfg); !f.empty()) {
             auto msg = features::enterprise_error_message::topic_property(f);
             vlog(clusterlog.warn, "{}", msg);
             return make_result(errc::topic_invalid_config, std::move(msg));
@@ -829,22 +821,23 @@ ss::future<topic_result> topics_frontend::do_create_topic(
         }
         auto validation_map = co_await maybe_validate_recovery_topic(
           assignable_config, bucket, _cloud_storage_api.local(), _as.local());
-        if (std::ranges::any_of(
-              validation_map,
-              [](const std::pair<model::partition_id, validation_result>& vp) {
-                  using enum validation_result;
-                  switch (vp.second) {
-                  case passed:
-                  case missing_manifest:
-                      // passed or missing_manifest do not fail validation
-                      return false;
-                  case anomaly_detected:
-                  case download_issue:
-                      // failure needs to be handled by an operator,
-                      // download_issue likely is a config issue
-                      return true;
-                  }
-              })) {
+        if (
+          std::ranges::any_of(
+            validation_map,
+            [](const std::pair<model::partition_id, validation_result>& vp) {
+                using enum validation_result;
+                switch (vp.second) {
+                case passed:
+                case missing_manifest:
+                    // passed or missing_manifest do not fail validation
+                    return false;
+                case anomaly_detected:
+                case download_issue:
+                    // failure needs to be handled by an operator,
+                    // download_issue likely is a config issue
+                    return true;
+                }
+            })) {
             vlog(
               clusterlog.error,
               "Stopping recovery of {} due to validation error",

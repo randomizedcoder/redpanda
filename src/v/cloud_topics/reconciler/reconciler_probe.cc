@@ -57,17 +57,17 @@ void reconciler_probe::setup_metrics() {
 
         // Histograms.
         sm::make_histogram(
-          "l0_read_duration_seconds",
+          "l0_read_duration_microseconds",
           [this] { return _l0_read_duration.internal_histogram_logform(); },
           sm::description("Duration reading from L0")),
         sm::make_histogram(
-          "object_build_duration_seconds",
+          "object_build_duration_microseconds",
           [this] {
               return _object_build_duration.internal_histogram_logform();
           },
           sm::description("Duration building and uploading L1 objects")),
         sm::make_histogram(
-          "metastore_add_objects_duration_seconds",
+          "metastore_add_objects_duration_microseconds",
           [this] {
               return _metastore_add_objects_duration
                 .internal_histogram_logform();
@@ -75,7 +75,7 @@ void reconciler_probe::setup_metrics() {
           sm::description("Duration of add_objects to metastore")),
         sm::make_histogram(
           "object_size_bytes",
-          [this] { return _object_size_bytes.internal_histogram_logform(); },
+          [this] { return _object_size_bytes.seastar_histogram_logform(); },
           sm::description("Distribution of built L1 object sizes in bytes")),
       });
 }

@@ -47,6 +47,20 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "leveling_range_builder_test",
+    timeout = "short",
+    srcs = [
+        "leveling_range_builder_test.cc",
+    ],
+    deps = [
+        "//src/v/cloud_topics/level_one/metastore:leveling_range_builder",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "garbage_collector_test",
     timeout = "short",
     srcs = [
@@ -81,6 +95,7 @@ redpanda_cc_gtest(
     deps = [
         "//src/v/cloud_storage:remote_label",
         "//src/v/cloud_topics:app",
+        "//src/v/cloud_topics/level_one/metastore:domain_uuid",
         "//src/v/cloud_topics/level_one/metastore:manifest_io",
         "//src/v/cloud_topics/level_one/metastore:metastore_manifest",
         "//src/v/cloud_topics/level_one/metastore:replicated_metastore",
@@ -88,8 +103,17 @@ redpanda_cc_gtest(
         "//src/v/cloud_topics/level_one/metastore/lsm:stm",
         "//src/v/cloud_topics/level_one/metastore/tests:state_utils",
         "//src/v/cloud_topics/tests:cluster_fixture",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:inventory_service",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:members_table",
+        "//src/v/cluster:node_status_backend",
+        "//src/v/cluster:partition_properties_stm",
+        "//src/v/cluster:self_test",
+        "//src/v/cluster:topic_metrics_watcher",
+        "//src/v/cluster:tx_manager_migrator_rpc",
         "//src/v/lsm",
-        "//src/v/lsm/io:cloud_persistence",
+        "//src/v/lsm/io:cloud_cache_persistence",
         "//src/v/lsm/io:memory_persistence",
         "//src/v/model",
         "//src/v/serde",
@@ -155,8 +179,10 @@ redpanda_cc_gtest(
         "//src/v/cloud_io:remote",
         "//src/v/cloud_topics/level_one/metastore:simple",
         "//src/v/cloud_topics/level_one/metastore:topic_purger",
-        "//src/v/cluster",
+        "//src/v/cluster:data_migrated_resources",
         "//src/v/cluster:nt_revision",
+        "//src/v/cluster:topic_table",
+        "//src/v/cluster:types",
         "//src/v/config",
         "//src/v/model",
         "//src/v/test_utils:gtest",
@@ -173,6 +199,25 @@ redpanda_cc_gtest(
     deps = [
         "//src/v/bytes:iobuf",
         "//src/v/cloud_topics/level_one/metastore:offset_interval_set",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "partition_validator_test",
+    timeout = "short",
+    srcs = [
+        "partition_validator_test.cc",
+    ],
+    deps = [
+        "//src/v/cloud_topics/level_one/common:object_id",
+        "//src/v/cloud_topics/level_one/metastore:partition_validator",
+        "//src/v/cloud_topics/level_one/metastore/lsm:keys",
+        "//src/v/cloud_topics/level_one/metastore/lsm:values",
+        "//src/v/lsm",
+        "//src/v/lsm/io:memory_persistence",
+        "//src/v/serde",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
     ],

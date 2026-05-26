@@ -9,16 +9,15 @@
  */
 #pragma once
 
-#include "cloud_io/io_result.h"
-#include "cloud_storage_clients/client.h"
-#include "cloud_storage_clients/types.h"
 #include "cloud_topics/level_zero/gc/level_zero_gc_probe.h"
-#include "cloud_topics/types.h"
-#include "container/chunked_hash_map.h"
+#include "cloud_topics/level_zero/gc/level_zero_gc_types.h"
+#include "random/generators.h"
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 #include <expected>
 
@@ -143,131 +142,109 @@ struct level_zero_gc_config {
     config::binding<std::chrono::milliseconds> throttle_no_progress;
 };
 
-class level_zero_gc {
+/*
+ * State Machine
+ * =============
+ *
+ *  Construction
+ *       |
+ *       v
+ *  +--------+
+ *  | paused |<-----------------------------+
+ *  +---+----+                              |
+ *      | start()                           |
+ *      v                                   |
+ *  +----------------+                      |
+ *  | worker loop top|<-----------+         |
+ *  +-------+--------+            |         |
+ *          |                     |         |
+ *          | check safety        |         |
+ *          |                     |         |
+ *     ok +-+-+ !ok               |         |
+ *    +---+   +----+              |         |
+ *    v            v              |         |
+ *  +---------+ +---------------+ |         |
+ *  | running | |safety_blocked | |         |
+ *  |         | |               | |         |
+ *  | backoff | | increment     | |         |
+ *  |  then   | |  probe,       | |         |
+ *  | collect | |  sleep        | |         |
+ *  +----+----+ +-------+-------+ |         |
+ *       |              |         |         |
+ *       +------+-------+         |         |
+ *              |                 |         |
+ *              +-----------------+         |
+ *                  loop back               |
+ *                                          |
+ *  pause() from running or safety_blocked  |
+ *  ----------------------------------------+
+ *
+ *  reset() from any non-stopped state:
+ *
+ *  +----------+
+ *  |resetting | drains delete worker, then
+ *  +----+-----+ restores prior run/pause state
+ *       |
+ *       v
+ *  was_running?
+ *    yes -> running
+ *    no  -> paused
+ *
+ *  stop() from any state:
+ *
+ *  +---------+  worker done  +---------+
+ *  |stopping |-------------->| stopped |
+ *  +---------+               +---------+
+ *                             (terminal)
+ *
+ *  The running/safety_blocked distinction is not an
+ *  explicit transition. Both are phases of the worker
+ *  loop -- each iteration checks can_proceed() and
+ *  takes the corresponding branch. The state returned
+ *  by get_state() reflects whichever branch would be
+ *  taken at query time.
+ *
+ *  get_state() priority:
+ *    should_shutdown_ > resetting_ > !should_run_ >
+ *    safety_monitor_.can_proceed()
+ *
+ *  start()/pause() block while resetting_ is true.
+ */
+template<class Clock = ss::lowres_clock>
+class level_zero_gc_t {
 public:
-    /*
-     * Object storage interface used by L0 GC.
-     */
-    class object_storage {
-    public:
-        object_storage() = default;
-        object_storage(const object_storage&) = delete;
-        object_storage(object_storage&&) = delete;
-        object_storage& operator=(const object_storage&) = delete;
-        object_storage& operator=(object_storage&&) = delete;
-        virtual ~object_storage() = default;
+    using jitter_fn = ss::noncopyable_function<typename Clock::duration(
+      typename Clock::duration)>;
 
-        /*
-         * Implementations are expected to limit the listing to only L0 data
-         * objects, and provide the listing in _globally_ lexicographic order.
-         */
-        virtual seastar::future<std::expected<
-          cloud_storage_clients::client::list_bucket_result,
-          cloud_storage_clients::error_outcome>>
-        list_objects(
-          seastar::abort_source*,
-          std::optional<cloud_storage_clients::object_key> prefix
-          = std::nullopt,
-          std::optional<ss::sstring> continuation_token = std::nullopt)
-          = 0;
-
-        virtual seastar::future<std::expected<void, cloud_io::upload_result>>
-        delete_objects(
-          seastar::abort_source*,
-          chunked_vector<cloud_storage_clients::client::list_bucket_item>)
-          = 0;
+    // Add positive jitter to despread wake times across
+    // shards. +[0, 10%] of the computed backoff.
+    static constexpr auto default_jitter =
+      [](Clock::duration base) -> Clock::duration {
+        using namespace std::chrono_literals;
+        // 2m is sort of arbitrary here with the aim of roughly staggering GC
+        // wakeups. "longer than a collection round but much shorter than a
+        // grace period"
+        constexpr typename Clock::duration max_jitter{120s};
+        auto ub = std::min(base / 10, max_jitter);
+        return std::chrono::milliseconds{random_generators::get_int(ub / 1ms)};
     };
 
-    /*
-     * Interface for computing the maximum epoch eligible for GC.
-     */
-    class epoch_source {
-    public:
-        struct partitions_snapshot {
-            using partition_map = chunked_hash_map<
-              model::topic_namespace,
-              chunked_vector<model::partition_id>,
-              model::topic_namespace_hash,
-              model::topic_namespace_eq>;
-
-            partition_map partitions;
-            cluster_epoch snap_revision;
-        };
-
-        using partitions_max_gc_epoch = chunked_hash_map<
-          model::topic_namespace,
-          chunked_hash_map<model::partition_id, cluster_epoch>,
-          model::topic_namespace_hash,
-          model::topic_namespace_eq>;
-
-        epoch_source() = default;
-        epoch_source(const epoch_source&) = default;
-        epoch_source(epoch_source&&) = delete;
-        epoch_source& operator=(const epoch_source&) = default;
-        epoch_source& operator=(epoch_source&&) = delete;
-        virtual ~epoch_source() = default;
-
-        void set_probe(level_zero_gc_probe* p) { probe_ = p; }
-
-        /*
-         * L0 objects with epochs <= the return value may be deleted. An
-         * expected return value of std::nullopt is not an error, but rather
-         * indicates that no GC eligible epoch could yet be determined.
-         */
-        virtual seastar::future<
-          std::expected<std::optional<cluster_epoch>, std::string>>
-        max_gc_eligible_epoch(seastar::abort_source*);
-
-        /*
-         * Snapshot of existing cloud topic partition identifiers along with the
-         * maximum possible GC eligible epoch for the set of partitions.
-         */
-        virtual seastar::future<std::expected<partitions_snapshot, std::string>>
-        get_partitions(seastar::abort_source*) = 0;
-
-        /*
-         * Reported max GC eligible epochs for cloud topic partitions.
-         */
-        virtual seastar::future<
-          std::expected<partitions_max_gc_epoch, std::string>>
-        get_partitions_max_gc_epoch(seastar::abort_source*) = 0;
-
-    protected:
-        level_zero_gc_probe* probe_{nullptr};
-    };
-
-    /**
-     * Interface for determining the total number of shards in the cluster
-     * and the current shard's position in logical, ordered list of shard IDs
-     * starting at 0 (node 0, shard 0) and ending at total_shards - 1.
-     */
-    struct node_info {
-        node_info() = default;
-        node_info(const node_info&) = default;
-        node_info(node_info&&) = delete;
-        node_info& operator=(const node_info&) = default;
-        node_info& operator=(node_info&&) = delete;
-        virtual ~node_info() = default;
-
-        virtual size_t shard_index() const = 0;
-        virtual size_t total_shards() const = 0;
-    };
-
-public:
     /*
      * Construct with the given storage and epoch providers. This interface is
      * intended to be used by tests which swap in mock implementations.
      */
-    level_zero_gc(
+    level_zero_gc_t(
       level_zero_gc_config,
-      std::unique_ptr<object_storage>,
-      std::unique_ptr<epoch_source>,
-      std::unique_ptr<node_info>);
+      std::unique_ptr<l0::gc::object_storage>,
+      std::unique_ptr<l0::gc::epoch_source>,
+      std::unique_ptr<l0::gc::node_info>,
+      std::unique_ptr<l0::gc::safety_monitor>,
+      jitter_fn = default_jitter);
 
     /*
      * Construct with default implementations of storage and epoch providers.
      */
-    level_zero_gc(
+    level_zero_gc_t(
       model::node_id,
       cloud_io::remote*,
       cloud_storage_clients::bucket_name,
@@ -276,14 +253,23 @@ public:
       seastar::sharded<cluster::topic_table>*,
       seastar::sharded<cluster::members_table>*);
 
-    ~level_zero_gc();
+    ~level_zero_gc_t();
 
     /*
      * Request that GC be started or paused. These can be called multiple times
      * and in any order. The last invocation will eventually take effect.
+     *
+     * If a reset is in progress, these will block until it completes or
+     * control_timeout expires.
      */
-    void start();
-    void pause();
+    seastar::future<> start();
+    seastar::future<> pause();
+
+    /// Reset internal GC state without a full stop/start cycle.
+    /// Drains in-flight operations, clears pagination and prefix
+    /// iteration state, and prepares for a fresh collection sweep.
+    /// GC resumes automatically if it was running before the reset.
+    seastar::future<> reset();
 
     /*
      * Request and wait for GC to be completely stopped. After calling shutdown,
@@ -292,46 +278,50 @@ public:
     seastar::future<> stop();
 
     /**
-     * @brief Shard-local state for an instance of level_zero_gc
-     *
-     *   - paused: Paused indefinitely, call start() to run
-     *   - running: GC will run until paused or stopped
-     *   - stopping: stop() requested but there may be work still in flight
-     *   - stopped: Permanently stopped.
-     */
-    enum class state : uint8_t {
-        paused,
-        running,
-        stopping,
-        stopped,
-    };
-
-    /**
      * @brief Compute the runtime state of this GC instance.
      */
-    state get_state() const;
+    l0::gc::state get_state() const;
 
 private:
+    seastar::condition_variable worker_cv_;
+    seastar::condition_variable reset_cv_;
+
     level_zero_gc_config config_;
-    std::unique_ptr<epoch_source> epoch_source_;
+    std::unique_ptr<l0::gc::epoch_source> epoch_source_;
+    std::unique_ptr<l0::gc::safety_monitor> safety_monitor_;
+    jitter_fn jitter_fn_;
 
     bool should_run_;
     bool should_shutdown_;
+    bool resetting_{false};
     seastar::abort_source asrc_;
-    seastar::condition_variable worker_cv_;
+    seastar::abort_source backoff_asrc_;
     seastar::future<> worker_;
 
     seastar::future<> worker();
-    enum class collection_error : int8_t;
-    seastar::future<std::expected<size_t, collection_error>> try_to_collect();
-    seastar::future<std::expected<size_t, collection_error>>
+
+    seastar::future<
+      std::expected<l0::gc::collection_outcome, l0::gc::collection_error>>
+    try_to_collect();
+
+    /// Returns per-page outcome, or nullopt when all prefixes are exhausted.
+    seastar::future<std::expected<
+      std::optional<l0::gc::collection_outcome>,
+      l0::gc::collection_error>>
     do_try_to_collect(std::optional<cluster_epoch>&);
 
     level_zero_gc_probe probe_;
 
+    /// Set by start() and reset() to force the worker to skip its next
+    /// backoff sleep so the first round after a state change runs
+    /// immediately.
+    bool skip_backoff_{false};
+
     class list_delete_worker;
     std::unique_ptr<list_delete_worker> delete_worker_{};
 };
+
+using level_zero_gc = level_zero_gc_t<>;
 
 /**
  * @brief Compute a subrange of [0,999] for some shard.
@@ -353,7 +343,5 @@ private:
 struct prefix_range_inclusive;
 std::optional<prefix_range_inclusive>
 compute_prefix_range(size_t shard_idx, size_t total_shards);
-
-std::string_view to_string_view(level_zero_gc::state s);
 
 } // namespace cloud_topics

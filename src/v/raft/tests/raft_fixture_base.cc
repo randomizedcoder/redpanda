@@ -253,9 +253,8 @@ static constexpr msg_type map_msg_type() {
         return msg_type::timeout_now;
     } else if constexpr (std::is_same_v<ReqT, get_compaction_mcco_request>) {
         return msg_type::get_compaction_mcco;
-    } else if constexpr (std::is_same_v<
-                           ReqT,
-                           distribute_compaction_mtro_request>) {
+    } else if constexpr (
+      std::is_same_v<ReqT, distribute_compaction_mtro_request>) {
         return msg_type::distribute_compaction_mtro;
     }
     __builtin_unreachable();
@@ -617,7 +616,7 @@ seastar::future<> raft_fixture_base::stop() {
 }
 
 seastar::future<> raft_fixture_base::start() {
-    for (auto cpu : ss::smp::all_cpus()) {
+    for (auto cpu : ss::this_smp_all_shards()) {
         co_await ss::smp::submit_to(cpu, [] {
             config::shard_local_cfg().disable_metrics.set_value(true);
             config::shard_local_cfg().disable_public_metrics.set_value(true);

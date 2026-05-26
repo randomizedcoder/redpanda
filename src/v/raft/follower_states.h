@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/node_hash_map.h"
+#include "base/format_to.h"
 #include "base/vassert.h"
 #include "raft/types.h"
 #include "ssx/single_fiber_executor.h"
@@ -59,6 +60,8 @@ struct follower_index_metadata {
     // timestamp of last append_entries_rpc call
     clock_type::time_point last_sent_append_entries_req_timestamp;
     clock_type::time_point last_received_reply_timestamp;
+    /// Heartbeat failures observed on the current cached transport.
+    /// Reset on a successful reply or when we force a reconnect.
     uint32_t heartbeats_failed{0};
     // The pair of sequences used to track append entries requests sent and
     // received by the follower. Every time append entries request is created
@@ -150,8 +153,7 @@ struct follower_index_metadata {
     // state for sending latest MTRO and MXRO to the follower
     void_executor_ptr coordinated_compaction_offsets_sender;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const follower_index_metadata& i);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 class follower_states {
 public:
@@ -213,10 +215,33 @@ public:
         }
     }
 
+    fmt::iterator format_to(fmt::iterator it) const;
+
 private:
-    friend std::ostream& operator<<(std::ostream&, const follower_states&);
     vnode _self;
     container_t _followers;
 };
 
 } // namespace raft
+
+template<>
+struct fmt::formatter<raft::follower_index_metadata> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    auto format(
+      const raft::follower_index_metadata& v, fmt::format_context& ctx) const {
+        return v.format_to(ctx.out());
+    }
+};
+
+template<>
+struct fmt::formatter<raft::follower_states> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    auto
+    format(const raft::follower_states& v, fmt::format_context& ctx) const {
+        return v.format_to(ctx.out());
+    }
+};

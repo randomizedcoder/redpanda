@@ -5,10 +5,10 @@ package(default_visibility = [
     "//src/v/cloud_topics:__pkg__",
     "//src/v/cloud_topics/level_zero/batcher:__pkg__",
     "//src/v/cloud_topics/level_zero/batcher/tests:__pkg__",
-    "//src/v/cloud_topics/level_zero/read_debounce:__pkg__",
-    "//src/v/cloud_topics/level_zero/read_debounce/tests:__pkg__",
     "//src/v/cloud_topics/level_zero/read_fanout:__pkg__",
     "//src/v/cloud_topics/level_zero/read_fanout/tests:__pkg__",
+    "//src/v/cloud_topics/level_zero/read_merge:__pkg__",
+    "//src/v/cloud_topics/level_zero/read_merge/tests:__pkg__",
     "//src/v/cloud_topics/level_zero/read_request_scheduler:__pkg__",
     "//src/v/cloud_topics/level_zero/read_request_scheduler/tests:__pkg__",
     "//src/v/cloud_topics/level_zero/reader:__pkg__",
@@ -61,6 +61,7 @@ redpanda_cc_library(
     deps = [
         "//src/v/base",
         "//src/v/utils:named_type",
+        "@fmt",
     ],
 )
 

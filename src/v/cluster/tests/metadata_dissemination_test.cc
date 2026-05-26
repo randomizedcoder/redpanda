@@ -15,8 +15,7 @@
 #include "model/timeout_clock.h"
 #include "test_utils/async.h"
 #include "test_utils/boost_fixture.h"
-
-#include <seastar/util/defer.hh>
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 
 #include <boost/test/tools/old/interface.hpp>
 

@@ -18,6 +18,7 @@ from typing import Any, NamedTuple, Protocol
 
 import requests
 import yaml
+from ducktape.cluster.cluster import ClusterNode
 from ducktape.mark import matrix, parametrize
 from ducktape.utils.util import wait_until
 
@@ -36,7 +37,6 @@ from rptest.services.redpanda import (
     RedpandaService,
     SISettings,
     get_cloud_storage_type,
-    CLOUD_TOPICS_CONFIG_STR,
 )
 from rptest.services.redpanda_installer import (
     RedpandaInstaller,
@@ -116,7 +116,12 @@ def wait_for_version_sync(admin, redpanda, version):
     )
 
 
-def wait_for_version_status_sync(admin, redpanda, version, nodes=None):
+def wait_for_version_status_sync(
+    admin: Admin,
+    redpanda: RedpandaService,
+    version: int,
+    nodes: list[ClusterNode] | None = None,
+) -> None:
     """
     Stricter than _wait_for_version_sync: this requires not only that
     the config version has propagated to all nodes, but also that the
@@ -126,7 +131,7 @@ def wait_for_version_status_sync(admin, redpanda, version, nodes=None):
     if nodes is None:
         nodes = redpanda.nodes
 
-    def is_complete(node):
+    def is_complete(node: ClusterNode) -> bool:
         node_status = admin.get_cluster_config_status(node=node)
         return set(n["config_version"] for n in node_status) == {version} and len(
             node_status
@@ -407,6 +412,55 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
         check_restart_clears(self.admin, self.redpanda)
 
     @cluster(num_nodes=3)
+    def test_suppress_pending_query_param(self):
+        """
+        Verify the suppress_pending query parameter on GET /v1/cluster_config.
+
+        By default (suppress_pending=false), the API returns configured values
+        including any pending changes that haven't been applied via restart.
+        With suppress_pending=true, only active runtime values are returned.
+        After restart, both views should converge.
+        """
+        # kafka_qdc_idle_depth requires restart, default is 10
+        key = "kafka_qdc_idle_depth"
+        new_value = 77
+        default_value = self.admin.get_cluster_config()[key]
+        assert default_value != new_value
+
+        patch_result = self.admin.patch_cluster_config(upsert={key: new_value})
+        wait_for_version_status_sync(
+            self.admin, self.redpanda, patch_result["config_version"]
+        )
+
+        # Default behavior: pending value is visible immediately
+        assert self.admin.get_cluster_config()[key] == new_value
+
+        # suppress_pending=false: same as default
+        assert self.admin.get_cluster_config(suppress_pending=False)[key] == new_value
+
+        # suppress_pending=true: shows the active runtime value (still default)
+        assert (
+            self.admin.get_cluster_config(suppress_pending=True)[key] == default_value
+        )
+
+        # Same behavior with single-key query
+        assert (
+            self.admin.get_cluster_config(key=key, suppress_pending=True)[key]
+            == default_value
+        )
+        assert (
+            self.admin.get_cluster_config(key=key, suppress_pending=False)[key]
+            == new_value
+        )
+
+        # After restart, pending value is promoted to active
+        self.redpanda.restart_nodes(self.redpanda.nodes)
+
+        # Both views now show the new value
+        assert self.admin.get_cluster_config()[key] == new_value
+        assert self.admin.get_cluster_config(suppress_pending=True)[key] == new_value
+
+    @cluster(num_nodes=3)
     def test_multistring_restart(self):
         """
         Reproduce an issue where the key we edit is saved correctly,
@@ -659,10 +713,9 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
                 "iceberg_rest_catalog_crl_file",
             ]
         )
-        # Cloud storage, cloud topics, and iceberg depend on properly
-        # configured cloud IO. Skip them to avoid breaking the test.
+        # Cloud storage and iceberg depend on properly configured cloud IO.
+        # Skip them to avoid breaking the test.
         exclude_settings.add("cloud_storage_enabled")
-        exclude_settings.add(CLOUD_TOPICS_CONFIG_STR)
         exclude_settings.add("iceberg_enabled")
         exclude_settings.add("default_redpanda_storage_mode")
 
@@ -1671,7 +1724,7 @@ class ClusterConfigTest(RedpandaTest, ClusterConfigHelpersMixin):
             "AZURE_CLIENT_ID": "client_id",
             "AZURE_TENANT_ID": "tenantid",
             "AZURE_FEDERATED_TOKEN_FILE": "/etc/hosts",
-            "AZURE_AUTHORITY_HOST": "authority.host.com",
+            "AZURE_AUTHORITY_HOST": "http://localhost:42",
         },
     }
 
@@ -2062,6 +2115,40 @@ class ClusterConfigIcebergTest(RedpandaTest):
             },
             expect_restart=True,
         )
+
+    @cluster(num_nodes=1)
+    def test_iceberg_rest_catalog_endpoint_url_validation(self):
+        """
+        Verifies that malformed `iceberg_rest_catalog_endpoint` values are
+        rejected, while well-formed URLs are accepted.
+        """
+        malformed_values = [
+            "not a url",
+            "://missing-scheme",
+            "http://host:not-a-port",
+            "http://host:99999",
+        ]
+        for value in malformed_values:
+            with expect_exception(
+                requests.exceptions.HTTPError,
+                lambda e: e.response.status_code == 400,
+            ):
+                self.redpanda.set_cluster_config(
+                    {"iceberg_rest_catalog_endpoint": value},
+                    expect_restart=True,
+                )
+
+        # Well-formed values should be accepted.
+        valid_values = [
+            "http://localhost:8181",
+            "https://catalog.example.com",
+            "https://catalog.example.com:443/path",
+        ]
+        for value in valid_values:
+            self.redpanda.set_cluster_config(
+                {"iceberg_rest_catalog_endpoint": value},
+                expect_restart=True,
+            )
 
 
 class PropertyAliasData(NamedTuple):
@@ -2735,6 +2822,42 @@ class ClusterConfigUnknownTest(RedpandaTest):
 
         # issue would appear when reloading the property back
         self.redpanda.restart_nodes(self.redpanda.nodes[0])
+
+    @cluster(num_nodes=3)
+    def test_unknown_value_can_be_removed(self):
+        """
+        Test that an unknown property forced into the log can be removed through the admin API _without_
+        use of ?force=true.
+        """
+        FAKE_PROPERTY = "my_fake_property"
+        # Force-write a removed property into the raft log
+        self.admin.patch_cluster_config(upsert={FAKE_PROPERTY: "true"}, force=True)
+
+        def _unknown_visible(expect_visible):
+            statuses = self.admin.get_cluster_config_status()
+            return all(
+                (FAKE_PROPERTY in s.get("unknown", [])) == expect_visible
+                for s in statuses
+            )
+
+        # Wait for all nodes to report it as unknown
+        wait_until(
+            lambda: _unknown_visible(True),
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg=f"{FAKE_PROPERTY} did not appear as unknown on all nodes",
+        )
+
+        # Remove the unknown property without force=true
+        self.admin.patch_cluster_config(remove=[FAKE_PROPERTY], force=False)
+
+        # Wait for all nodes to no longer report it as unknown
+        wait_until(
+            lambda: _unknown_visible(False),
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg=f"{FAKE_PROPERTY} was not removed from unknown on all nodes",
+        )
 
 
 class DevelopmentFeatureTest(RedpandaTest):

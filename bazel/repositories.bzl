@@ -3,6 +3,7 @@ This module contains the sources for all third party dependencies.
 """
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@toolchains_llvm//toolchain:sysroot.bzl", "sysroot")
 
 def data_dependency():
     """
@@ -22,10 +23,13 @@ def data_dependency():
     http_archive(
         name = "avro",
         build_file = "//bazel/thirdparty:avro.BUILD",
-        sha256 = "791d9f163f458d0ba4c94251f58ef5af9157952a9569ce0968d89aeb585af34f",
-        strip_prefix = "avro-46fe1e36f680d75219cba46368de38321f1810ed",
-        url = "https://github.com/redpanda-data/avro/archive/46fe1e36f680d75219cba46368de38321f1810ed.tar.gz",
-        patches = ["//bazel/thirdparty:avro-snappy-includes.patch"],
+        sha256 = "1c09dd94cc8fcac0fa99359254507cfd538c527bcb8b5066d16b6289ac87ea93",
+        strip_prefix = "avro-6821e2b454401308d4e3819c0569d0fe7f2a66fa",
+        url = "https://github.com/redpanda-data/avro/archive/6821e2b454401308d4e3819c0569d0fe7f2a66fa.tar.gz",
+        patches = [
+            "//bazel/thirdparty:avro-snappy-includes.patch",
+            "//bazel/thirdparty:avro-fmt-const.patch",
+        ],
         patch_args = ["-p1"],
     )
 
@@ -77,7 +81,10 @@ def data_dependency():
         sha256 = "2157d92020d408ed63ebcd886a92d1346a1383b0f91123a0473b4f69b4a24861",
         strip_prefix = "krb5-krb5-1.21.3-final",
         url = "https://github.com/krb5/krb5/archive/refs/tags/krb5-1.21.3-final.tar.gz",
-        patches = ["//bazel/thirdparty:0001-Fix-two-unlikely-memory-leaks.patch"],
+        patches = [
+            "//bazel/thirdparty:0001-Fix-two-unlikely-memory-leaks.patch",
+            "//bazel/thirdparty:0002-Fix-two-NegoEx-parsing-vulnerabilities.patch",
+        ],
         patch_args = ["-p1"],
     )
 
@@ -98,27 +105,11 @@ def data_dependency():
     )
 
     http_archive(
-        name = "libxml2",
-        build_file = "//bazel/thirdparty:libxml2.BUILD",
-        sha256 = "546ab74561c040df210c88dbd3c652bf509d826954ab2002c8973f1fa8d10130",
-        strip_prefix = "libxml2-2.14.6",
-        url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/libxml2-v2.14.6.tar.gz",
-    )
-
-    http_archive(
         name = "lksctp",
         build_file = "//bazel/thirdparty:lksctp.BUILD",
         sha256 = "0c8fac0a5c66eea339dce6be857101b308ce1064c838b81125b0dde3901e8032",
         strip_prefix = "lksctp-tools-lksctp-tools-1.0.19",
         url = "https://vectorized-public.s3.amazonaws.com/dependencies/lksctp-tools-1.0.19.tar.gz",
-    )
-
-    http_archive(
-        name = "ragel",
-        build_file = "//bazel/thirdparty:ragel.BUILD",
-        sha256 = "5f156edb65d20b856d638dd9ee2dfb43285914d9aa2b6ec779dac0270cd56c3f",
-        strip_prefix = "ragel-6.10",
-        url = "http://www.colm.net/files/ragel/ragel-6.10.tar.gz",
     )
 
     #
@@ -138,9 +129,11 @@ def data_dependency():
     http_archive(
         name = "openssl",
         build_file = "//bazel/thirdparty:openssl.BUILD",
-        sha256 = "b28c91532a8b65a1f983b4c28b7488174e4a01008e29ce8e69bd789f28bc2a89",
-        strip_prefix = "openssl-3.5.5",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.5.tar.gz",
+        patches = ["//bazel/thirdparty:openssl-reproducible-buildinf.patch"],
+        patch_args = ["-p1"],
+        sha256 = "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736",
+        strip_prefix = "openssl-3.5.6",
+        url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.6.tar.gz",
     )
 
     http_archive(
@@ -167,13 +160,13 @@ def data_dependency():
         url = "https://github.com/redpanda-data/CRoaring/archive/c433d1c70c10fb2e40f049e019e2abbcafa6e69d.tar.gz",
     )
 
-    # branch: v26.1.x
+    # branch: v26.2.x
     http_archive(
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
-        sha256 = "b697dbed6afd966feae8bf58a3a3af704cb74ef4ee699c70506533948b23c740",
-        strip_prefix = "seastar-7780db6428357bca114d405ee2c7c24c52db6901",
-        url = "https://github.com/redpanda-data/seastar/archive/7780db6428357bca114d405ee2c7c24c52db6901.tar.gz",
+        sha256 = "d2a4816aa75e1c8eacdd78265e7461bd2e3885f0daf30904e5d1fb638ceda37c",
+        strip_prefix = "seastar-9de2b0b3a75a78ace41d06ea8b24ad12bfbb0186",
+        url = "https://github.com/redpanda-data/seastar/archive/9de2b0b3a75a78ace41d06ea8b24ad12bfbb0186.tar.gz",
     )
 
     http_archive(
@@ -200,22 +193,31 @@ def data_dependency():
         url = "https://github.com/Cyan4973/xxHash/archive/bbb27a5efb85b92a0486cf361a8635715a53f6ba.tar.gz",
     )
 
-    sysroot_build_file = """
-filegroup(
-  name = "sysroot",
-  srcs = glob(["*/**"]),
-  visibility = ["//visibility:public"],
-)"""
-    http_archive(
-        name = "x86_64_sysroot",
-        build_file_content = sysroot_build_file,
-        sha256 = "282b7eb89ca45d2309217d5d2099cc087c1e7bd55f7891b9d2ddca648b6663b7",
-        urls = ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-19.1.7/sysroot-ubuntu-22.04-x86_64-2025-02-24.tar.zst"],
-    )
-
-    http_archive(
-        name = "aarch64_sysroot",
-        build_file_content = sysroot_build_file,
-        sha256 = "39e3d368d57a40d36f6735dcfe3ed699c6a5962cd47c5b1f652254f077632688",
-        urls = ["https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-19.1.7/sysroot-ubuntu-22.04-aarch64-2025-02-27.tar.zst"],
-    )
+    # The sysroot is consumed two ways. The upstream `sysroot` rule from
+    # toolchains_llvm exposes a single source-directory artifact that the
+    # cc_toolchain ingests as one input. The packaging rules in
+    # //bazel/packaging need individual file labels for the dynamic loader
+    # and versioned shared libraries to ship alongside the binary, so we
+    # also pull the same tarball via http_archive with a glob-based BUILD.
+    _SYSROOT_URL = "https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-22.1.0/sysroot-ubuntu-22.04-{arch}-2026-05-05.tar.zst"
+    for arch, sha in [
+        ("x86_64", "0d85fc9e155e664403c1c3c40831d865796d36a91b78a2e6d8922aa6ad3f0375"),
+        ("aarch64", "1afc00adf978c90ad8ffd3b729180923c27d57a7702ea23ba35c714e11d0def2"),
+    ]:
+        url = _SYSROOT_URL.format(arch = arch)
+        sysroot(
+            name = arch + "_sysroot",
+            sha256 = sha,
+            urls = [url],
+        )
+        http_archive(
+            name = arch + "_sysroot_runtime",
+            build_file_content = """filegroup(
+    name = "runtime",
+    srcs = glob(["**/*.so.*"], allow_empty = False),
+    visibility = ["//visibility:public"],
+)
+""",
+            sha256 = sha,
+            urls = [url],
+        )

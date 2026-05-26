@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0
 
 //go:build linux
-// +build linux
 
 package redpanda
 
@@ -35,6 +34,7 @@ func NewCommand(fs afero.Fs, p *config.Params, launcher rp.Launcher) *cobra.Comm
 		NewConfigCommand(fs, p),
 
 		tune.NewCommand(fs, p),
+		// deprecated
 		admin.NewCommand(fs, p),
 	)
 

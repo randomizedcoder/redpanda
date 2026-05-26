@@ -62,9 +62,14 @@ aws_refresh_impl::aws_refresh_impl(
   aws_service_name service,
   aws_region_name region,
   ss::abort_source& as,
-  retry_params retry_params)
+  retry_params retry_params,
+  ss::sstring metrics_tag)
   : refresh_credentials::impl(
-      std::move(address), std::move(region), as, retry_params)
+      std::move(address),
+      std::move(region),
+      as,
+      retry_params,
+      std::move(metrics_tag))
   , _service(std::move(service)) {}
 
 bool aws_refresh_impl::is_fallback_required(const api_request_error& response) {
@@ -219,9 +224,8 @@ ss::future<api_response> aws_refresh_impl::make_request_with_token(
       co_await make_api_client("aws"), std::move(req));
 }
 
-std::ostream& aws_refresh_impl::print(std::ostream& os) const {
-    fmt::print(os, "aws_refresh_impl{{address:{}}}", address());
-    return os;
+fmt::iterator aws_refresh_impl::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "aws_refresh_impl{{address:{}}}", address());
 }
 
 } // namespace cloud_roles

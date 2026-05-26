@@ -96,7 +96,7 @@ See `.bazelrc` for more details on build settings and config modes
 
 ### Protobuf Coding Guidelines
 
-Follow the guidelines provided in `proto/redpanda/README.md` for basic Protobuf standards.
+Follow the guidelines provided in `proto/redpanda/README.md` for basic Protobuf standards. For admin v2 ConnectRPC endpoints (proto → C++ service impl → registration → ducktape Python bindings), use the `add-admin-v2-endpoint` skill.
 
 ### Protobuf Build & Environment
 - **Primary Protobuf code lives in `proto/`.**
@@ -173,6 +173,16 @@ lambda object, decoupling capture lifetime from the lambda's lifetime.
 This is distinct from the recursive-lambda use case—here this auto is required
 for memory safety in coroutines, not self-reference.
 
+### Exception handling
+
+- Read the "Exceptions in coroutines" section within [tutorial.md](external/+non_module_dependencies+seastar/doc/tutorial.md)
+  to best understand how exceptions should be handled in Redpanda.
+- `throw` and `std::rethrow_exception()` may have an effect on performance, especially in hot paths.
+  There are several `seastar` utilities that should be preferred to explicitly throwing exceptions.
+  Namely, `ss::coroutine::try_future()`, `ss::coroutine::as_future()`, `ss::coroutine::return_exception()`,
+  and `ss::coroutine::return_exception_ptr()`. This is only a brief summary of the content in the tutorial above,
+  which must be read to fully understand exception handling in Redpanda.
+
 ### C++ coding style
 
 - Use snake_case for identifiers. Use CamelCase for concepts.
@@ -193,6 +203,12 @@ for memory safety in coroutines, not self-reference.
   - Mapping internal types/concepts to external formats (e.g., wire protocols, APIs)
   - ASCII diagrams for complex state machines or data flows
 - **Avoid obvious branching comments** - `if (x)` rarely needs `// when x is true`
+
+### Benchmarking
+
+  - Run benchmarks like `bazel run --config=release //src/v/utils/tests:coro_rpbench`
+  - Get --help like: `bazel run --config=release //src/v/utils/tests:coro_rpbench -- --help`
+  - If running/writing benchmarks read this also: external/+non_module_dependencies+seastar/tests/perf/perf-tests.md
 
 ### More C++-Specific References
 

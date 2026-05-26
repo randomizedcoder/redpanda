@@ -32,7 +32,7 @@ simple_fcfs_scheduling_policy::simple_fcfs_scheduling_policy(
       datalake_log.info,
       "created simple_fcfs_scheduling_policy policy with {} translators "
       "and {} time quota",
-      max_concurrent_translators(),
+      _max_concurrent_translations(),
       std::chrono::duration_cast<std::chrono::milliseconds>(
         translation_time_quota));
 }
@@ -77,24 +77,10 @@ fair_scheduling_policy::fair_scheduling_policy(
       datalake_log.info,
       "created fair_scheduling_policy policy with {} translators "
       "and {} time quota",
-      max_concurrent_translators(),
+      _max_concurrent_translations(),
       std::chrono::duration_cast<std::chrono::milliseconds>(
         translation_time_quota));
     initialize_group_shares();
-}
-
-std::ostream&
-operator<<(std::ostream& os, fair_scheduling_policy::translator_group group) {
-    switch (group) {
-    case fair_scheduling_policy::translator_group::other:
-        return os << "translator_group::other";
-    case fair_scheduling_policy::translator_group::unfulfilled_quota:
-        return os << "translator_group::unfulfilled_quota";
-    case fair_scheduling_policy::translator_group::about_to_expire:
-        return os << "translator_group::about_to_expire";
-    case fair_scheduling_policy::translator_group::expired:
-        return os << "translator_group::expired";
-    }
 }
 
 void fair_scheduling_policy::initialize_group_shares() {

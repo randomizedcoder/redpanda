@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "cloud_topics/level_zero/stm/ctp_stm_state.h"
 #include "cloud_topics/level_zero/stm/types.h"
 #include "model/fundamental.h"
 #include "serde/envelope.h"
@@ -85,6 +86,52 @@ struct advance_epoch_cmd
     auto serde_fields() { return std::tie(new_epoch); }
 
     cluster_epoch new_epoch;
+};
+
+/// This command resets the ctp_stm state to a serialized snapshot.
+///
+/// When applied, the STM replaces its entire in-memory state with the
+/// one embedded in this command. This is used as an escape hatch to
+/// recover from state corruption or to force a known-good state onto
+/// the partition without truncating the log.
+struct reset_state_cmd
+  : public serde::
+      envelope<reset_state_cmd, serde::version<0>, serde::compat_version<0>> {
+    static constexpr cmd_key key = cmd_key(
+      std::to_underlying(ctp_stm_key::reset_state));
+
+    reset_state_cmd() noexcept = default;
+
+    explicit reset_state_cmd(ctp_stm_state new_state) noexcept
+      : state(std::move(new_state)) {}
+
+    auto serde_fields() { return std::tie(state); }
+
+    ctp_stm_state state;
+};
+
+/// Sets the cached `allowed_local_start_offset` hint on ctp_stm.
+///
+/// The reconciler replicates this command after computing the offset
+/// from local segment stats and effective local-retention targets.
+/// nullopt clears the hint (used when storage.mode != tiered_cloud or
+/// when compaction is enabled on the topic).
+struct set_allowed_local_start_offset_cmd
+  : public serde::envelope<
+      set_allowed_local_start_offset_cmd,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    static constexpr cmd_key key = cmd_key(
+      std::to_underlying(ctp_stm_key::set_allowed_local_start_offset));
+
+    set_allowed_local_start_offset_cmd() noexcept = default;
+    explicit set_allowed_local_start_offset_cmd(
+      std::optional<kafka::offset> v) noexcept
+      : value(v) {}
+
+    auto serde_fields() { return std::tie(value); }
+
+    std::optional<kafka::offset> value;
 };
 
 } // namespace cloud_topics

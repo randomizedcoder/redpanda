@@ -8,11 +8,13 @@
 // by the Apache License, Version 2.0
 
 //go:build linux
-// +build linux
 
 package bundle
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -342,6 +344,166 @@ func TestSliceControllerDir(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			slice := sliceControllerDir(test.in, test.limit)
 			require.Equal(t, test.exp, slice)
+		})
+	}
+}
+
+func TestSaveProcFileSampled(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	content := []byte("counter-snapshot")
+	require.NoError(t, afero.WriteFile(fs, "/proc/test", content, 0o644))
+
+	newPS := func(zw *zip.Writer) *stepParams {
+		return &stepParams{
+			fs:        fs,
+			w:         zw,
+			timeout:   time.Second,
+			fileRoot:  "bundle",
+			sharedBuf: make([]byte, 1024),
+		}
+	}
+
+	readZip := func(buf *bytes.Buffer) map[string][]byte {
+		zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+		require.NoError(t, err)
+		got := map[string][]byte{}
+		for _, f := range zr.File {
+			func(f *zip.File) {
+				rc, err := f.Open()
+				require.NoError(t, err)
+				defer func() {
+					require.NoError(t, rc.Close())
+				}()
+
+				data, err := io.ReadAll(rc)
+				require.NoError(t, err)
+				got[f.Name] = data
+			}(f)
+		}
+		return got
+	}
+
+	t.Run("each sample written to proc/<name>/tN.txt", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		step := saveProcFileSampled(context.Background(), newPS(zw), "/proc/test", "test", time.Millisecond, 3)
+		require.NoError(t, step())
+		require.NoError(t, zw.Close())
+
+		got := readZip(&buf)
+		require.Len(t, got, 3)
+		for _, n := range []string{
+			"bundle/proc/test/t0.txt",
+			"bundle/proc/test/t1.txt",
+			"bundle/proc/test/t2.txt",
+		} {
+			require.Contains(t, got, n)
+			require.Equal(t, content, got[n])
+		}
+	})
+
+	t.Run("ctx cancel captures final sample and returns", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		step := saveProcFileSampled(ctx, newPS(zw), "/proc/test", "test", time.Hour, 5)
+		require.NoError(t, step())
+		require.NoError(t, zw.Close())
+
+		got := readZip(&buf)
+		require.Len(t, got, 2)
+		require.Contains(t, got, "bundle/proc/test/t0.txt")
+		require.Contains(t, got, "bundle/proc/test/t1.txt")
+	})
+
+	t.Run("sampleCount of 1 writes only t0", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		step := saveProcFileSampled(context.Background(), newPS(zw), "/proc/test", "test", time.Hour, 1)
+		require.NoError(t, step())
+		require.NoError(t, zw.Close())
+
+		got := readZip(&buf)
+		require.Len(t, got, 1)
+		require.Contains(t, got, "bundle/proc/test/t0.txt")
+	})
+
+	t.Run("missing source file surfaces error", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		step := saveProcFileSampled(context.Background(), newPS(zw), "/proc/does-not-exist", "nope", time.Millisecond, 2)
+		require.Error(t, step())
+	})
+}
+
+func TestAdminAddressesUnion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b []string
+		want []string
+	}{
+		{
+			name: "no overlap",
+			a:    []string{"a:9644", "b:9644"},
+			b:    []string{"c:9644"},
+			want: []string{"a:9644", "b:9644", "c:9644"},
+		},
+		{
+			name: "exact duplicate across sources",
+			a:    []string{"broker-0.svc.ns.svc.cluster.local:9644"},
+			b:    []string{"broker-0.svc.ns.svc.cluster.local:9644"},
+			want: []string{"broker-0.svc.ns.svc.cluster.local:9644"},
+		},
+		{
+			name: "short form vs FQDN — same broker, profile wins",
+			a:    []string{"cluster-third-0.default:9644"},
+			b:    []string{"cluster-third-0.cluster.default.svc.cluster.local.:9644"},
+			want: []string{"cluster-third-0.default:9644"},
+		},
+		{
+			name: "trailing dot is normalized",
+			a:    []string{"broker-0.ns.svc.cluster.local:9644"},
+			b:    []string{"broker-0.ns.svc.cluster.local.:9644"},
+			want: []string{"broker-0.ns.svc.cluster.local:9644"},
+		},
+		{
+			name: "different brokers in same headless service stay separate",
+			a:    []string{"broker-0.cluster.default.svc.cluster.local.:9644"},
+			b:    []string{"broker-1.cluster.default.svc.cluster.local.:9644"},
+			want: []string{
+				"broker-0.cluster.default.svc.cluster.local.:9644",
+				"broker-1.cluster.default.svc.cluster.local.:9644",
+			},
+		},
+		{
+			name: "IPv4 literals are not collapsed by leading octet",
+			a:    []string{"10.0.0.1:9644"},
+			b:    []string{"10.0.0.2:9644"},
+			want: []string{"10.0.0.1:9644", "10.0.0.2:9644"},
+		},
+		{
+			name: "different ports for same host stay separate",
+			a:    []string{"broker-0.default:9644"},
+			b:    []string{"broker-0.default:9645"},
+			want: []string{"broker-0.default:9644", "broker-0.default:9645"},
+		},
+		{
+			name: "duplicates within a single slice are also collapsed",
+			a:    []string{"broker-0.default:9644", "broker-0.cluster.default.svc.cluster.local.:9644"},
+			b:    nil,
+			want: []string{"broker-0.default:9644"},
+		},
+		{
+			name: "unparseable addresses fall back to exact-string compare",
+			a:    []string{"not-a-valid-addr"},
+			b:    []string{"not-a-valid-addr", "also-bogus"},
+			want: []string{"not-a-valid-addr", "also-bogus"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := adminAddressesUnion(tc.a, tc.b)
+			require.Equal(t, tc.want, got)
 		})
 	}
 }

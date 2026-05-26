@@ -23,9 +23,8 @@
 #include "net/tls.h"
 #include "net/tls_certificate_probe.h"
 #include "ssx/future-util.h"
+#include "ssx/sformat.h"
 
-#include <seastar/core/abort_source.hh>
-#include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/util/defer.hh>
 
@@ -160,13 +159,16 @@ refresh_credentials::impl::impl(
   net::unresolved_address address,
   aws_region_name region,
   ss::abort_source& as,
-  retry_params retry_params)
+  retry_params retry_params,
+  ss::sstring metrics_tag)
   : _address{std::move(address)}
   , _region{std::move(region)}
   , _as{as}
-  , _retry_params{retry_params} {
-    if (auto address_override = load_and_validate_env_var(override_address);
-        address_override) {
+  , _retry_params{retry_params}
+  , _metrics_tag{std::move(metrics_tag)} {
+    if (
+      auto address_override = load_and_validate_env_var(override_address);
+      address_override) {
         auto address = parse_address(address_override.value());
         vlog(
           clrl_log.debug,
@@ -395,9 +397,13 @@ ss::future<> refresh_credentials::impl::init_tls_certs(ss::sstring name) {
       .require_client_auth = false,
     });
 
+    auto detail = _metrics_tag.empty()
+                    ? std::move(name)
+                    : ssx::sformat("{}_{}", name, _metrics_tag);
+
     _tls_certs = co_await net::build_reloadable_credentials_with_probe<
       ss::tls::certificate_credentials>(
-      std::move(builder), "cloud_provider_client", std::move(name));
+      std::move(builder), "cloud_provider_client", std::move(detail));
 }
 
 refresh_credentials make_refresh_credentials(
@@ -407,6 +413,7 @@ refresh_credentials make_refresh_credentials(
   aws_service_name service,
   aws_region_name region,
   std::optional<net::unresolved_address> endpoint,
+  std::optional<ss::sstring> host_override,
   retry_params retry_params,
   ss::sstring metrics_tag) {
     switch (cloud_credentials_source) {
@@ -424,6 +431,7 @@ refresh_credentials make_refresh_credentials(
           std::move(service),
           std::move(region),
           std::move(endpoint),
+          std::move(host_override),
           retry_params,
           std::move(metrics_tag));
     case model::cloud_credentials_source::sts:
@@ -433,6 +441,7 @@ refresh_credentials make_refresh_credentials(
           std::move(service),
           std::move(region),
           std::move(endpoint),
+          std::move(host_override),
           retry_params,
           std::move(metrics_tag));
     case model::cloud_credentials_source::gcp_instance_metadata:
@@ -442,6 +451,7 @@ refresh_credentials make_refresh_credentials(
           std::move(service),
           std::move(region),
           std::move(endpoint),
+          std::move(host_override),
           retry_params,
           std::move(metrics_tag));
     case model::cloud_credentials_source::azure_aks_oidc_federation:
@@ -451,6 +461,7 @@ refresh_credentials make_refresh_credentials(
           std::move(service),
           std::move(region),
           std::move(endpoint),
+          std::move(host_override),
           retry_params,
           std::move(metrics_tag));
     case model::cloud_credentials_source::azure_vm_instance_metadata:
@@ -460,13 +471,10 @@ refresh_credentials make_refresh_credentials(
           std::move(service),
           std::move(region),
           std::move(endpoint),
+          std::move(host_override),
           retry_params,
           std::move(metrics_tag));
     }
-}
-
-std::ostream& operator<<(std::ostream& os, const refresh_credentials& rc) {
-    return rc.print(os);
 }
 
 } // namespace cloud_roles

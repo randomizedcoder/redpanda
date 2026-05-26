@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "base/format_to.h"
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -95,8 +96,7 @@ public:
         // Storage mode for the topic (local, tiered, or cloud)
         model::redpanda_storage_mode storage_mode{default_storage_mode};
 
-        friend std::ostream&
-        operator<<(std::ostream&, const default_overrides&);
+        fmt::iterator format_to(fmt::iterator it) const;
     };
 
     ntp_config(model::ntp n, ss::sstring base_dir) noexcept
@@ -284,9 +284,6 @@ public:
     }
 
     bool is_read_replica_mode_enabled() const {
-        if (cloud_topic_enabled()) {
-            return false;
-        }
         return _overrides != nullptr && _overrides->read_replica
                && _overrides->read_replica.value();
     }
@@ -434,9 +431,6 @@ public:
     }
 
     model::iceberg_mode iceberg_mode() const {
-        if (!config::shard_local_cfg().iceberg_enabled) {
-            return model::iceberg_mode::disabled;
-        }
         return _overrides ? _overrides->iceberg_mode : default_iceberg_mode;
     }
 
@@ -445,12 +439,17 @@ public:
     }
 
     bool cloud_topic_enabled() const {
-        if (!config::shard_local_cfg().cloud_topics_enabled()) {
-            return false;
-        }
+        return _overrides
+               && (_overrides->storage_mode
+                     == model::redpanda_storage_mode::cloud
+                   || _overrides->storage_mode
+                        == model::redpanda_storage_mode::tiered_cloud);
+    }
+
+    bool is_tiered_cloud() const {
         return _overrides
                && _overrides->storage_mode
-                    == model::redpanda_storage_mode::cloud;
+                    == model::redpanda_storage_mode::tiered_cloud;
     }
 
     std::optional<double> min_cleanable_dirty_ratio() const {
@@ -512,8 +511,9 @@ private:
     /// _topic_revision in case of recovered topics or read replicas.
     model::initial_revision_id _remote_rev{0};
 
+public:
     // in storage/types.cc
-    friend std::ostream& operator<<(std::ostream&, const ntp_config&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 } // namespace storage

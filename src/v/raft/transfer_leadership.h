@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "model/fundamental.h"
 #include "raft/errc.h"
 #include "raft/fundamental.h"
@@ -35,13 +36,15 @@ struct transfer_leadership_request
     raft::group_id target_group() const { return group; }
 
     friend bool operator==(
-      const transfer_leadership_request&, const transfer_leadership_request&)
-      = default;
+      const transfer_leadership_request&,
+      const transfer_leadership_request&) = default;
 
     auto serde_fields() { return std::tie(group, target, timeout); }
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const transfer_leadership_request& r);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, "group {} target {} timeout {}", group, target, timeout);
+    }
 };
 
 struct transfer_leadership_reply
@@ -53,15 +56,13 @@ struct transfer_leadership_reply
     raft::errc result;
 
     friend bool operator==(
-      const transfer_leadership_reply&, const transfer_leadership_reply&)
-      = default;
+      const transfer_leadership_reply&,
+      const transfer_leadership_reply&) = default;
 
     auto serde_fields() { return std::tie(success, result); }
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const transfer_leadership_reply& r) {
-        fmt::print(o, "success {} result {}", r.success, r.result);
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "success {} result {}", success, result);
     }
 };
 

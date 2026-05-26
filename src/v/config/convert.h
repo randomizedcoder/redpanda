@@ -417,6 +417,7 @@ struct convert<model::leader_balancer_mode> {
     static constexpr auto acceptable_values = std::to_array(
       {model::leader_balancer_mode_to_string(type::calibrated),
        model::leader_balancer_mode_to_string(type::random),
+       model::leader_balancer_mode_to_string(type::greedy),
        "greedy_balanced_shards",
        "random_hill_climbing"});
 
@@ -439,6 +440,9 @@ struct convert<model::leader_balancer_mode> {
                 .match(
                   model::leader_balancer_mode_to_string(type::random),
                   type::random)
+                .match(
+                  model::leader_balancer_mode_to_string(type::greedy),
+                  type::greedy)
                 .match("greedy_balanced_shards", type::calibrated)
                 .match("random_hill_climbing", type::calibrated);
 
@@ -692,7 +696,7 @@ template<>
 struct convert<config::leaders_preference> {
     using type = config::leaders_preference;
 
-    static Node encode(const type& rhs) { return Node(fmt::to_string(rhs)); }
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
 
     static bool decode(const Node& node, type& rhs) {
         auto node_str = node.as<std::string>();
@@ -737,6 +741,19 @@ struct convert<config::datalake_catalog_type> {
 template<>
 struct convert<model::iceberg_invalid_record_action> {
     using type = model::iceberg_invalid_record_action;
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        rhs = boost::lexical_cast<type>(value);
+        return true;
+    }
+};
+
+template<>
+struct convert<model::iceberg_schema_case_insensitive> {
+    using type = model::iceberg_schema_case_insensitive;
 
     static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
 

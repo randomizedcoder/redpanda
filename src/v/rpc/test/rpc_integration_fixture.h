@@ -41,8 +41,7 @@ public:
 
     virtual void configure_server(
       std::optional<ss::tls::credentials_builder> credentials = std::nullopt,
-      ss::tls::reload_callback&& cb = {})
-      = 0;
+      ss::tls::reload_callback&& cb = {}) = 0;
 
     rpc::transport_configuration client_config(
       std::optional<ss::tls::credentials_builder> credentials
@@ -167,7 +166,7 @@ private:
     void check_server() override {
         const bool all_initialized = ss::map_reduce(
                                        boost::irange<unsigned>(
-                                         0, ss::smp::count),
+                                         0, ss::this_smp_shard_count()),
                                        [this](unsigned /*c*/) {
                                            return ss::make_ready_future<bool>(
                                              _server.local_is_initialized());

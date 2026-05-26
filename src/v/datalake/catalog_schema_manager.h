@@ -9,8 +9,10 @@
  */
 #pragma once
 
+#include "base/format_to.h"
 #include "iceberg/catalog.h"
 #include "iceberg/datatypes.h"
+#include "iceberg/field_name_comparison.h"
 #include "iceberg/partition.h"
 #include "iceberg/schema.h"
 #include "iceberg/table_identifier.h"
@@ -32,13 +34,22 @@ public:
         // The system is shutting down.
         shutting_down,
     };
-    friend std::ostream& operator<<(std::ostream&, const errc&);
+    friend fmt::iterator format_to(errc e, fmt::iterator out) {
+        switch (e) {
+        case errc::not_supported:
+            return fmt::format_to(out, "schema_manager::errc::not_supported");
+        case errc::failed:
+            return fmt::format_to(out, "schema_manager::errc::failed");
+        case errc::shutting_down:
+            return fmt::format_to(out, "schema_manager::errc::shutting_down");
+        }
+    }
 
     virtual ss::future<checked<std::nullopt_t, errc>> ensure_table_schema(
       const iceberg::table_identifier&,
       const iceberg::struct_type& desired_type,
-      const iceberg::unresolved_partition_spec&)
-      = 0;
+      const iceberg::unresolved_partition_spec&,
+      iceberg::field_name_comparison norm) = 0;
 
     struct table_info {
         iceberg::table_identifier id;
@@ -49,14 +60,14 @@ public:
 
         // Fills the field IDs of the given type with those in the current
         // schema. Returns true on success.
-        bool fill_registered_ids(iceberg::struct_type&);
+        bool fill_registered_ids(
+          iceberg::struct_type&, iceberg::field_name_comparison norm);
     };
 
     virtual ss::future<checked<table_info, errc>> get_table_info(
       const iceberg::table_identifier&,
-      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type
-      = std::nullopt)
-      = 0;
+      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type,
+      iceberg::field_name_comparison norm) = 0;
 
     virtual ss::future<> stop() = 0;
     virtual ~schema_manager() = default;
@@ -73,12 +84,13 @@ public:
     ensure_table_schema(
       const iceberg::table_identifier&,
       const iceberg::struct_type& desired_type,
-      const iceberg::unresolved_partition_spec&) override;
+      const iceberg::unresolved_partition_spec&,
+      iceberg::field_name_comparison norm) override;
 
     ss::future<checked<table_info, schema_manager::errc>> get_table_info(
       const iceberg::table_identifier&,
-      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type
-      = std::nullopt) override;
+      std::optional<std::reference_wrapper<iceberg::struct_type>> desired_type,
+      iceberg::field_name_comparison norm) override;
     ss::future<> stop() final { return ss::now(); }
 
 private:
@@ -105,14 +117,15 @@ public:
     ensure_table_schema(
       const iceberg::table_identifier&,
       const iceberg::struct_type& writer_struct_type,
-      const iceberg::unresolved_partition_spec&) override;
+      const iceberg::unresolved_partition_spec&,
+      iceberg::field_name_comparison norm) override;
 
     // Loads the table metadata for the given topic.
     ss::future<checked<table_info, schema_manager::errc>> get_table_info(
       const iceberg::table_identifier&,
       std::optional<std::reference_wrapper<iceberg::struct_type>>
-        writer_struct_type
-      = std::nullopt) override;
+        writer_struct_type,
+      iceberg::field_name_comparison norm) override;
 
     // Stops the schema manager, waiting for any ongoing operations to
     // complete.

@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cloud_topics/level_zero/common/producer_queue.h"
 #include "cloud_topics/level_zero/stm/types.h"
 #include "cloud_topics/types.h"
@@ -20,7 +21,6 @@
 #include <seastar/core/gate.hh>
 
 #include <expected>
-#include <ostream>
 
 struct ctp_stm_api_accessor;
 class prefix_logger;
@@ -36,7 +36,18 @@ enum class ctp_stm_api_errc : uint8_t {
     failure,
 };
 
-std::ostream& operator<<(std::ostream& o, ctp_stm_api_errc errc);
+inline fmt::iterator format_to(ctp_stm_api_errc errc, fmt::iterator out) {
+    switch (errc) {
+    case ctp_stm_api_errc::timeout:
+        return fmt::format_to(out, "timeout");
+    case ctp_stm_api_errc::not_leader:
+        return fmt::format_to(out, "not_leader");
+    case ctp_stm_api_errc::shutdown:
+        return fmt::format_to(out, "shutdown");
+    case ctp_stm_api_errc::failure:
+        return fmt::format_to(out, "failure");
+    }
+}
 
 class ctp_stm_api {
     friend struct ::ctp_stm_api_accessor;
@@ -65,6 +76,14 @@ public:
     ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
     set_start_offset(
       kafka::offset new_start_offset,
+      model::timeout_clock::time_point deadline,
+      ss::abort_source& as);
+
+    /// Replicate a set_allowed_local_start_offset_cmd. The STM stores the
+    /// value as a hint for prefix_truncate_below_lro.
+    ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
+    set_allowed_local_start_offset(
+      std::optional<kafka::offset> value,
       model::timeout_clock::time_point deadline,
       ss::abort_source& as);
 
@@ -114,9 +133,14 @@ public:
 
     std::optional<cluster_epoch> get_max_epoch() const;
 
-    std::optional<cluster_epoch> get_max_seen_epoch() const;
+    std::optional<cluster_epoch> get_max_seen_epoch(model::term_id) const;
 
     l0::producer_queue& producer_queue();
+
+    // Register this reader with the STM so that it's state isn't GC'd.
+    //
+    // The provided pointer must be kept *stable* during it's entire lifetime.
+    void register_reader(active_reader_state*);
 
     /// Estimate the total bytes of cloud data addressable by the level-zero
     /// log for this partition.

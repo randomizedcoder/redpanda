@@ -1018,8 +1018,18 @@ class RpkTool:
             cmd, timeout=timeout, use_schema_registry=use_schema_registry is not None
         )
 
-    def group_seek_to(self, group: str, to: str) -> None:
+    def group_seek_to(
+        self,
+        group: str,
+        to: str,
+        topics: list[str] | None = None,
+        allow_new_topics: bool = False,
+    ) -> None:
         cmd = ["seek", group, "--to", to]
+        if topics is not None:
+            cmd += ["--topics", ",".join(topics)]
+        if allow_new_topics:
+            cmd += ["--allow-new-topics"]
         self._run_group(cmd)
 
     def group_describe(self, group, summary=False, tolerant=False):
@@ -1628,7 +1638,9 @@ class RpkTool:
         output = self._execute(cmd)
         return list(filter(None, map(parse, output.splitlines())))
 
-    def cluster_connections_list(self, limit: int, filter_raw=None, order_by=None):
+    def cluster_connections_list(
+        self, limit: int, filter_raw: str | None = None, order_by: str | None = None
+    ) -> str:
         cmd = [
             self._rpk_binary(),
             "-X",

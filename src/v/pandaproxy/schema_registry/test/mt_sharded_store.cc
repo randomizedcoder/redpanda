@@ -7,9 +7,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "pandaproxy/schema_registry/error.h"
-#include "pandaproxy/schema_registry/exceptions.h"
-#include "pandaproxy/schema_registry/protobuf.h"
 #include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/test/compatibility_protobuf.h"
 #include "pandaproxy/schema_registry/types.h"
@@ -71,13 +68,14 @@ SEASTAR_THREAD_TEST_CASE(test_sharded_store_cross_shard_def) {
         ss::parallel_for_each(
           boost::irange(0, num_parallel_requests),
           [&store, i](auto shrd) {
-              return ss::smp::submit_to(shrd % ss::smp::count, [&store, i]() {
-                  return store
-                    .get_schema_definition(
-                      pps::context_schema_id{
-                        pps::default_context, pps::schema_id{i}})
-                    .discard_result();
-              });
+              return ss::smp::submit_to(
+                shrd % ss::this_smp_shard_count(), [&store, i]() {
+                    return store
+                      .get_schema_definition(
+                        pps::context_schema_id{
+                          pps::default_context, pps::schema_id{i}})
+                      .discard_result();
+                });
           })
           .get();
     }

@@ -170,12 +170,27 @@ has_references(const context_subject& sub, schema_version ver) {
 error_info no_reference_found_for(
   const subject_schema& schema, const context_subject& sub, schema_version ver);
 
+inline error_info compatibility_not_found(const context& ctx) {
+    return error_info{
+      error_code::compatibility_not_found,
+      fmt::format(
+        "Context '{}' does not have context-level compatibility configured",
+        ctx)};
+}
+
 inline error_info compatibility_not_found(const context_subject& sub) {
     return error_info{
       error_code::compatibility_not_found,
       fmt::format(
         "Subject '{}' does not have subject-level compatibility configured",
         sub)};
+}
+
+inline error_info mode_not_found(const context& ctx) {
+    return error_info{
+      error_code::mode_not_found,
+      fmt::format(
+        "Context '{}' does not have context-level mode configured", ctx)};
 }
 
 inline error_info mode_not_found(const context_subject& sub) {
@@ -244,6 +259,12 @@ inline error_info context_not_empty(const context& ctx) {
     return error_info{
       error_code::context_not_empty,
       fmt::format("The specified context '{}' is not empty.", ctx())};
+}
+
+inline error_info context_invalid(std::string_view ctx) {
+    return error_info{
+      error_code::context_invalid,
+      fmt::format("The specified context '{}' is not valid.", ctx)};
 }
 
 inline bool failed_subject_schema_lookup(std::error_code ec) {

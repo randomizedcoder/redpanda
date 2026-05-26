@@ -9,14 +9,12 @@
 
 #include "syschecks/syschecks.h"
 
-#include "base/likely.h"
 #include "base/seastarx.h"
 #include "version/version.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/posix.hh> // here for workaround
-#include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/net/api.hh>
 
@@ -39,6 +37,8 @@ ss::sstring to_string(ss::fs_type fs) {
         return "hfs";
     case ss::fs_type::tmpfs:
         return "tmpfs";
+    case ss::fs_type::hugetlbfs:
+        return "hugetlbfs";
     };
     return "bad_enum";
 }

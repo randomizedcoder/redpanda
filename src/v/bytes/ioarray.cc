@@ -17,8 +17,6 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/byteorder.hh>
 
-#include <sys/uio.h>
-
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
@@ -95,6 +93,44 @@ ioarray::string_view::operator<=>(std::string_view other) const {
     }
     other.remove_prefix(_views[0].size());
     return _views[1] <=> other;
+}
+
+ioarray ioarray::concat(ioarray a, ioarray b) {
+    if (a.empty()) {
+        return b;
+    }
+    if (b.empty()) {
+        return a;
+    }
+    // Fast path: when a's data ends on a chunk boundary and b has no offset,
+    // we can move buffers directly since the indexing math is preserved.
+    bool fast = b._offset == 0 && (a._offset + a._size) % max_chunk_size == 0;
+    if (fast) {
+        ioarray out(
+          uninitialized_t{},
+          (a._buffers.size() + b._buffers.size()) * max_chunk_size);
+        out._offset = a._offset;
+        out._size = a._size + b._size;
+        size_t i = 0;
+        for (auto& buf : a._buffers) {
+            out._buffers[i++] = std::move(buf);
+        }
+        for (auto& buf : b._buffers) {
+            out._buffers[i++] = std::move(buf);
+        }
+        return out;
+    }
+    // Slow path: copy both into a fresh ioarray.
+    size_t total = a._size + b._size;
+    ioarray out(total);
+    size_t pos = 0;
+    for (auto c : a.as_range()) {
+        out[pos++] = c;
+    }
+    for (auto c : b.as_range()) {
+        out[pos++] = c;
+    }
+    return out;
 }
 
 ioarray ioarray::copy_from(const iobuf& buf) {
@@ -263,8 +299,7 @@ void ioarray::trim_back(size_t n) {
     new (buffers_ptr) absl::FixedArray(std::move(replacement));
 }
 
-ioarray
-ioarray::from_sized_buffers(std::span<ss::temporary_buffer<char>> bufs) {
+ioarray ioarray::from_sized_buffers(scattered_buffer_view bufs) {
     if (bufs.empty()) {
         return {};
     }

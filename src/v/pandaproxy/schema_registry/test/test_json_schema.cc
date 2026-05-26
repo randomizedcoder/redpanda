@@ -21,7 +21,6 @@
 
 #include <seastar/core/sstring.hh>
 #include <seastar/testing/thread_test_case.hh>
-#include <seastar/util/defer.hh>
 
 #include <boost/test/tools/context.hpp>
 #include <fmt/core.h>
@@ -812,6 +811,21 @@ static const auto compatibility_test_cases = std::to_array<compatibility_test_ca
     = R"({"oneOf": [{"type":"number", "multipleOf": 10}, {"type": "number", "multipleOf": 1.1}]})",
     // Note: this is reported as combined_type_changed by the reference impl
     .compat_result = {{"#/", incompat_t::combined_type_subschemas_changed}},
+  },
+  // #30398: adding a required field whose name is absent from the writer's
+  // properties must be flagged. Previously masked by a faulty filter.
+  {
+    .reader_schema = R"({
+      "type": "object",
+      "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
+      "required": ["name", "id"]
+    })",
+    .writer_schema = R"({
+      "type": "object",
+      "properties": {"name": {"type": "string"}},
+      "required": ["name"]
+    })",
+    .compat_result = {{"#/required/id", incompat_t::required_attribute_added}},
   },
   // object checks: removing a required property not ok if didn't have a default value
   {
@@ -2299,6 +2313,7 @@ const absl::flat_hash_set<incompatibility> forward_expected{
   // for this schema update.
   // {"#/properties/cccc",
   //  incompat_t::required_property_added_to_unopen_content_model},
+  {"#/required/cccc", incompat_t::required_attribute_added},
   {"#/dependencies/a", incompat_t::dependency_array_extended},
   {"#/dependencies/d", incompat_t::dependency_array_added},
   {"#/dependencies/b", incompat_t::type_narrowed},
@@ -2477,7 +2492,7 @@ SEASTAR_THREAD_TEST_CASE(test_refs_fixing) {
           pps::make_canonical_json_schema(
             f.store(),
             {pps::context_subject::unqualified("test"),
-             {fmt::format("{}", jsoncons::print(input_schema)),
+             {fmt::format("{}", fmt_streamed(jsoncons::print(input_schema))),
               pps::schema_type::json}})
             .get())
           .get();
@@ -2527,9 +2542,9 @@ SEASTAR_THREAD_TEST_CASE(test_refs_fixing) {
       fmt::format(
         "input_schema:\n{}\n\nexpected_schema:\n{}\n\nprocessed_schema:\n{}"
         "\n\n",
-        jsoncons::pretty_print(input_schema),
-        jsoncons::pretty_print(expected_schema),
-        jsoncons::pretty_print(processed_schema))) {
+        fmt_streamed(jsoncons::pretty_print(input_schema)),
+        fmt_streamed(jsoncons::pretty_print(expected_schema)),
+        fmt_streamed(jsoncons::pretty_print(processed_schema)))) {
         // check that the processed schema is the same as the expected schema,
         // output the difference if not
         auto jpatch = jsoncons::jsonpatch::from_diff(
@@ -2538,6 +2553,6 @@ SEASTAR_THREAD_TEST_CASE(test_refs_fixing) {
           expected_schema == processed_schema,
           fmt::format(
             "differences expected_schema-processed_schema:\n{}\n",
-            jsoncons::pretty_print(jpatch)));
+            fmt_streamed(jsoncons::pretty_print(jpatch))));
     }
 }

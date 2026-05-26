@@ -70,6 +70,7 @@ TEST(SimpleMetastoreTest, TestGetMissingPartition) {
                    .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                    .add(tid_b, 0_o, 10_o, 2000_t, 100, 199)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(
            om_list_t::single(std::move(ometa)),
@@ -112,6 +113,7 @@ TEST(SimpleMetastoreTest, TestAddWithGap) {
         auto ometa = om_builder(oid1, 100, 1100)
                        .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                        .build();
+        m.preregister_objects(chunked_vector<object_id>::single(oid1));
         auto add_res = m.add_objects(
                           om_list_t::single(std::move(ometa)),
                           terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -131,6 +133,7 @@ TEST(SimpleMetastoreTest, TestAddWithGap) {
         auto ometa = om_builder(oid2, 100, 1100)
                        .add(tid_a, 12_o, 20_o, 2000_t, 0, 99)
                        .build();
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto add_res = m.add_objects(
                           om_list_t::single(std::move(ometa)),
                           terms_builder().add(tid_a, 0_tm, 12_o).build())
@@ -150,6 +153,7 @@ TEST(SimpleMetastoreTest, TestAddWithGap) {
     auto ometa = om_builder(oid3, 100, 1100)
                    .add(tid_a, 11_o, 20_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid3));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder().add(tid_a, 0_tm, 11_o).build())
@@ -170,6 +174,7 @@ TEST(SimpleMetastoreTest, TestAddWithOverlap) {
         auto ometa = om_builder(oid1, 100, 1100)
                        .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                        .build();
+        m.preregister_objects(chunked_vector<object_id>::single(oid1));
         auto add_res = m.add_objects(
                           chunked_vector<metastore::object_metadata>::single(
                             std::move(ometa)),
@@ -184,6 +189,7 @@ TEST(SimpleMetastoreTest, TestAddWithOverlap) {
         auto ometa = om_builder(oid2, 100, 1100)
                        .add(tid_a, 10_o, 20_o, 2000_t, 0, 99)
                        .build();
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto add_res = m.add_objects(
                           chunked_vector<metastore::object_metadata>::single(
                             std::move(ometa)),
@@ -197,6 +203,7 @@ TEST(SimpleMetastoreTest, TestAddWithOverlap) {
         auto ometa = om_builder(oid3, 100, 1100)
                        .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                        .build();
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
         auto add_res = m.add_objects(
                           om_list_t::single(std::move(ometa)),
                           terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -212,6 +219,7 @@ TEST(SimpleMetastoreTest, TestAddPastBeginning) {
     auto ometa = om_builder(oid1, 100, 1100)
                    .add(tid_a, 1_o, 10_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -231,6 +239,13 @@ TEST(SimpleMetastoreTest, TestAddGetOffsetBasic) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 21_o, 30_o, 2000_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -271,6 +286,7 @@ TEST(SimpleMetastoreTest, TestAddGetOffsetBelowStart) {
     auto ometa = om_builder(oid1, 100, 1100)
                    .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -294,6 +310,7 @@ TEST(SimpleMetastoreTest, TestAddGetOffsetOutOfRange) {
     auto ometa = om_builder(oid1, 100, 1100)
                    .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -319,6 +336,13 @@ TEST(SimpleMetastoreTest, TestAddGetTimestampBasic) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 21_o, 30_o, 3999_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -359,6 +383,7 @@ TEST(SimpleMetastoreTest, TestAddGetTimestampBelowStart) {
     auto ometa = om_builder(oid1, 100, 1100)
                    .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -377,6 +402,7 @@ TEST(SimpleMetastoreTest, TestAddGetTimestampOutOfRange) {
     auto ometa = om_builder(oid1, 100, 1100)
                    .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder().add(tid_a, 0_tm, 0_o).build())
@@ -399,6 +425,12 @@ TEST(SimpleMetastoreTest, TestAddGetTimestampCustomStart) {
     ometas.push_back(om_builder(oid2, 100, 1100)
                        .add(tid_a, 11_o, 20_o, 1000_t, 0, 99)
                        .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        m.preregister_objects(ids);
+    }
     auto add_res = m.add_objects(
                       ometas, terms_builder().add(tid_a, 0_tm, 0_o).build())
                      .get();
@@ -432,6 +464,7 @@ TEST(StateUpdateTest, TestReplaceBasic) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -440,7 +473,8 @@ TEST(StateUpdateTest, TestReplaceBasic) {
     om_list_t new_os;
     new_os.emplace_back(
       om_builder(oid2, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
-    auto replace_res = m.replace_objects(new_os).get();
+    m.preregister_objects(chunked_vector<object_id>::single(oid2));
+    auto replace_res = m.replace_objects(new_os, make_epoch_map(new_os)).get();
     ASSERT_TRUE(replace_res.has_value());
 
     // Sanity check that replacement leaves us with expected offsets.
@@ -462,6 +496,12 @@ TEST(StateUpdateTest, TestReplaceMultipleOnePartition) {
                       .add(tid_a, 11_o, 20_o, 2000_t, 0, 99)
                       .add(tid_b, 11_o, 20_o, 2000_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(
            os,
@@ -472,7 +512,8 @@ TEST(StateUpdateTest, TestReplaceMultipleOnePartition) {
     om_list_t new_os;
     new_os.emplace_back(
       om_builder(oid3, 100, 1100).add(tid_a, 0_o, 20_o, 2000_t, 0, 99).build());
-    auto replace_res = m.replace_objects(new_os).get();
+    m.preregister_objects(chunked_vector<object_id>::single(oid3));
+    auto replace_res = m.replace_objects(new_os, make_epoch_map(new_os)).get();
     ASSERT_TRUE(replace_res.has_value());
 
     // Replaced offsets should be served from oid3.
@@ -527,6 +568,12 @@ TEST(StateUpdateTest, TestReplaceMultipleMultiplePartitions) {
                       .add(tid_a, 11_o, 20_o, 2000_t, 0, 99)
                       .add(tid_b, 11_o, 20_o, 2000_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(
            os,
@@ -542,7 +589,8 @@ TEST(StateUpdateTest, TestReplaceMultipleMultiplePartitions) {
                           .add(tid_a, 0_o, 20_o, 2000_t, 0, 99)
                           .add(tid_b, 11_o, 20_o, 2000_t, 0, 99)
                           .build());
-    auto replace_res = m.replace_objects(new_os).get();
+    m.preregister_objects(chunked_vector<object_id>::single(oid3));
+    auto replace_res = m.replace_objects(new_os, make_epoch_map(new_os)).get();
     ASSERT_TRUE(replace_res.has_value());
 
     // Replaced offsets should be served from oid3.
@@ -591,13 +639,14 @@ TEST(StateUpdateTest, TestReplaceEmptyRequest) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
 
     // Add a replacement object that has no objects.
     om_list_t new_os;
-    auto replace_res = m.replace_objects(new_os).get();
+    auto replace_res = m.replace_objects(new_os, make_epoch_map(new_os)).get();
     ASSERT_FALSE(replace_res.has_value());
     EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
 }
@@ -607,7 +656,8 @@ TEST(StateUpdateTest, TestReplaceEmptyState) {
     {
         // Add a replacement object that has no objects.
         om_list_t new_os;
-        auto replace_res = m.replace_objects(new_os).get();
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -617,7 +667,9 @@ TEST(StateUpdateTest, TestReplaceEmptyState) {
         new_os.emplace_back(om_builder(oid1, 100, 1100)
                               .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                               .build());
-        auto replace_res = m.replace_objects(new_os).get();
+        m.preregister_objects(chunked_vector<object_id>::single(oid1));
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -628,6 +680,7 @@ TEST(StateUpdateTest, TestReplaceMisaligned) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -639,7 +692,9 @@ TEST(StateUpdateTest, TestReplaceMisaligned) {
         new_os.emplace_back(om_builder(oid2, 100, 1100)
                               .add(tid_a, base_o, last_o, 2000_t, 0, 99)
                               .build());
-        auto replace_res = m.replace_objects(new_os).get();
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -650,6 +705,7 @@ TEST(StateUpdateTest, TestReplaceOneWithMultipleMisaligned) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -662,7 +718,9 @@ TEST(StateUpdateTest, TestReplaceOneWithMultipleMisaligned) {
                               .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                               .add(tid_a, 11_o, 12_o, 2000_t, 0, 99)
                               .build());
-        auto replace_res = m.replace_objects(new_os).get();
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -673,7 +731,9 @@ TEST(StateUpdateTest, TestReplaceOneWithMultipleMisaligned) {
                               .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                               .add(tid_b, 0_o, 10_o, 2000_t, 0, 99)
                               .build());
-        auto replace_res = m.replace_objects(new_os).get();
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -690,6 +750,12 @@ TEST(StateUpdateTest, TestReplaceMultipleMisaligned) {
                       .add(tid_a, 11_o, 20_o, 2000_t, 0, 99)
                       .add(tid_b, 11_o, 20_o, 2000_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(
            os,
@@ -702,7 +768,9 @@ TEST(StateUpdateTest, TestReplaceMultipleMisaligned) {
         new_os.emplace_back(om_builder(oid3, 100, 1100)
                               .add(tid_a, 0_o, 19_o, 2000_t, 0, 99)
                               .build());
-        auto replace_res = m.replace_objects(new_os).get();
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -713,7 +781,9 @@ TEST(StateUpdateTest, TestReplaceMultipleMisaligned) {
                               .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                               .add(tid_b, 0_o, 19_o, 2000_t, 0, 99)
                               .build());
-        auto replace_res = m.replace_objects(new_os).get();
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
+        auto replace_res
+          = m.replace_objects(new_os, make_epoch_map(new_os)).get();
         ASSERT_FALSE(replace_res.has_value());
         EXPECT_EQ(replace_res.error(), metastore::errc::invalid_request);
     }
@@ -724,6 +794,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsMissingPartition) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_b, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_b, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -743,6 +814,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsAllDirty) {
                       .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
                       .add(tid_b, 0_o, 10_o, 2000_t, 0, 99)
                       .build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(
            os,
@@ -765,6 +837,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsets) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -779,6 +852,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsets) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 3_o, 5_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -825,6 +899,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsets) {
         cmb.clean(tid_a, 0_o, 2_o);
         cmb.remove_tombstones(tid_a, 3_o, 4_o);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{1});
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -850,6 +925,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsets) {
         cmb.clean(tid_a, 6_o, 10_o);
         cmb.remove_tombstones(tid_a, 5_o, 5_o);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{2});
+        m.preregister_objects(chunked_vector<object_id>::single(oid4));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -867,6 +943,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsNoTombstones) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -881,6 +958,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsNoTombstones) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 3_o, 5_o);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -925,6 +1003,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsNoTombstones) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 0_o, 2_o);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{1});
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -948,6 +1027,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsNoTombstones) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 6_o, 10_o);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{2});
+        m.preregister_objects(chunked_vector<object_id>::single(oid4));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -966,16 +1046,16 @@ TEST(SimpleMetastoreTest, TestObjectBuilder) {
     auto tp_a = model::topic_id_partition::from(tid_a);
 
     // Creating objects for the same partition will result in the same object.
-    auto o_a = ob->get_or_create_object_for(tp_a).value();
-    auto o_a_2 = ob->get_or_create_object_for(tp_a).value();
+    auto o_a = ob->get_or_create_object_for(tp_a).get().value();
+    auto o_a_2 = ob->get_or_create_object_for(tp_a).get().value();
     ASSERT_EQ(o_a, o_a_2);
 
     // Creating objects for different partitions will result in the same
     // object.
     auto tp_b = model::topic_id_partition::from(tid_b);
-    auto o_b = ob->get_or_create_object_for(tp_b).value();
+    auto o_b = ob->get_or_create_object_for(tp_b).get().value();
     ASSERT_EQ(o_a, o_b);
-    auto o_b_2 = ob->get_or_create_object_for(tp_b).value();
+    auto o_b_2 = ob->get_or_create_object_for(tp_b).get().value();
     ASSERT_EQ(o_b, o_b_2);
 
     // Add a partition's metadata to the object.
@@ -984,7 +1064,7 @@ TEST(SimpleMetastoreTest, TestObjectBuilder) {
     // Finish the current object. The next object will be different.
     ASSERT_TRUE(ob->finish(o_a, 0, 1000).has_value());
 
-    auto o_a_3 = ob->get_or_create_object_for(tp_a).value();
+    auto o_a_3 = ob->get_or_create_object_for(tp_a).get().value();
     ASSERT_NE(o_a_2, o_a_3);
 
     // We can't release the result until we finish all objects.
@@ -1009,12 +1089,45 @@ TEST(SimpleMetastoreTest, TestObjectBuilderCreatesNewObjects) {
     // Creating objects for the same partition will result in a different object
     // everytime.
     for (size_t i = 0; i < num_objects; ++i) {
-        auto oid_opt = ob->create_object_for(tp);
+        auto oid_opt = ob->create_object_for(tp).get();
         ASSERT_TRUE(oid_opt.has_value());
         auto [_, inserted] = oids.insert(oid_opt.value());
         ASSERT_TRUE(inserted);
     }
     ASSERT_EQ(oids.size(), num_objects);
+}
+
+TEST(SimpleMetastoreTest, TestObjectBuilderRejectsInvertedExtent) {
+    simple_metastore m;
+    auto ob = m.object_builder().get().value();
+    auto tp = model::topic_id_partition::from(tid_a);
+    auto oid = ob->create_object_for(tp).get().value();
+
+    // base_offset > last_offset should be rejected.
+    auto res = ob->add(
+      oid,
+      metastore::object_metadata::ntp_metadata{
+        .tidp = tp,
+        .base_offset = 10_o,
+        .last_offset = 5_o,
+        .max_timestamp = 1000_t,
+        .pos = 0,
+        .size = 100,
+      });
+    EXPECT_FALSE(res.has_value());
+
+    // A valid extent should still be accepted.
+    auto res2 = ob->add(
+      oid,
+      metastore::object_metadata::ntp_metadata{
+        .tidp = tp,
+        .base_offset = 0_o,
+        .last_offset = 10_o,
+        .max_timestamp = 1000_t,
+        .pos = 0,
+        .size = 100,
+      });
+    EXPECT_TRUE(res2.has_value());
 }
 
 TEST(SimpleMetastoreTest, TestObjectBuilderBadObjects) {
@@ -1044,6 +1157,7 @@ TEST(SimpleMetastoreTest, TestObjectBuilderRemovedObjects) {
           ->get_or_create_object_for(
             model::topic_id_partition(
               topic_id, model::partition_id(static_cast<int32_t>(0))))
+          .get()
           .value();
     };
 
@@ -1079,7 +1193,7 @@ TEST(SimpleMetastoreTest, TestUpdateWithObjectBuilder) {
     auto tp_a = model::topic_id_partition::from(tid_a);
     {
         auto ob = m.object_builder().get().value();
-        auto o_a = ob->get_or_create_object_for(tp_a).value();
+        auto o_a = ob->get_or_create_object_for(tp_a).get().value();
         auto add_res = ob->add(
           o_a,
           metastore::object_metadata::ntp_metadata{
@@ -1105,7 +1219,7 @@ TEST(SimpleMetastoreTest, TestUpdateWithObjectBuilder) {
     }
     {
         auto ob = m.object_builder().get().value();
-        auto o_a = ob->get_or_create_object_for(tp_a).value();
+        auto o_a = ob->get_or_create_object_for(tp_a).get().value();
         auto add_res = ob->add(
           o_a,
           metastore::object_metadata::ntp_metadata{
@@ -1131,7 +1245,7 @@ TEST(SimpleMetastoreTest, TestUpdateWithObjectBuilder) {
     }
     {
         auto ob = m.object_builder().get().value();
-        auto o_a = ob->get_or_create_object_for(tp_a).value();
+        auto o_a = ob->get_or_create_object_for(tp_a).get().value();
         auto add_res = ob->add(
           o_a,
           metastore::object_metadata::ntp_metadata{
@@ -1145,7 +1259,9 @@ TEST(SimpleMetastoreTest, TestUpdateWithObjectBuilder) {
         ASSERT_TRUE(add_res.has_value());
         auto fin_res = ob->finish(o_a, 0, 1000);
         ASSERT_TRUE(fin_res.has_value());
-        auto replace_obj_res = m.replace_objects(*ob).get();
+        metastore::replace_epoch_map_t replace_epochs;
+        replace_epochs[tp_a] = metastore::compaction_epoch{0};
+        auto replace_obj_res = m.replace_objects(*ob, replace_epochs).get();
         ASSERT_TRUE(replace_obj_res.has_value());
 
         auto offsets_res = m.get_offsets(tp_a).get();
@@ -1155,7 +1271,7 @@ TEST(SimpleMetastoreTest, TestUpdateWithObjectBuilder) {
     }
     {
         auto ob = m.object_builder().get().value();
-        auto o_a = ob->get_or_create_object_for(tp_a).value();
+        auto o_a = ob->get_or_create_object_for(tp_a).get().value();
         auto add_res = ob->add(
           o_a,
           metastore::object_metadata::ntp_metadata{
@@ -1193,6 +1309,7 @@ TEST(SimpleMetastoreState, TestInvalidTermRequest) {
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
     // Make the term misaligned with the extent.
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       os, terms_builder().add(tid_a, 0_tm, 1337_o).build())
                      .get();
@@ -1205,6 +1322,7 @@ TEST(SimpleMetastoreTest, TestEndOffsetForEpoch) {
     auto ometa = om_builder(oid1, 200, 1200)
                    .add(tid_a, 0_o, 20_o, 2000_t, 0, 99)
                    .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder()
@@ -1260,6 +1378,7 @@ TEST(SimpleMetastoreTest, TestEpochForOffset) {
     simple_metastore m;
     auto ometa
       = om_builder(oid1, 200, 1200).add(tid_a, 0_o, 9_o, 2000_t, 0, 99).build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder()
@@ -1321,6 +1440,13 @@ TEST(SimpleMetastoreTest, TestSetStartAlignedWithExtent) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 21_o, 30_o, 2000_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1364,6 +1490,13 @@ TEST(SimpleMetastoreTest, TestSetStartNotAlignedWithExtent) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 21_o, 30_o, 2000_t, 0, 99)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1401,6 +1534,7 @@ TEST(SimpleMetastoreTest, TestSetStartEmptyWithTerms) {
     simple_metastore m;
     auto ometa
       = om_builder(oid1, 100, 1100).add(tid_a, 0_o, 9_o, 2000_t, 0, 99).build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res = m.add_objects(
                       om_list_t::single(std::move(ometa)),
                       terms_builder()
@@ -1441,6 +1575,7 @@ TEST(SimpleMetastoreTest, TestSetStartWithCompactionState) {
     om_list_t os;
     os.emplace_back(
       om_builder(oid1, 100, 1100).add(tid_a, 0_o, 20_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1455,6 +1590,7 @@ TEST(SimpleMetastoreTest, TestSetStartWithCompactionState) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 5_o, 15_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1509,6 +1645,12 @@ TEST(SimpleMetastoreTest, TestDirtyRatio) {
       om_builder(oid1, 100, 10).add(tid_a, 0_o, 9_o, 1000_t, 0, 99).build());
     os.emplace_back(
       om_builder(oid2, 100, 10).add(tid_a, 10_o, 19_o, 2000_t, 0, 99).build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1523,6 +1665,7 @@ TEST(SimpleMetastoreTest, TestDirtyRatio) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 0_o, 5_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1544,6 +1687,7 @@ TEST(SimpleMetastoreTest, TestDirtyRatio) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 6_o, 9_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{1});
+        m.preregister_objects(chunked_vector<object_id>::single(oid4));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1563,6 +1707,7 @@ TEST(SimpleMetastoreTest, TestDirtyRatio) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 10_o, 19_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{2});
+        m.preregister_objects(chunked_vector<object_id>::single(oid5));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1582,6 +1727,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsSingleDirtyAtEnd) {
     os.emplace_back(om_builder(oid1, 100, 1010)
                       .add(tid_a, 0_o, 100_o, 1000_t, 0, 1009)
                       .build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1597,6 +1743,7 @@ TEST(SimpleMetastoreTest, TestCompactionOffsetsSingleDirtyAtEnd) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 0_o, 99_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1632,6 +1779,13 @@ TEST(
       om_builder(oid2, 100, 1100).add(tid_a, 10_o, 19_o, 300_t, 0, 99).build());
     os.emplace_back(
       om_builder(oid3, 100, 1100).add(tid_a, 20_o, 29_o, 500_t, 0, 99).build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1655,6 +1809,7 @@ TEST(
         auto cmb = cm_builder();
         cmb.clean(tid_a, 0_o, 9_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid4));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1674,6 +1829,7 @@ TEST(
         auto cmb = cm_builder();
         cmb.clean(tid_a, 10_o, 19_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{1});
+        m.preregister_objects(chunked_vector<object_id>::single(oid5));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1701,6 +1857,13 @@ TEST(
       om_builder(oid2, 100, 1100).add(tid_a, 10_o, 19_o, 500_t, 0, 99).build());
     os.emplace_back(
       om_builder(oid3, 100, 1100).add(tid_a, 20_o, 29_o, 300_t, 0, 99).build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1724,6 +1887,7 @@ TEST(
         auto cmb = cm_builder();
         cmb.clean(tid_a, 0_o, 9_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid4));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1743,6 +1907,7 @@ TEST(
         auto cmb = cm_builder();
         cmb.clean(tid_a, 20_o, 29_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{1});
+        m.preregister_objects(chunked_vector<object_id>::single(oid5));
         auto compact_res = m.compact_objects(new_os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1766,6 +1931,13 @@ TEST(SimpleMetastoreTest, TestAddGetOffsetAfterBytes) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 21_o, 30_o, 2000_t, 0, data_size)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1796,6 +1968,7 @@ TEST(SimpleMetastoreTest, TestCompactionMultipleDirtyRangesMadeClean) {
         os.emplace_back(om_builder(oid1, 100, 1100)
                           .add(tid_a, 0_o, 20_o, 2000_t, 0, 99)
                           .build());
+        m.preregister_objects(chunked_vector<object_id>::single(oid1));
         auto add_res = m.add_objects(
                           os, terms_builder().add(tid_a, 0_tm, 0_o).build())
                          .get();
@@ -1812,6 +1985,7 @@ TEST(SimpleMetastoreTest, TestCompactionMultipleDirtyRangesMadeClean) {
         auto cmb = cm_builder();
         cmb.clean(tid_a, 5_o, 15_o, 3000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+        m.preregister_objects(chunked_vector<object_id>::single(oid2));
         auto compact_res = m.compact_objects(os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1842,6 +2016,7 @@ TEST(SimpleMetastoreTest, TestCompactionMultipleDirtyRangesMadeClean) {
         cmb.clean(tid_a, 0_o, 4_o, 6000_t);
         cmb.clean(tid_a, 16_o, 20_o, 6000_t);
         cmb.set_expected_epoch(tid_a, metastore::compaction_epoch{1});
+        m.preregister_objects(chunked_vector<object_id>::single(oid3));
         auto compact_res = m.compact_objects(os, cmb.build()).get();
         ASSERT_TRUE(compact_res.has_value());
     }
@@ -1870,6 +2045,13 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 20_o, 29_o, 2000_t, 0, data_size)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -1881,7 +2063,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{9};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -1893,7 +2079,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{15};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -1906,7 +2096,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{19};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -1919,7 +2113,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{20};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -1934,7 +2132,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{100};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -1950,8 +2152,13 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
     {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{9};
-        auto extent_metadata_res
-          = m.get_extent_metadata_forwards(tp, min_offset, max_offset, 0).get();
+        auto extent_metadata_res = m.get_extent_metadata_forwards(
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      0,
+                                      metastore::include_object_metadata::no)
+                                     .get();
         // Requesting 0 extents still results in a single extent being returned.
         ASSERT_TRUE(extent_metadata_res.has_value());
         ASSERT_EQ(extent_metadata_res->extents.size(), 1);
@@ -1960,8 +2167,13 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
     {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{15};
-        auto extent_metadata_res
-          = m.get_extent_metadata_forwards(tp, min_offset, max_offset, 1).get();
+        auto extent_metadata_res = m.get_extent_metadata_forwards(
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      1,
+                                      metastore::include_object_metadata::no)
+                                     .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
           extent_metadata_res->extents,
@@ -1971,8 +2183,13 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
     {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{20};
-        auto extent_metadata_res
-          = m.get_extent_metadata_forwards(tp, min_offset, max_offset, 2).get();
+        auto extent_metadata_res = m.get_extent_metadata_forwards(
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      2,
+                                      metastore::include_object_metadata::no)
+                                     .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
           extent_metadata_res->extents,
@@ -1986,7 +2203,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{5};
         auto max_offset = kafka::offset{9};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -1998,7 +2219,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataForwards) {
         auto min_offset = kafka::offset{9};
         auto max_offset = kafka::offset{29};
         auto extent_metadata_res = m.get_extent_metadata_forwards(
-                                      tp, min_offset, max_offset, 10)
+                                      tp,
+                                      min_offset,
+                                      max_offset,
+                                      10,
+                                      metastore::include_object_metadata::no)
                                      .get();
         ASSERT_TRUE(extent_metadata_res.has_value());
         EXPECT_THAT(
@@ -2024,6 +2249,13 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataBackwards) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 20_o, 29_o, 2000_t, 0, data_size)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -2193,6 +2425,13 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataEmpty) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 20_o, 29_o, 2000_t, 0, data_size)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -2206,7 +2445,11 @@ TEST(SimpleMetastoreTest, TestGetExtentMetadataEmpty) {
         auto min_offset = kafka::offset{0};
         auto max_offset = kafka::offset{100};
         auto extent_metadata_ge_res = m.get_extent_metadata_forwards(
-                                         tp, min_offset, max_offset, 10)
+                                         tp,
+                                         min_offset,
+                                         max_offset,
+                                         10,
+                                         metastore::include_object_metadata::no)
                                         .get();
         ASSERT_TRUE(extent_metadata_ge_res.has_value());
         ASSERT_TRUE(extent_metadata_ge_res->extents.empty());
@@ -2247,6 +2490,13 @@ TEST(SimpleMetastoreTest, TestGetSizeBasic) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 20_o, 29_o, 2000_t, 0, data_size_3)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -2273,6 +2523,13 @@ TEST(SimpleMetastoreTest, TestGetSizeAfterSetStartOffset) {
     os.emplace_back(om_builder(oid3, 100, 1100)
                       .add(tid_a, 20_o, 29_o, 2000_t, 0, data_size_3)
                       .build());
+    {
+        chunked_vector<object_id> ids;
+        ids.push_back(oid1);
+        ids.push_back(oid2);
+        ids.push_back(oid3);
+        m.preregister_objects(ids);
+    }
     auto add_res
       = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
     ASSERT_TRUE(add_res.has_value());
@@ -2322,6 +2579,7 @@ TEST(SimpleMetastoreTest, TestGetSizeMultiplePartitions) {
                       .add(tid_a, 0_o, 9_o, 2000_t, 0, data_size_a)
                       .add(tid_b, 0_o, 9_o, 2000_t, 100, 100 + data_size_b)
                       .build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
     auto add_res
       = m.add_objects(
            os,
@@ -2340,3 +2598,351 @@ TEST(SimpleMetastoreTest, TestGetSizeMultiplePartitions) {
     ASSERT_TRUE(size_res_b.has_value());
     ASSERT_EQ(data_size_b, size_res_b->size);
 }
+
+TEST(SimpleMetastoreTest, TestGetExtentMetadataForwardsWithObjectMetadata) {
+    simple_metastore m;
+    om_list_t os;
+    os.emplace_back(
+      om_builder(oid1, 100, 1100).add(tid_a, 0_o, 9_o, 2000_t, 0, 500).build());
+    os.emplace_back(om_builder(oid2, 200, 2200)
+                      .add(tid_a, 10_o, 19_o, 3000_t, 0, 500)
+                      .build());
+    os.emplace_back(om_builder(oid3, 300, 3300)
+                      .add(tid_a, 20_o, 29_o, 4000_t, 0, 500)
+                      .build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
+    m.preregister_objects(chunked_vector<object_id>::single(oid2));
+    m.preregister_objects(chunked_vector<object_id>::single(oid3));
+    auto add_res
+      = m.add_objects(os, terms_builder().add(tid_a, 0_tm, 0_o).build()).get();
+    ASSERT_TRUE(add_res.has_value());
+
+    auto tp = model::topic_id_partition::from(tid_a);
+
+    // Without include_object_metadata, object_info should be nullopt.
+    {
+        auto res
+          = m.get_extent_metadata_forwards(
+               tp, 0_o, 100_o, 10, metastore::include_object_metadata::no)
+              .get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQ(res->extents.size(), 3);
+        EXPECT_FALSE(res->extents[0].object_info.has_value());
+        EXPECT_FALSE(res->extents[1].object_info.has_value());
+        EXPECT_FALSE(res->extents[2].object_info.has_value());
+    }
+
+    // With include_object_metadata, object_info should be populated from
+    // the object store.
+    {
+        auto res
+          = m.get_extent_metadata_forwards(
+               tp, 0_o, 100_o, 10, metastore::include_object_metadata::yes)
+              .get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQ(res->extents.size(), 3);
+
+        EXPECT_EQ(res->extents[0].base_offset, 0_o);
+        EXPECT_EQ(res->extents[0].last_offset, 9_o);
+        ASSERT_TRUE(res->extents[0].object_info.has_value());
+        EXPECT_EQ(res->extents[0].object_info->oid, oid1);
+        EXPECT_EQ(res->extents[0].object_info->footer_pos, 100);
+        EXPECT_EQ(res->extents[0].object_info->object_size, 1100);
+
+        EXPECT_EQ(res->extents[1].base_offset, 10_o);
+        EXPECT_EQ(res->extents[1].last_offset, 19_o);
+        ASSERT_TRUE(res->extents[1].object_info.has_value());
+        EXPECT_EQ(res->extents[1].object_info->oid, oid2);
+        EXPECT_EQ(res->extents[1].object_info->footer_pos, 200);
+        EXPECT_EQ(res->extents[1].object_info->object_size, 2200);
+
+        EXPECT_EQ(res->extents[2].base_offset, 20_o);
+        EXPECT_EQ(res->extents[2].last_offset, 29_o);
+        ASSERT_TRUE(res->extents[2].object_info.has_value());
+        EXPECT_EQ(res->extents[2].object_info->oid, oid3);
+        EXPECT_EQ(res->extents[2].object_info->footer_pos, 300);
+        EXPECT_EQ(res->extents[2].object_info->object_size, 3300);
+
+        EXPECT_TRUE(res->end_of_stream);
+    }
+
+    // With max_num_extents limit.
+    {
+        auto res
+          = m.get_extent_metadata_forwards(
+               tp, 0_o, 100_o, 2, metastore::include_object_metadata::yes)
+              .get();
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQ(res->extents.size(), 2);
+        ASSERT_TRUE(res->extents[0].object_info.has_value());
+        EXPECT_EQ(res->extents[0].object_info->oid, oid1);
+        ASSERT_TRUE(res->extents[1].object_info.has_value());
+        EXPECT_EQ(res->extents[1].object_info->oid, oid2);
+        EXPECT_FALSE(res->end_of_stream);
+    }
+}
+
+TEST(SimpleMetastoreTest, ReplaceObjectsRejectsEpoch) {
+    simple_metastore m;
+    auto tp = model::topic_id_partition::from(tid_a);
+
+    // Add an initial object.
+    auto ometa = om_builder(oid1, 100, 1100)
+                   .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
+                   .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
+    auto add_res = m.add_objects(
+                      om_list_t::single(std::move(ometa)),
+                      terms_builder().add(tid_a, 0_tm, 0_o).build())
+                     .get();
+    ASSERT_TRUE(add_res.has_value()) << int(add_res.error());
+
+    // Read the current epoch (should be 0 since no replace has happened).
+    auto info_res = m.get_compaction_info({
+                                            .tidp = tp,
+                                            .tombstone_removal_upper_bound_ts
+                                            = model::timestamp::min(),
+                                          })
+                      .get();
+    ASSERT_TRUE(info_res.has_value()) << int(info_res.error());
+    EXPECT_EQ(info_res->compaction_epoch, metastore::compaction_epoch{0});
+
+    // First replace with the correct epoch (0). Should succeed.
+    om_list_t new_os1;
+    new_os1.emplace_back(
+      om_builder(oid2, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid2));
+    metastore::replace_epoch_map_t epochs1;
+    epochs1[tp] = metastore::compaction_epoch{0};
+    auto replace1 = m.replace_objects(new_os1, epochs1).get();
+    ASSERT_TRUE(replace1.has_value()) << int(replace1.error());
+
+    // Epoch should still be 0, since replace_objects() does not bump the epoch.
+    info_res = m
+                 .get_compaction_info({
+                   .tidp = tp,
+                   .tombstone_removal_upper_bound_ts = model::timestamp::min(),
+                 })
+                 .get();
+    ASSERT_TRUE(info_res.has_value());
+    EXPECT_EQ(info_res->compaction_epoch, metastore::compaction_epoch{0});
+
+    // Replace again with incorrect epoch (1). Should fail.
+    om_list_t new_os2;
+    new_os2.emplace_back(
+      om_builder(oid3, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid3));
+    metastore::replace_epoch_map_t incorrect_epochs;
+    incorrect_epochs[tp] = metastore::compaction_epoch{1};
+    auto replace2 = m.replace_objects(new_os2, incorrect_epochs).get();
+    ASSERT_FALSE(replace2.has_value());
+    EXPECT_EQ(replace2.error(), metastore::errc::invalid_request);
+}
+
+TEST(SimpleMetastoreTest, CompactObjectsBumpsEpochAndRejectsStale) {
+    simple_metastore m;
+    auto tp = model::topic_id_partition::from(tid_a);
+
+    // Add an initial object.
+    auto ometa = om_builder(oid1, 100, 1100)
+                   .add(tid_a, 0_o, 10_o, 2000_t, 0, 99)
+                   .build();
+    m.preregister_objects(chunked_vector<object_id>::single(oid1));
+    auto add_res = m.add_objects(
+                      om_list_t::single(std::move(ometa)),
+                      terms_builder().add(tid_a, 0_tm, 0_o).build())
+                     .get();
+    ASSERT_TRUE(add_res.has_value()) << int(add_res.error());
+
+    // Read the current epoch (should be 0).
+    auto info_res = m.get_compaction_info({
+                                            .tidp = tp,
+                                            .tombstone_removal_upper_bound_ts
+                                            = model::timestamp::min(),
+                                          })
+                      .get();
+    ASSERT_TRUE(info_res.has_value()) << int(info_res.error());
+    EXPECT_EQ(info_res->compaction_epoch, metastore::compaction_epoch{0});
+
+    // First compact with the correct epoch (0). Should succeed.
+    om_list_t new_os1;
+    new_os1.emplace_back(
+      om_builder(oid2, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid2));
+    auto cmb1 = cm_builder();
+    cmb1.clean(tid_a, 3_o, 5_o, 3000_t);
+    cmb1.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+    auto compact1 = m.compact_objects(new_os1, cmb1.build()).get();
+    ASSERT_TRUE(compact1.has_value()) << int(compact1.error());
+
+    // Epoch should now be 1.
+    info_res = m
+                 .get_compaction_info({
+                   .tidp = tp,
+                   .tombstone_removal_upper_bound_ts = model::timestamp::min(),
+                 })
+                 .get();
+    ASSERT_TRUE(info_res.has_value());
+    EXPECT_EQ(info_res->compaction_epoch, metastore::compaction_epoch{1});
+
+    // Second compact with the stale epoch (0). Should fail.
+    om_list_t new_os2;
+    new_os2.emplace_back(
+      om_builder(oid3, 100, 1100).add(tid_a, 0_o, 10_o, 2000_t, 0, 99).build());
+    m.preregister_objects(chunked_vector<object_id>::single(oid3));
+    auto cmb2 = cm_builder();
+    cmb2.clean(tid_a, 6_o, 8_o, 3000_t);
+    cmb2.set_expected_epoch(tid_a, metastore::compaction_epoch{0});
+    auto compact2 = m.compact_objects(new_os2, cmb2.build()).get();
+    ASSERT_FALSE(compact2.has_value());
+    EXPECT_EQ(compact2.error(), metastore::errc::invalid_request);
+}
+
+namespace {
+
+// A scenario for the leveling-range algorithm. Each entry in
+// `object_sizes` becomes one extent under `tid_a` covering 10 offsets
+// (so extent `i` covers offsets [i*10, i*10+9]) and `object_sizes[i]`
+// bytes, backed by a distinct object of size `object_sizes[i]`. The
+// algorithm runs against this layout and the response's `ranges` is
+// asserted to equal `expected_ranges`.
+struct leveling_case {
+    std::string name;
+    std::vector<size_t> object_sizes;
+    size_t min_acceptable;
+    std::vector<levelable_range> expected_ranges;
+};
+
+class SimpleMetastoreLevelingAlgoTest
+  : public ::testing::TestWithParam<leveling_case> {};
+
+} // namespace
+
+TEST_P(SimpleMetastoreLevelingAlgoTest, ComputesExpectedRanges) {
+    const auto& c = GetParam();
+    simple_metastore m;
+
+    om_list_t objects;
+    chunked_vector<object_id> oids;
+    for (size_t i = 0; i < c.object_sizes.size(); ++i) {
+        const auto oid = l1::create_object_id();
+        oids.push_back(oid);
+        const auto base = kafka::offset(static_cast<int64_t>(i * 10));
+        const auto last = kafka::offset(static_cast<int64_t>(i * 10 + 9));
+        const auto ts = model::timestamp(static_cast<int64_t>((i + 1) * 100));
+        objects.push_back(om_builder(oid, 0, c.object_sizes[i])
+                            .add(tid_a, base, last, ts, 0, c.object_sizes[i])
+                            .build());
+    }
+    m.preregister_objects(oids);
+    auto add_res = m.add_objects(
+                      objects, terms_builder().add(tid_a, 0_tm, 0_o).build())
+                     .get();
+    ASSERT_TRUE(add_res.has_value()) << int(add_res.error());
+
+    const auto tp = model::topic_id_partition::from(tid_a);
+    chunked_vector<metastore::leveling_info_spec> specs;
+    specs.push_back(
+      {.tidp = tp, .min_acceptable_extent_bytes = c.min_acceptable});
+    auto infos_res = m.get_leveling_infos(specs).get();
+    ASSERT_TRUE(infos_res.has_value()) << int(infos_res.error());
+    auto it = infos_res->find(tp);
+    ASSERT_NE(it, infos_res->end());
+    ASSERT_TRUE(it->second.has_value()) << int(it->second.error());
+    const auto& res = it->second.value();
+
+    EXPECT_THAT(res.ranges, ::testing::ElementsAreArray(c.expected_ranges));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  Cases,
+  SimpleMetastoreLevelingAlgoTest,
+  ::testing::Values(
+    // No undersized extents, nothing to level.
+    leveling_case{
+      .name = "NoUndersizedExtents",
+      .object_sizes = {100, 100, 100},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // Small extents sandwiched between healthy ones.
+    // Two undersized runs, with a singleton at obj 1 (discarded, K=1) and
+    // an adjacent pair at objs 3->4 (committed, K=2). The healthy
+    // obj 2 closes the first run; the trailing healthy obj 5 closes
+    // the second.
+    leveling_case{
+      .name = "SmallSandwichedBetweenLarge",
+      .object_sizes = {100, 2, 100, 15, 2, 100},
+      .min_acceptable = 50,
+      .expected_ranges
+      = {{.base_offset = 30_o, .last_offset = 49_o, .size_bytes = 17}},
+    },
+    // A single isolated small surrounded by healthies, a K=1 singleton
+    // run that finalize() discards on close.
+    leveling_case{
+      .name = "IsolatedSmallSingleton",
+      .object_sizes = {100, 2, 100},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // A small followed by a long healthy run. The first healthy closes
+    // the K=1 singleton run, which is discarded; the rest are no-ops.
+    leveling_case{
+      .name = "SmallFollowedByManyHealthy",
+      .object_sizes = {100, 2, 100, 100, 100, 100},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // Two smalls separated by two healthies. Pure size-tier never
+    // bridges across a healthy, so each small is a K=1 singleton run
+    // and neither commits.
+    leveling_case{
+      .name = "TwoSmallsSeparatedByHealthies",
+      .object_sizes = {100, 2, 100, 100, 2, 100},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // All extents undersized. Rewrites cleanly into a single 6-byte
+    // object, 3 extents become 1, saving 2.
+    leveling_case{
+      .name = "AllSmall",
+      .object_sizes = {2, 2, 2},
+      .min_acceptable = 50,
+      .expected_ranges
+      = {{.base_offset = 0_o, .last_offset = 29_o, .size_bytes = 6}},
+    },
+    // Leading healthies are no-ops (no active range to close). Range
+    // opens at obj 2, extends to obj 3, and closes on the trailing
+    // healthy at obj 4. K=2, commits objs 2->3 (4 bytes).
+    leveling_case{
+      .name = "LeadingHealthyExtentsUntouched",
+      .object_sizes = {100, 100, 2, 2, 100},
+      .min_acceptable = 50,
+      .expected_ranges
+      = {{.base_offset = 20_o, .last_offset = 39_o, .size_bytes = 4}},
+    },
+    // Smalls separated by a healthy: pure size-tier never bridges
+    // across a healthy, so each small is its own K=1 singleton run and
+    // neither commits.
+    leveling_case{
+      .name = "SmallsAcrossHealthyAreNotMerged",
+      .object_sizes = {100, 30, 100, 30, 100},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // A single leading small followed by healthies. The first healthy
+    // closes the K=1 singleton run, which is then discarded.
+    leveling_case{
+      .name = "LeadingSmallSingleton",
+      .object_sizes = {2, 100, 100},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // Threshold below ALL object sizes, nothing eligible.
+    leveling_case{
+      .name = "ThresholdBelowAllSizes",
+      .object_sizes = {200, 200, 200},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    }),
+  [](const auto& info) { return info.param.name; });

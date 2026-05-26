@@ -235,6 +235,15 @@ public:
         return clamp_and_update(val);
     }
 
+    bool set_pending_value(YAML::Node n) override {
+        auto val = std::move(n.as<T>());
+        return clamp_and_update_pending(val);
+    }
+
+    void set_pending_value(std::any v) override {
+        property<T>::update_pending_value(std::any_cast<T>(std::move(v)));
+    }
+
     std::optional<std::string_view> example() const override {
         if (!_example.empty()) {
             return _example;
@@ -274,6 +283,21 @@ private:
         }
     }
 
+    bool clamp_and_update_pending(T val) {
+        using outer_type = std::decay_t<T>;
+        if constexpr (reflection::is_std_optional<outer_type>) {
+            if (val.has_value()) {
+                return property<T>::update_pending_value(
+                  std::move(clamp_with_bounds(val.value())));
+            } else {
+                return property<T>::update_pending_value(std::move(val));
+            }
+        } else {
+            return property<T>::update_pending_value(
+              std::move(clamp_with_bounds(val)));
+        }
+    }
+
     /*
      * Pre-generate an example for docs/api, if the explicit property
      * metadata does not provide one.
@@ -309,8 +333,8 @@ private:
             }
         }
 
-        if constexpr (::detail::
-                        is_specialization_of_v<I, std::chrono::duration>) {
+        if constexpr (
+          ::detail::is_specialization_of_v<I, std::chrono::duration>) {
             return fmt::format("{}", guess.count());
         } else if constexpr (std::is_arithmetic_v<I>) {
             return fmt::format("{}", guess);

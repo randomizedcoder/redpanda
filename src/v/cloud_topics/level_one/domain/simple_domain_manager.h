@@ -36,6 +36,9 @@ public:
     ss::future<rpc::replace_objects_reply>
       replace_objects(rpc::replace_objects_request) override;
 
+    ss::future<rpc::compact_objects_reply>
+      compact_objects(rpc::compact_objects_request) override;
+
     ss::future<rpc::get_first_offset_ge_reply>
       get_first_offset_ge(rpc::get_first_offset_ge_request) override;
 
@@ -69,6 +72,9 @@ public:
     ss::future<rpc::get_compaction_infos_reply>
       get_compaction_infos(rpc::get_compaction_infos_request) override;
 
+    ss::future<rpc::get_leveling_infos_reply>
+      get_leveling_infos(rpc::get_leveling_infos_request) override;
+
     ss::future<rpc::get_extent_metadata_reply>
       get_extent_metadata(rpc::get_extent_metadata_request) override;
 
@@ -81,12 +87,31 @@ public:
     ss::future<std::expected<database_stats, rpc::errc>>
     get_database_stats() override;
 
+    ss::future<rpc::preregister_objects_reply>
+      preregister_objects(rpc::preregister_objects_request) override;
+
+    ss::future<std::expected<void, rpc::errc>>
+      write_debug_rows(chunked_vector<write_batch_row>) override;
+
+    ss::future<std::expected<read_debug_rows_result, rpc::errc>>
+    read_debug_rows(
+      std::optional<ss::sstring> seek_key,
+      std::optional<ss::sstring> last_key,
+      uint32_t max_rows) override;
+
+    ss::future<
+      std::expected<partition_validation_result, partition_validator::error>>
+      validate_partition(validate_partition_options) override;
+
 private:
     std::optional<ss::gate::holder> maybe_gate();
     ss::future<> gc_loop();
 
     rpc::get_compaction_info_reply
     do_get_compaction_info(const state&, rpc::get_compaction_info_request);
+
+    rpc::get_leveling_info_reply
+    do_get_leveling_info(const state&, rpc::get_leveling_info_request);
 
     config::binding<std::chrono::milliseconds> gc_interval_;
     // This semaphore is used as a way to signal a change to

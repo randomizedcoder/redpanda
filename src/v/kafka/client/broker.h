@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "kafka/client/api_types.h"
 #include "kafka/client/configuration.h"
 #include "kafka/client/exceptions.h"
@@ -31,12 +32,10 @@ struct api_version_range {
 
     bool is_supported(api_version v) const { return v >= min && v <= max; }
 
-    friend std::ostream&
-    operator<<(std::ostream& os, const api_version_range& r);
+    fmt::iterator format_to(fmt::iterator it) const;
 
-    friend bool
-    operator==(const api_version_range& lhs, const api_version_range& rhs)
-      = default;
+    friend bool operator==(
+      const api_version_range& lhs, const api_version_range& rhs) = default;
 };
 /**
  * Broker interface that defines the methods required for a Kafka broker
@@ -63,8 +62,8 @@ public:
      */
     virtual ss::future<std::optional<api_version_range>> get_supported_versions(
       api_key key,
-      std::optional<std::reference_wrapper<ss::abort_source>> = std::nullopt)
-      = 0;
+      std::optional<std::reference_wrapper<ss::abort_source>>
+      = std::nullopt) = 0;
 
     virtual const net::unresolved_address& get_address() const = 0;
 };

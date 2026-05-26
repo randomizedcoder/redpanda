@@ -44,13 +44,9 @@
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include <seastar/util/backtrace.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/noncopyable_function.hh>
-#include <seastar/util/optimized_optional.hh>
-
-#include <fmt/ostream.h>
 
 #include <algorithm>
 #include <alloca.h>
@@ -59,7 +55,6 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <pthread.h>
 #include <unistd.h>
 #include <utility>
 #include <variant>
@@ -768,8 +763,8 @@ private:
           wasi::preview_1_start_function_name.size(),
           &start);
         if (!ok || start.kind != WASMTIME_EXTERN_FUNC) {
-            throw wasm_exception(
-              "Missing wasi _start function", errc::user_code_failure);
+            co_await ss::coroutine::return_exception(wasm_exception(
+              "Missing wasi _start function", errc::user_code_failure));
         }
         vlog(wasm_log.info, "starting wasm vm {}", _meta.name());
         std::exception_ptr ex;
@@ -1319,12 +1314,6 @@ wasmtime_runtime::wasmtime_runtime(std::unique_ptr<schema::registry> sr)
     // off, otherwise we'd want to turn this off (it's on by default).
     // wasmtime_config_parallel_compilation_set(config, false);
 
-    // Let wasmtime do the stack switching so we can run async host
-    // functions and allow running out of fuel to pause the runtime.
-    //
-    // See the documentation for more information:
-    // https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#asynchronous-wasm
-    wasmtime_config_async_support_set(config, true);
     // Set max stack size to generally be as big as a contiguous memory
     // region we're willing to allocate in Redpanda.
     wasmtime_config_async_stack_size_set(config, vm_stack_size);

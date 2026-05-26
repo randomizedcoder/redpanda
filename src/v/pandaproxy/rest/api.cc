@@ -9,13 +9,14 @@
 
 #include "pandaproxy/rest/api.h"
 
+#include "datalake/coordinator/frontend.h"
 #include "kafka/client/configuration.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/rest/configuration.h"
 #include "pandaproxy/rest/fwd.h"
 #include "pandaproxy/rest/proxy.h"
 
-#include <seastar/core/coroutine.hh>
+#include <seastar/core/coroutine.hh> // NOLINT(misc-include-cleaner): required for co_await/co_return coroutine support
 
 #include <functional>
 
@@ -25,12 +26,14 @@ api::api(
   size_t max_memory,
   kafka::client::configuration& client_cfg,
   configuration& cfg,
-  cluster::controller* c) noexcept
+  cluster::controller* c,
+  ss::sharded<datalake::coordinator::frontend>& dl_frontend) noexcept
   : _sg{sg}
   , _max_memory{max_memory}
   , _client_cfg{client_cfg}
   , _cfg{cfg}
-  , _controller(c) {}
+  , _controller(c)
+  , _dl_frontend(dl_frontend) {}
 
 api::~api() noexcept = default;
 
@@ -54,7 +57,8 @@ ss::future<> api::start() {
       _max_memory,
       std::ref(_client),
       std::ref(_client_cache),
-      _controller);
+      _controller,
+      std::ref(_dl_frontend));
 
     co_await _proxy.invoke_on_all(&proxy::start);
 }

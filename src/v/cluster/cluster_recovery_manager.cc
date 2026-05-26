@@ -15,15 +15,13 @@
 #include "cluster/cloud_metadata/error_outcome.h"
 #include "cluster/cloud_metadata/manifest_downloads.h"
 #include "cluster/cluster_recovery_table.h"
-#include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
+#include "cluster/controller_utils.h"
 #include "cluster/errc.h"
 #include "config/configuration.h"
+#include "config/node_config.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/gate.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
 
 namespace cluster {

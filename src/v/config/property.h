@@ -105,6 +105,7 @@ public:
       : base_property(rhs)
       , _value(std::move(rhs._value))
       , _default(std::move(rhs._default))
+      , _pending_value(std::move(rhs._pending_value))
       , _validator(std::move(rhs._validator))
       , _bindings(std::move(rhs._bindings)) {
         for (auto& binding : _bindings) {
@@ -122,6 +123,16 @@ public:
 
     const value_type& value() const { return _value; }
 
+    /// Return the pending value if one exists, otherwise the active value.
+    /// Use this to check the user's configured intent (e.g. for enterprise
+    /// feature enforcement) rather than the currently active runtime value.
+    const value_type& configured_value() const {
+        if (_pending_value.has_value()) {
+            return *_pending_value;
+        }
+        return _value;
+    }
+
     const value_type& default_value() const { return _default; }
 
     std::string_view type_name() const override;
@@ -136,6 +147,10 @@ public:
 
     bool is_default() const override { return _value == _default; }
 
+    bool is_default_pending() const override {
+        return configured_value() == _default;
+    }
+
     bool is_set() const override { return _is_set; }
 
     bool is_hidden() const override {
@@ -148,25 +163,27 @@ public:
 
     operator value_type() const { return value(); } // NOLINT
 
-    void print(std::ostream& o) const override {
-        o << name() << ":";
-
+    fmt::iterator format_to(fmt::iterator it) const override {
         if (is_secret() && !is_default()) {
-            o << secret_placeholder;
-        } else {
-            o << _value;
+            return fmt::format_to(it, "{}:{}", name(), secret_placeholder);
         }
+        return fmt::format_to(it, "{}:{}", name(), _value);
     }
 
     // serialize the value. the key is taken from the property name at the
     // serialization point in config_store::to_json to avoid users from being
     // forced to consume the property as a json object.
-    void to_json(json::Writer<json::StringBuffer>& w, redact_secrets redact)
-      const override {
-        if (is_secret() && !is_default() && redact == redact_secrets::yes) {
+    void to_json(
+      json::Writer<json::StringBuffer>& w,
+      redact_secrets redact,
+      use_pending pending = use_pending::yes) const override {
+        const auto& v = (pending == use_pending::yes) ? configured_value()
+                                                      : _value;
+        bool has_non_default = v != _default;
+        if (is_secret() && has_non_default && redact == redact_secrets::yes) {
             json::rjson_serialize(w, secret_placeholder);
         } else {
-            json::rjson_serialize(w, _value);
+            json::rjson_serialize(w, v);
         }
     }
 
@@ -184,6 +201,30 @@ public:
 
     bool set_value(YAML::Node n) override {
         return update_value(std::move(n.as<T>()));
+    }
+
+    bool set_pending_value(YAML::Node n) override {
+        return update_pending_value(std::move(n.as<T>()));
+    }
+
+    void set_pending_value(std::any v) override {
+        update_pending_value(std::any_cast<value_type>(std::move(v)));
+    }
+
+    void set_pending_value_to_default() override {
+        auto v = default_value();
+        update_pending_value(std::move(v));
+    }
+
+    bool has_pending() const override {
+        return _pending_value.has_value() && *_pending_value != _value;
+    }
+
+    void promote_pending() override {
+        if (_pending_value.has_value()) {
+            auto v = std::exchange(_pending_value, std::nullopt).value();
+            update_value(std::move(v));
+        }
     }
 
     std::optional<validation_error> validate(const value_type& v) const {
@@ -214,7 +255,8 @@ public:
     }
 
     base_property& operator=(const base_property& pr) override {
-        auto v = dynamic_cast<const property<value_type>&>(pr)._value;
+        auto v
+          = dynamic_cast<const property<value_type>&>(pr).configured_value();
         update_value(std::move(v));
         return *this;
     }
@@ -296,20 +338,43 @@ protected:
         // Set flag even if the value won't be updated. This is to mark that
         // someone tried to explicitly set this property
         _is_set = true;
+        // if there is an update pending either
+        //   - we are in the process of promoting it OR
+        //   - it is stale with respect to new_value
+        _pending_value.reset();
         if (new_value != _value) {
             // Update the main value first, in case one of the binding updates
             // throws.
             _value = std::move(new_value);
             notify_watchers(_value);
-
             return true;
         } else {
             return false;
         }
     }
 
+    bool update_pending_value(value_type&& new_value) {
+        vassert(
+          needs_restart(),
+          "set_pending_value called on property '{}' which does not require "
+          "restart",
+          name());
+        _is_set = true;
+        if (new_value != _value) {
+            _pending_value = std::move(new_value);
+            return true;
+        } else {
+            // new value matches current _active_ value of the property, so
+            // a) there's no need to cache anything
+            // b) anything previously cached is out of date
+            _pending_value.reset();
+            return false;
+        }
+    }
+
     value_type _value;
     value_type _default;
+    std::optional<value_type> _pending_value;
 
     // An alternative default that applies if the cluster's original logical
     // version is <= the defined version
@@ -653,16 +718,15 @@ consteval std::string_view property_type_name() {
         return "broker_endpoint";
     } else if constexpr (std::is_same_v<type, model::rack_id>) {
         return "rack_id";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           model::partition_autobalancing_mode>) {
+    } else if constexpr (
+      std::is_same_v<type, model::partition_autobalancing_mode>) {
         return "partition_autobalancing_mode";
     } else if constexpr (std::is_floating_point_v<type>) {
         return "number";
     } else if constexpr (std::is_integral_v<type>) {
         return "integer";
-    } else if constexpr (std::
-                           is_same_v<type, model::cloud_credentials_source>) {
+    } else if constexpr (
+      std::is_same_v<type, model::cloud_credentials_source>) {
         return "string";
     } else if constexpr (std::is_same_v<type, s3_url_style>) {
         return "string";
@@ -670,23 +734,22 @@ consteval std::string_view property_type_name() {
         return "string";
     } else if constexpr (std::is_same_v<type, std::filesystem::path>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           model::cloud_storage_chunk_eviction_strategy>) {
+    } else if constexpr (
+      std::is_same_v<type, model::cloud_storage_chunk_eviction_strategy>) {
         return "string";
     } else if constexpr (std::is_same_v<type, model::leader_balancer_mode>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           pandaproxy::schema_registry::
-                             schema_id_validation_mode>) {
+    } else if constexpr (
+      std::is_same_v<
+        type,
+        pandaproxy::schema_registry::schema_id_validation_mode>) {
         return "string";
     } else if constexpr (std::is_same_v<type, model::fetch_read_strategy>) {
         return "string";
     } else if constexpr (std::is_same_v<type, model::write_caching_mode>) {
         return "string";
-    } else if constexpr (std::
-                           is_same_v<type, model::recovery_validation_mode>) {
+    } else if constexpr (
+      std::is_same_v<type, model::recovery_validation_mode>) {
         return "recovery_validation_mode";
     } else if constexpr (std::is_same_v<type, config::fips_mode_flag>) {
         return "string";
@@ -700,25 +763,24 @@ consteval std::string_view property_type_name() {
         return "leaders_preference";
     } else if constexpr (std::is_same_v<type, config::datalake_catalog_type>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           model::iceberg_invalid_record_action>) {
+    } else if constexpr (
+      std::is_same_v<type, model::iceberg_invalid_record_action>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           config::datalake_catalog_auth_mode>) {
+    } else if constexpr (
+      std::is_same_v<type, model::iceberg_schema_case_insensitive>) {
+        return "string";
+    } else if constexpr (
+      std::is_same_v<type, config::datalake_catalog_auth_mode>) {
         return "string";
     } else if constexpr (std::is_same_v<type, config::tls_name_format>) {
         return "string";
     } else if constexpr (std::is_same_v<type, config::audit_failure_policy>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           model::kafka_batch_validation_mode>) {
+    } else if constexpr (
+      std::is_same_v<type, model::kafka_batch_validation_mode>) {
         return "string";
-    } else if constexpr (std::is_same_v<
-                           type,
-                           security::oidc::nested_group_behavior>) {
+    } else if constexpr (
+      std::is_same_v<type, security::oidc::nested_group_behavior>) {
         return "string";
     } else if constexpr (std::is_same_v<type, model::redpanda_storage_mode>) {
         return "string";
@@ -805,6 +867,11 @@ public:
         return property<std::vector<T>>::update_value(std::move(value));
     }
 
+    bool set_pending_value(YAML::Node n) override {
+        auto value = decode_yaml(n);
+        return property<std::vector<T>>::update_pending_value(std::move(value));
+    }
+
     std::optional<validation_error>
     validate([[maybe_unused]] YAML::Node n) const override {
         std::vector<T> value = decode_yaml(n);
@@ -844,6 +911,12 @@ public:
         auto value = decode_yaml(n);
         return property<std::unordered_map<typename T::key_type, T>>::
           update_value(std::move(value));
+    }
+
+    bool set_pending_value(YAML::Node n) override {
+        auto value = decode_yaml(n);
+        return property<std::unordered_map<typename T::key_type, T>>::
+          update_pending_value(std::move(value));
     }
 
     std::optional<validation_error> validate(YAML::Node n) const override {
@@ -896,6 +969,15 @@ public:
     bool set_value(YAML::Node) override {
         vlog(configlog.warn, "{}", deprecated_property_log_line());
         return false;
+    }
+
+    bool set_pending_value(YAML::Node) override {
+        vlog(configlog.warn, "{}", deprecated_property_log_line());
+        return false;
+    }
+
+    void set_pending_value(std::any) override {
+        vlog(configlog.warn, "{}", deprecated_property_log_line());
     }
 };
 
@@ -997,21 +1079,35 @@ public:
         return update_value(n.as<std::chrono::milliseconds>());
     }
 
-    void print(std::ostream& o) const final {
+    bool set_pending_value(YAML::Node n) final {
+        return update_pending_value_ms(n.as<std::chrono::milliseconds>());
+    }
+
+    void set_pending_value(std::any v) final {
+        update_pending_value_ms(
+          std::any_cast<std::optional<std::chrono::milliseconds>>(std::move(v))
+            .value_or(-1ms));
+    }
+
+    fmt::iterator format_to(fmt::iterator it) const final {
         vassert(!is_secret(), "{} must not be a secret", name());
-        o << name() << ":" << _value.value_or(-1ms);
+        return fmt::format_to(it, "{}:{}", name(), _value.value_or(-1ms));
     }
 
     // serialize the value. the key is taken from the property name at the
     // serialization point in config_store::to_json to avoid users from being
     // forced to consume the property as a json object.
-    void
-    to_json(json::Writer<json::StringBuffer>& w, redact_secrets) const final {
+    void to_json(
+      json::Writer<json::StringBuffer>& w,
+      redact_secrets,
+      use_pending pending = use_pending::yes) const final {
         // TODO: there's nothing forcing the retention duration to be a
         // non-secret; if a secret retention duration is ever introduced,
         // redact it, but consider the implications on the JSON type.
         vassert(!is_secret(), "{} must not be a secret", name());
-        json::rjson_serialize(w, _value.value_or(-1ms));
+        const auto& v = (pending == use_pending::yes) ? configured_value()
+                                                      : _value;
+        json::rjson_serialize(w, v.value_or(-1ms));
     }
 
 private:
@@ -1020,6 +1116,14 @@ private:
             return property::update_value(std::nullopt);
         } else {
             return property::update_value(value);
+        }
+    }
+
+    bool update_pending_value_ms(std::chrono::milliseconds value) {
+        if (value < 0ms) {
+            return property::update_pending_value(std::nullopt);
+        } else {
+            return property::update_pending_value(value);
         }
     }
 };

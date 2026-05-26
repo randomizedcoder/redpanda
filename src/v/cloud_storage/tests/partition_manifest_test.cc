@@ -10,7 +10,6 @@
 
 #include "base/seastarx.h"
 #include "bytes/iobuf.h"
-#include "bytes/iobuf_parser.h"
 #include "bytes/iostream.h"
 #include "cloud_storage/base_manifest.h"
 #include "cloud_storage/partition_manifest.h"
@@ -19,13 +18,10 @@
 #include "cloud_storage/spillover_manifest.h"
 #include "cloud_storage/types.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/timestamp.h"
 #include "random/generators.h"
 #include "utils/to_string.h" // IWYU pragma: keep
-#include "utils/tracking_allocator.h"
 
-#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include <boost/test/tools/context.hpp>
@@ -2540,7 +2536,9 @@ SEASTAR_THREAD_TEST_CASE(test_estimate_size_empty) {
 
 SEASTAR_THREAD_TEST_CASE(test_partition_manifest_outofbound_trigger) {
     BOOST_TEST_INFO(
-      fmt::format("random_seed: [{}]", random_generators::global().engine()));
+      fmt::format(
+        "random_seed: [{}]",
+        fmt_streamed(random_generators::global().engine())));
     auto m = partition_manifest{manifest_ntp, model::initial_revision_id(0)};
     BOOST_REQUIRE(m.get_start_offset() == std::nullopt);
     auto max_committed_offset = random_generators::get_int(0, 100000);
@@ -2839,4 +2837,97 @@ SEASTAR_THREAD_TEST_CASE(
 
     BOOST_REQUIRE(restored == m);
     BOOST_REQUIRE(m.get_applied_offset() == model::offset{100});
+}
+
+SEASTAR_THREAD_TEST_CASE(test_repair_state_no_spillovers) {
+    partition_manifest m;
+    m.add(make_segment({10, 99}, 1234));
+    m.add(make_segment({100, 199}, 1000));
+
+    BOOST_REQUIRE(!m.repair_state().has_value());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_repair_state_aligned) {
+    partition_manifest m;
+    m.add(make_segment({10, 199}, 2234, 0));
+    m.add(make_segment({200, 299}, 2000, 0));
+    m.add(make_segment({300, 399}, 500, 0));
+    {
+        auto spill_manifest = partition_manifest{
+          m.get_ntp(), m.get_revision_id()};
+        spill_manifest.add(*m.begin());
+        m.spillover(spill_manifest.make_manifest_metadata());
+        m.set_archive_start_offset(model::offset{10}, model::offset_delta{0});
+        m.set_archive_clean_offset(model::offset{10}, 0);
+    }
+
+    auto first_spill_base = m.get_spillover_map().begin()->base_offset;
+    BOOST_REQUIRE_EQUAL(first_spill_base, model::offset{10});
+    BOOST_REQUIRE(!m.repair_state().has_value());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_repair_state_misaligned) {
+    partition_manifest m;
+    m.add(make_segment({10, 199}, 2234, 0));
+    m.add(make_segment({200, 299}, 2000, 0));
+    m.add(make_segment({300, 399}, 500, 0));
+
+    {
+        auto spill_manifest = partition_manifest{
+          m.get_ntp(), m.get_revision_id()};
+        spill_manifest.add(*m.begin());
+        m.spillover(spill_manifest.make_manifest_metadata());
+        m.set_archive_start_offset(model::offset{5}, model::offset_delta{0});
+        m.set_archive_clean_offset(model::offset{5}, 0);
+    }
+
+    auto first_spill = *m.get_spillover_map().begin();
+    BOOST_REQUIRE(m.get_archive_start_offset() < first_spill.base_offset);
+
+    auto repaired = m.repair_state();
+    BOOST_REQUIRE(repaired.has_value());
+    BOOST_REQUIRE_EQUAL(
+      repaired->get_archive_start_offset(), first_spill.base_offset);
+    BOOST_REQUIRE_EQUAL(
+      repaired->get_archive_clean_offset(), first_spill.base_offset);
+
+    // Original manifest is unchanged.
+    BOOST_REQUIRE_EQUAL(m.get_archive_start_offset(), model::offset{5});
+    BOOST_REQUIRE_EQUAL(m.get_archive_clean_offset(), model::offset{5});
+
+    // Repaired manifest no longer needs repair.
+    BOOST_REQUIRE(!repaired->repair_state().has_value());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_repair_state_misaligned_clean_offset) {
+    partition_manifest m;
+    m.add(make_segment({10, 199}, 2234, 0));
+    m.add(make_segment({200, 299}, 2000, 0));
+    m.add(make_segment({300, 399}, 500, 0));
+
+    {
+        auto spill_manifest = partition_manifest{
+          m.get_ntp(), m.get_revision_id()};
+        spill_manifest.add(*m.begin());
+        m.spillover(spill_manifest.make_manifest_metadata());
+        m.set_archive_start_offset(model::offset{200}, model::offset_delta{0});
+        m.set_archive_clean_offset(model::offset{5}, 0);
+    }
+
+    auto first_spill = *m.get_spillover_map().begin();
+    BOOST_REQUIRE(m.get_archive_clean_offset() < first_spill.base_offset);
+
+    auto repaired = m.repair_state();
+    BOOST_REQUIRE(repaired.has_value());
+    BOOST_REQUIRE_EQUAL(
+      repaired->get_archive_start_offset(), model::offset{200});
+    BOOST_REQUIRE_EQUAL(
+      repaired->get_archive_clean_offset(), first_spill.base_offset);
+
+    // Original manifest is unchanged.
+    BOOST_REQUIRE_EQUAL(m.get_archive_start_offset(), model::offset{200});
+    BOOST_REQUIRE_EQUAL(m.get_archive_clean_offset(), model::offset{5});
+
+    // Repaired manifest no longer needs repair.
+    BOOST_REQUIRE(!repaired->repair_state().has_value());
 }

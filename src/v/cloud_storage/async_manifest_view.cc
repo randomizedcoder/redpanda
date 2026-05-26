@@ -20,19 +20,12 @@
 #include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
-#include "ssx/sformat.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
-#include <seastar/core/semaphore.hh>
-#include <seastar/core/smp.hh>
-#include <seastar/util/defer.hh>
-
-#include <boost/lexical_cast.hpp>
-#include <boost/outcome/success_failure.hpp>
+#include <seastar/coroutine/exception.hh>
 
 #include <exception>
 #include <functional>
@@ -52,19 +45,16 @@ ss::log_level log_level_for_error(cloud_storage::error_outcome err) {
 
 namespace cloud_storage {
 
-static ss::sstring to_string(const async_view_search_query_t& t) {
+fmt::iterator format_to(const async_view_search_query_t& q, fmt::iterator out) {
     return ss::visit(
-      t,
-      [&](model::offset ro) { return ssx::sformat("[offset: {}]", ro); },
-      [&](kafka::offset ko) { return ssx::sformat("[kafka offset: {}]", ko); },
+      q,
+      [&](model::offset ro) { return fmt::format_to(out, "[offset: {}]", ro); },
+      [&](kafka::offset ko) {
+          return fmt::format_to(out, "[kafka offset: {}]", ko);
+      },
       [&](const async_view_timestamp_query& ts) {
-          return ssx::sformat("{}", ts);
+          return fmt::format_to(out, "{}", ts);
       });
-}
-
-std::ostream& operator<<(std::ostream& s, const async_view_search_query_t& q) {
-    s << to_string(q);
-    return s;
 }
 
 static bool
@@ -103,24 +93,6 @@ contains(const partition_manifest& m, const async_view_search_query_t& query) {
       });
 }
 
-std::ostream& operator<<(std::ostream& o, async_manifest_view_cursor_status s) {
-    switch (s) {
-    case async_manifest_view_cursor_status::empty:
-        fmt::print(o, "empty");
-        break;
-    case async_manifest_view_cursor_status::evicted:
-        fmt::print(o, "evicted");
-        break;
-    case async_manifest_view_cursor_status::materialized_stm:
-        fmt::print(o, "materialized_stm");
-        break;
-    case async_manifest_view_cursor_status::materialized_spillover:
-        fmt::print(o, "materialized_spillover");
-        break;
-    }
-    return o;
-}
-
 async_manifest_view_cursor::async_manifest_view_cursor(
   async_manifest_view& view,
   model::offset begin,
@@ -152,7 +124,8 @@ ss::future<> async_manifest_view_cursor::maybe_sync_manifest() {
     if (manifest_needs_sync()) {
         auto res = co_await seek(_stm_start_offset.value());
         if (res.has_failure()) {
-            throw std::system_error(res.error());
+            co_await ss::coroutine::return_exception(
+              std::system_error(res.error()));
         }
         if (!res.value()) {
             vlog(_view._ctxlog.error, "Can't sync manifest");
@@ -319,7 +292,8 @@ async_manifest_view_cursor::next() {
 ss::future<ss::stop_iteration> async_manifest_view_cursor::next_iter() {
     auto res = co_await next();
     if (res.has_failure()) {
-        throw std::system_error(res.error());
+        co_await ss::coroutine::return_exception(
+          std::system_error(res.error()));
     }
     co_return res.value() == eof::yes ? ss::stop_iteration::yes
                                       : ss::stop_iteration::no;

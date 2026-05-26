@@ -26,8 +26,9 @@ link_probe::link_probe(link& link)
   , _fetch_data{ss::make_lw_shared<replication::link_data_probe>()}
   , _public_counter_metrics()
   , _public_status_metrics() {
-    if (_link.partition_manager().is_current_shard_leader(
-          ::model::controller_ntp)) {
+    if (
+      _link.partition_manager().is_current_shard_leader(
+        ::model::controller_ntp)) {
         setup_status_metrics();
     }
 
@@ -117,7 +118,7 @@ void link_probe::setup_status_metrics() {
     auto status_to_metric = std::views::transform(
       [this, &sl_name](const model::mirror_topic_status status) {
           auto status_label = sm::label_instance(
-            "status", to_string_view(status));
+            "status", fmt::format("{}", status));
           return sm::make_gauge(
                    "shadow_topic_state",
                    [this, status] { return count_topics(status); },

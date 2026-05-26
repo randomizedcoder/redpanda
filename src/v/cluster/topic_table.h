@@ -12,13 +12,14 @@
 #pragma once
 
 #include "absl/container/node_hash_map.h"
+#include "base/format_to.h"
 #include "cluster/commands.h"
 #include "cluster/fwd.h"
+#include "cluster/logger.h"
 #include "cluster/notification.h"
 #include "cluster/topic_table_probe.h"
 #include "container/chunked_hash_map.h"
 #include "container/contiguous_range_map.h"
-#include "logger.h"
 #include "model/fundamental.h"
 #include "model/kitp.h"
 #include "model/metadata.h"
@@ -212,8 +213,7 @@ public:
                    || _state == reconfiguration_state::force_update;
         }
 
-        friend std::ostream&
-        operator<<(std::ostream&, const in_progress_update&);
+        fmt::iterator format_to(fmt::iterator it) const;
 
     private:
         replicas_t _previous_replicas;
@@ -490,8 +490,7 @@ public:
                           : last_update_finished_revision();
         }
 
-        friend std::ostream&
-        operator<<(std::ostream&, const partition_replicas_view&);
+        fmt::iterator format_to(fmt::iterator it) const;
 
         const partition_meta& partition_meta;
         const partition_assignment& assignment;
@@ -589,7 +588,7 @@ public:
     /// Query API
 
     /// Returns list of all topics that exists in the cluster.
-    std::vector<model::topic_namespace> all_topics() const;
+    chunked_vector<model::topic_namespace> all_topics() const;
 
     // Returns the number of topics that exist in the cluster.
     size_t all_topics_count() const;
@@ -862,6 +861,10 @@ public:
     std::optional<model::topic_namespace>
     get_name_by_id(model::topic_id tp_id) const {
         return _topics.get_name(tp_id);
+    }
+
+    void increment_leadership_changes(model::topic_namespace_view tp_ns) {
+        _probe.increment_leadership_changes(tp_ns);
     }
 
 private:

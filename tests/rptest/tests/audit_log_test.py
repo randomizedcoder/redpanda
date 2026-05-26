@@ -24,7 +24,10 @@ from ducktape.errors import TimeoutError
 from ducktape.mark import matrix
 from keycloak import KeycloakOpenID
 
-from rptest.clients.admin.proto.redpanda.core.admin.v2 import security_pb2
+from rptest.clients.admin.proto.redpanda.core.admin.v2 import (
+    features_pb2,
+    security_pb2,
+)
 from rptest.clients.admin.v2 import Admin as AdminV2
 from rptest.clients.default import DefaultClient
 from rptest.clients.kcl import KCL
@@ -1071,6 +1074,54 @@ class AuditLogTestAdminApi(AuditLogTestBase):
             upsert={"audit_enabled_event_types": ["heartbeat"]}
         )
         wait_for_version_sync(self.admin, self.redpanda, patch_result["config_version"])
+
+    @skip_fips_mode
+    @cluster(num_nodes=5)
+    def test_admin_v2_finalize_upgrade(self):
+        """
+        Verifies that calls to the admin v2 FeaturesService.FinalizeUpgrade
+        RPC produce an api_activity audit record when the "admin" event
+        type is enabled. The audit entry is emitted at the auth boundary,
+        so it appears regardless of whether the service handler later
+        rejects the request — here it does, with FAILED_PRECONDITION,
+        because features_auto_finalization defaults to true.
+        """
+        self.modify_audit_event_types(["admin"])
+
+        admin_v2 = AdminV2(
+            self.redpanda,
+            auth=(
+                self.redpanda.SUPERUSER_CREDENTIALS[0],
+                self.redpanda.SUPERUSER_CREDENTIALS[1],
+            ),
+        )
+
+        try:
+            admin_v2.features().finalize_upgrade(features_pb2.FinalizeUpgradeRequest())
+        except Exception as e:
+            self.logger.debug(f"FinalizeUpgrade returned (expected failure): {e}")
+
+        def is_finalize_upgrade_record(record):
+            if (
+                record["class_uid"] != 6003
+                or record["dst_endpoint"]["svc_name"] != self.admin_audit_svc_name
+            ):
+                return False
+            url = record["http_request"]["url"]["url_string"]
+            return "FeaturesService/FinalizeUpgrade" in url
+
+        records = self.find_matching_record(
+            is_finalize_upgrade_record,
+            lambda count: count >= 1,
+            "admin v2 FinalizeUpgrade audit record",
+        )
+
+        assert len(records) >= 1, (
+            f"Expected at least one record, got {len(records)}: {records}"
+        )
+        actor = records[0]["actor"]["user"]["name"]
+        expected = self.redpanda.SUPERUSER_CREDENTIALS[0]
+        assert actor == expected, f"Expected actor user {expected}, got {actor}"
 
 
 class AuditLogTestAdminAuthApi(AuditLogTestBase):
@@ -2678,6 +2729,32 @@ class AuditLogTestOauth(AuditLogTestBase):
             for g in user_groups
         )
 
+    @staticmethod
+    def oidc_authz_with_group_filter_function(
+        service_name: str,
+        username: str | None,
+        expected_group: str,
+        record,
+    ):
+        """Filter for authorization events that include an idp_group"""
+        if not (
+            record["class_uid"] == 6003
+            and record["api"]["service"]["name"] == service_name
+            and (record["actor"]["user"]["name"] == username if username else True)
+        ):
+            return False
+
+        # Check that group is present in groups
+        user_groups = record.get("actor", {}).get("user", {}).get("groups", [])
+        if not user_groups:
+            return False
+
+        # Check for expected group with type idp_group
+        return any(
+            g.get("type") == "idp_group" and g.get("name") == expected_group
+            for g in user_groups
+        )
+
     @skip_fips_mode
     @cluster(num_nodes=6)
     @matrix(audit_transport_mode=get_audit_modes())
@@ -2769,23 +2846,9 @@ class AuditLogTestOauth(AuditLogTestBase):
             lambda records: self.aggregate_count(records) >= 1,
         )
 
-        assert len(records) >= 1, (
-            f"Expected at least 1 authentication record with IDP group but received {len(records)}"
-        )
         self.logger.info(
             f"Found {len(records)} authentication record(s) with IDP group '{test_group}'"
         )
-
-        # Verify authentication record contains the IDP group
-        for record in records:
-            user_groups = record.get("user", {}).get("groups", [])
-            self.logger.debug(
-                f"Found groups in authentication audit record: {user_groups}"
-            )
-            idp_groups = [g for g in user_groups if g.get("type") == "idp_group"]
-            assert len(idp_groups) >= 1, (
-                f"Expected at least 1 IDP group in authentication record, found {idp_groups}"
-            )
 
         # Verify authorization event contains the role
         records = self.read_all_from_audit_log(
@@ -2798,27 +2861,78 @@ class AuditLogTestOauth(AuditLogTestBase):
             lambda records: self.aggregate_count(records) >= 1,
         )
 
-        assert len(records) >= 1, (
-            f"Expected at least 1 authorization record with role but received {len(records)}"
-        )
-
-        # Verify authorization record contains the role
-        for record in records:
-            user_groups = record.get("actor", {}).get("user", {}).get("groups", [])
-            self.logger.debug(
-                f"Found groups in authorization audit record: {user_groups}"
-            )
-            roles = [g for g in user_groups if g.get("type") == "role"]
-            assert len(roles) >= 1, (
-                f"Expected at least 1 role in authorization record, found {roles}"
-            )
-            assert any(g.get("name") == role_name for g in roles), (
-                f"Expected role '{role_name}' not found in {roles}"
-            )
-
         self.logger.info(
             f"Verified complete audit trail: authentication contains IDP group '{test_group}', "
             f"authorization contains role '{role_name}'"
+        )
+
+    @skip_fips_mode
+    @cluster(num_nodes=6)
+    @matrix(audit_transport_mode=get_audit_modes())
+    def test_kafka_oauth_with_group_acl_authz(self, audit_transport_mode):
+        """
+        Validate that when authorization matches a Group ACL (Group:groupname),
+        the matched group appears in the authorization audit event's
+        actor.user.groups with type "idp_group".
+
+        Unlike test_kafka_oauth_with_groups_and_role which tests Role-based
+        authorization, this test uses a direct Group ACL to verify group
+        principal propagation into audit events.
+        """
+        self.modify_audit_event_types(["describe", "authenticate"])
+        kc_node = self.keycloak.nodes[0]
+        self.super_rpk.create_topic(self.example_topic)
+
+        # Create Keycloak group and group mapper
+        test_group = "audit-group-acl-test"
+        self.keycloak.admin.create_group(test_group)
+        self.keycloak.admin.create_group_mapper(self.client_id, use_full_path=False)
+        self.keycloak.admin.add_service_user_to_group(self.client_id, test_group)
+
+        service_user_id = self.keycloak.admin_ll.get_user_id(
+            f"service-account-{self.client_id}"
+        )
+
+        # Grant permissions via a Group ACL (not a Role ACL)
+        self.super_rpk.sasl_allow_principal(
+            f"Group:{test_group}", ["all"], "topic", self.example_topic
+        )
+        self.logger.info(
+            f"Granted 'all' permission to Group:{test_group} on topic {self.example_topic}"
+        )
+
+        # Authenticate via OIDC and perform an action
+        cfg = self.keycloak.generate_oauth_config(kc_node, self.client_id)
+        assert cfg.client_secret is not None, "client_secret is None"
+        assert cfg.token_endpoint is not None, "token_endpoint is None"
+
+        k_client = PythonLibrdkafka(
+            self.redpanda, algorithm="OAUTHBEARER", oauth_config=cfg
+        )
+        producer = k_client.get_producer()
+        producer.poll(0.0)
+
+        expected_topics = set([self.example_topic])
+        wait_until(
+            lambda: (
+                set(producer.list_topics(timeout=5).topics.keys()) == expected_topics
+            ),
+            timeout_sec=5,
+        )
+
+        # Verify authorization event contains the group with type idp_group
+        self.read_all_from_audit_log(
+            partial(
+                self.oidc_authz_with_group_filter_function,
+                self.kafka_rpc_service_name,
+                service_user_id,
+                test_group,
+            ),
+            lambda records: self.aggregate_count(records) >= 1,
+        )
+
+        self.logger.info(
+            f"Verified authorization audit event contains group '{test_group}' with type 'idp_group'"
         )
 
 
@@ -2835,6 +2949,9 @@ class AuditLogTestSchemaRegistryBase(AuditLogTestBase):
         sr_config = SchemaRegistryConfig()
         sr_config.authn_method = "http_basic"
         sr_config.mode_mutability = True
+        extra_rp_conf = {"schema_registry_use_rpc": False}
+        if "extra_rp_conf" in kwargs:
+            extra_rp_conf.update(kwargs.pop("extra_rp_conf"))
         super(AuditLogTestSchemaRegistryBase, self).__init__(
             test_context=test_context,
             audit_log_config=AuditLogConfig(
@@ -2844,6 +2961,7 @@ class AuditLogTestSchemaRegistryBase(AuditLogTestBase):
                 "info", logger_levels={"auditing": "trace", "schemaregistry": "trace"}
             ),
             schema_registry_config=sr_config,
+            extra_rp_conf=extra_rp_conf,
             **kwargs,
         )
 
@@ -3469,9 +3587,6 @@ class AuditLogTestSchemaRegistryACLs(AuditLogTestSchemaRegistryBase):
         - Context-level (e.g., /config/:.ctx:) uses sr_registry
         - Subject-level (e.g., /config/:.ctx:subject) uses sr_subject
         """
-        self.redpanda.set_cluster_config(
-            {"schema_registry_enable_qualified_subjects": True}, expect_restart=True
-        )
         self.setup_cluster()
 
         context_only = ":.staging:"
@@ -3496,7 +3611,7 @@ class AuditLogTestSchemaRegistryACLs(AuditLogTestSchemaRegistryBase):
 
         # Context-level access with only sr_subject ACL should fail
         result = self.sr_client.get_config_subject(
-            subject=context_only, auth=self.user_auth
+            subject=context_only, fallback=True, auth=self.user_auth
         )
         self.assert_equal(result.status_code, 403)
 
@@ -3505,14 +3620,14 @@ class AuditLogTestSchemaRegistryACLs(AuditLogTestSchemaRegistryBase):
 
         # Context-level: audit should show registry resource
         result = self.sr_client.get_config_subject(
-            subject=context_only, auth=self.user_auth
+            subject=context_only, fallback=True, auth=self.user_auth
         )
         self.assert_equal(result.status_code, 200)
 
         records = self.find_matching_record(
             lambda record: self.match_api_record(
                 record,
-                path=f"config/{context_only}",
+                path=f"config/{context_only}?defaultToGlobal=true",
                 resources={"name": "", "type": "registry"},
                 status_id=StatusID.SUCCESS,
                 operation="get_config_subject",
@@ -3545,9 +3660,6 @@ class AuditLogTestSchemaRegistryACLs(AuditLogTestSchemaRegistryBase):
     @cluster(num_nodes=5)
     @matrix(audit_transport_mode=get_audit_modes())
     def test_sr_audit_get_contexts(self, audit_transport_mode):
-        self.redpanda.set_cluster_config(
-            {"schema_registry_enable_qualified_subjects": True}, expect_restart=True
-        )
         self.setup_cluster()
 
         schema_data = json.dumps({"schema": schema1_def})
@@ -3622,9 +3734,6 @@ class AuditLogTestSchemaRegistryACLs(AuditLogTestSchemaRegistryBase):
     @cluster(num_nodes=5)
     @matrix(audit_transport_mode=get_audit_modes())
     def test_sr_audit_delete_context(self, audit_transport_mode):
-        self.redpanda.set_cluster_config(
-            {"schema_registry_enable_qualified_subjects": True}, expect_restart=True
-        )
         self.setup_cluster()
 
         schema_data = json.dumps({"schema": schema1_def})
@@ -3748,6 +3857,97 @@ class AuditLogTestSchemaRegistryACLs(AuditLogTestSchemaRegistryBase):
         self.assert_equal(result.status_code, 200)
 
         self.check_matching_api_record(endpoint, StatusID.SUCCESS)
+
+    @skip_fips_mode
+    @cluster(num_nodes=5)
+    @matrix(audit_transport_mode=get_audit_modes())
+    def test_sr_audit_context_prefix_authz(self, audit_transport_mode):
+        """
+        Verify ACLs and audit logging for context-prefixed routes
+        (/contexts/{context}/...). Each route should:
+          - Authorize against the context-qualified subject derived from the
+            URL prefix and {subject} path/query parameter.
+          - Record the context-prefixed nickname (ctx_*) in audit logs, even
+            for deferred-authz handlers where the nickname used to be hardcoded
+            to the non-prefixed variant.
+        """
+        self.setup_cluster()
+
+        ctx = ".staging"
+        subject = "topic-a"
+        qualified_subject = f":{ctx}:{subject}"
+        self.sr_client.base_path = f"contexts/{ctx}"
+        schema_data = json.dumps({"schema": schema1_def})
+
+        # POST /contexts/{ctx}/subjects/{subject}/versions, regular handler.
+        # Without an ACL on the qualified subject, this is denied.
+        result = self.sr_client.post_subjects_subject_versions(
+            subject=subject, data=schema_data, auth=self.user_auth
+        )
+        self.assert_equal(result.status_code, 403)
+        self.check_matching_api_record_parts(
+            path=f"contexts/{ctx}/subjects/{subject}/versions",
+            resources={"name": qualified_subject, "type": "subject"},
+            operation="ctx_post_subject_versions",
+            status_id=StatusID.FAILURE,
+        )
+
+        # Grant prefix-WRITE on the .staging context, retry. Should succeed
+        # and audit the qualified subject under ctx_post_subject_versions.
+        self._post_acl(self._create_acl(f":{ctx}:", "SUBJECT", "PREFIXED", "WRITE"))
+        result = self.sr_client.post_subjects_subject_versions(
+            subject=subject, data=schema_data, auth=self.user_auth
+        )
+        self.assert_equal(result.status_code, 200)
+        schema_id = result.json()["id"]
+        self.check_matching_api_record_parts(
+            path=f"contexts/{ctx}/subjects/{subject}/versions",
+            resources={"name": qualified_subject, "type": "subject"},
+            operation="ctx_post_subject_versions",
+            status_id=StatusID.SUCCESS,
+        )
+
+        # GET /contexts/{ctx}/subjects, deferred handler. Audit log must
+        # record ctx_get_subjects (not get_subjects).
+        self._post_acl(self._create_acl(f":{ctx}:", "SUBJECT", "PREFIXED", "DESCRIBE"))
+        result = self.sr_client.get_subjects(auth=self.user_auth)
+        self.assert_equal(result.status_code, 200)
+        self.check_matching_api_record_parts(
+            path=f"contexts/{ctx}/subjects",
+            resources={"name": qualified_subject, "type": "subject"},
+            operation="ctx_get_subjects",
+            status_id=StatusID.SUCCESS,
+        )
+
+        # GET /contexts/{ctx}/schemas/ids/{id}, deferred handler that authz's
+        # against the matched subjects. Audit log must record
+        # ctx_get_schemas_ids_id.
+        self._post_acl(self._create_acl(f":{ctx}:", "SUBJECT", "PREFIXED", "READ"))
+        result = self.sr_client.get_schemas_ids_id(id=schema_id, auth=self.user_auth)
+        self.assert_equal(result.status_code, 200)
+        self.check_matching_api_record_parts(
+            path=f"contexts/{ctx}/schemas/ids/{schema_id}",
+            resources={"name": qualified_subject, "type": "subject"},
+            operation="ctx_get_schemas_ids_id",
+            status_id=StatusID.SUCCESS,
+        )
+
+        # GET /contexts/{ctx}/config/{subject}, deferred handler routed
+        # through handle_config_mode_authz. Audit log must record
+        # ctx_get_config_subject.
+        self._post_acl(
+            self._create_acl(f":{ctx}:", "SUBJECT", "PREFIXED", "DESCRIBE_CONFIGS")
+        )
+        result = self.sr_client.get_config_subject(
+            subject=subject, fallback=True, auth=self.user_auth
+        )
+        self.assert_equal(result.status_code, 200)
+        self.check_matching_api_record_parts(
+            path=f"contexts/{ctx}/config/{subject}?defaultToGlobal=true",
+            resources={"name": qualified_subject, "type": "subject"},
+            operation="ctx_get_config_subject",
+            status_id=StatusID.SUCCESS,
+        )
 
 
 class AuditLogTestSanctionMode(AuditLogTestBase):

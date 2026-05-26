@@ -14,6 +14,7 @@
 #include "redpanda/admin/server.h"
 #include "redpanda/admin/services/cluster.h"
 #include "redpanda/admin/services/datalake/datalake.h"
+#include "redpanda/admin/services/features.h"
 #include "redpanda/admin/services/internal/breakglass.h"
 #include "redpanda/admin/services/internal/debug.h"
 #include "redpanda/admin/services/internal/level_zero.h"
@@ -95,6 +96,9 @@ void application::configure_admin_server(model::node_id node_id) {
               std::ref(_kafka_connections_service),
               controller->get_feature_table()));
           s.add_service(
+            std::make_unique<admin::features_service_impl>(
+              create_client(), controller.get(), std::ref(metadata_cache)));
+          s.add_service(
             std::make_unique<admin::internal::breakglass_service_impl>(
               controller.get()));
           if (cloud_topics_app) {
@@ -105,7 +109,8 @@ void application::configure_admin_server(model::node_id node_id) {
                   &controller->get_topics_state(),
                   &metadata_cache,
                   &controller->get_shard_table(),
-                  cloud_topics_app->get_sharded_l1_domain_supervisor()));
+                  cloud_topics_app->get_sharded_l1_domain_supervisor(),
+                  cloud_topics_app->get_sharded_l1_metastore_router()));
               s.add_service(
                 std::make_unique<admin::level_zero_service_impl>(
                   node_id,

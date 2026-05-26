@@ -13,21 +13,31 @@
 #include "base/vassert.h"
 #include "bytes/details/io_allocation_size.h"
 
-#include <seastar/core/bitops.hh>
-#include <seastar/core/do_with.hh>
-#include <seastar/core/future-util.hh>
-#include <seastar/core/smp.hh>
-
 #include <algorithm>
 #include <compare>
 #include <cstddef>
-#include <iostream>
-#include <limits>
+#include <sstream>
 #include <string_view>
 
-std::ostream& operator<<(std::ostream& o, const iobuf& io) {
-    return o << "{bytes=" << io.size_bytes()
-             << ", fragments=" << std::distance(io.cbegin(), io.cend()) << "}";
+scattered_buffer iobuf::as_scattered() && {
+    scattered_buffer bufs;
+    bufs.reserve(std::distance(begin(), end()));
+    while (!_frags.empty()) {
+        // This ordering is to preserve weak exception safety
+        auto front_buf = std::move(_frags.front()).unoptimized_release();
+        // _size is wrong here (still counts bytes in front_buf)
+        pop_front(); // fixes up size
+        bufs.emplace_back(std::move(front_buf));
+    }
+    return bufs;
+}
+
+size_t iobuf::scattered_size(const scattered_buffer& bufs) {
+    size_t total = 0;
+    for (const auto& buf : bufs) {
+        total += buf.size();
+    }
+    return total;
 }
 
 iobuf iobuf::copy() const {

@@ -1,13 +1,10 @@
-/*
- * Copyright 2025 Redpanda Data, Inc.
- *
- * Use of this software is governed by the Business Source License
- * included in the file licenses/BSL.md
- *
- * As of the Change Date specified in that file, in accordance with
- * the Business Source License, use of this software will be governed
- * by the Apache License, Version 2.0
- */
+// Copyright (c) 2014 The LevelDB Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found at https://github.com/google/leveldb/blob/main/LICENSE. See
+// https://github.com/google/leveldb/blob/main/AUTHORS for names of
+// contributors.
+//
+// Modifications copyright 2025 Redpanda Data, Inc.
 
 #include "lsm/sst/reader.h"
 
@@ -20,10 +17,11 @@
 #include "lsm/core/exceptions.h"
 #include "lsm/core/internal/two_level_iterator.h"
 #include "lsm/io/persistence.h"
+#include "lsm/io/readahead_file_reader.h"
 #include "lsm/sst/footer.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 
 #include <sys/uio.h>
 
@@ -53,12 +51,12 @@ read_block(io::random_access_file_reader* file, block::handle handle) {
         actual_crc.extend(static_cast<char*>(chunk.iov_base), chunk.iov_len);
     }
     if (expected_crc != actual_crc.value()) {
-        throw corruption_exception(
+        co_await ss::coroutine::return_exception(corruption_exception(
           "unexpected crc, got: {}, want: {} for handle {} and file {}",
           actual_crc.value(),
           expected_crc,
           handle,
-          fmt::streamed(*file));
+          *file));
     }
     data.trim_back(sizeof(compression_type));
     if (compression != compression_type::none) {
@@ -89,20 +87,33 @@ public:
       internal::file_id id,
       block::reader index_block,
       std::unique_ptr<io::random_access_file_reader> file,
+      size_t file_size,
       std::optional<block::filter_reader> filter,
       ss::lw_shared_ptr<block_cache> cache)
       : _id(id)
       , _file(std::move(file))
+      , _file_size(file_size)
       , _index_block(std::move(index_block))
       , _filter(std::move(filter))
       , _cache(std::move(cache)) {}
 
-    std::unique_ptr<internal::iterator> create_iterator() {
+    std::unique_ptr<internal::iterator>
+    create_iterator(internal::iterator_options opts) {
+        if (opts.readahead_size == 0) {
+            return internal::create_two_level_iterator(
+              _index_block.create_iterator(), [this](iobuf index_value) {
+                  return block_reader(std::move(index_value), _file.get());
+              });
+        }
+        auto ra = std::make_shared<io::readahead_file_reader>(
+          _file.get(), _file_size, opts.readahead_size);
         return internal::create_two_level_iterator(
-          _index_block.create_iterator(), [this](iobuf index_value) {
-              return block_reader(std::move(index_value));
+          _index_block.create_iterator(),
+          [this, ra = std::move(ra)](iobuf index_value) {
+              return block_reader(std::move(index_value), ra.get());
           });
     }
+
     ss::future<> internal_get(
       internal::key_view key,
       absl::FunctionRef<ss::future<>(internal::key_view, iobuf)> fn) {
@@ -119,7 +130,7 @@ public:
                 co_return;
             }
         }
-        auto block_iter = co_await block_reader(std::move(v));
+        auto block_iter = co_await block_reader(std::move(v), _file.get());
         co_await block_iter->seek(key);
         if (block_iter->valid()) {
             co_await fn(block_iter->key(), block_iter->value());
@@ -130,13 +141,13 @@ public:
 
 private:
     ss::future<std::unique_ptr<internal::iterator>>
-    block_reader(iobuf index_value) {
+    block_reader(iobuf index_value, io::random_access_file_reader* file) {
         auto block_handle = block::handle::from_iobuf(std::move(index_value));
         auto cache_handle = co_await _cache->get(_id, block_handle);
         if (auto reader = cache_handle.get()) {
             co_return reader->create_iterator();
         }
-        auto contents = co_await read_block(_file.get(), block_handle);
+        auto contents = co_await read_block(file, block_handle);
         auto rdr = block::reader(std::move(contents));
         auto it = rdr.create_iterator();
         cache_handle.insert(std::move(rdr));
@@ -145,6 +156,7 @@ private:
 
     internal::file_id _id;
     std::unique_ptr<io::random_access_file_reader> _file;
+    size_t _file_size;
     block::reader _index_block;
     std::optional<block::filter_reader> _filter;
     ss::lw_shared_ptr<block_cache> _cache;
@@ -183,6 +195,7 @@ ss::future<reader> reader::open(
             id,
             std::move(index_block),
             std::move(file),
+            file_size,
             std::move(filter),
             std::move(block_cache)));
     } catch (...) {
@@ -194,8 +207,9 @@ ss::future<reader> reader::open(
     std::rethrow_exception(ep);
 }
 
-std::unique_ptr<internal::iterator> reader::create_iterator() {
-    return _impl->create_iterator();
+std::unique_ptr<internal::iterator>
+reader::create_iterator(internal::iterator_options opts) {
+    return _impl->create_iterator(opts);
 }
 
 ss::future<> reader::internal_get(

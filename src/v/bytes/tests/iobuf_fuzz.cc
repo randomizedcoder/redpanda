@@ -16,10 +16,10 @@
  * llvm-cov show src/v/bytes/tests/fuzz_iobuf -instr-profile=default.profdata
  * -format=html ../src/v/bytes/iobuf.h ../src/v/bytes/iobuf.cc > cov.html
  */
+#include "base/format_to.h"
 #include "base/units.h"
 #include "base/vassert.h"
 #include "bytes/iobuf.h"
-#include "bytes/scattered_message.h"
 
 #include <deque>
 #include <exception>
@@ -487,15 +487,11 @@ public:
     }
 
     void iobuf_as_scattered() {
-        auto s = ::iobuf_as_scattered(buf.share(0, buf.size_bytes()));
-        auto p = std::move(s).release();
-        iobuf tmp;
-        for (auto& t : p.release()) {
-            tmp.append(std::move(t));
-        }
+        auto bufs = buf.share(0, buf.size_bytes()).as_scattered();
+        auto tmp = iobuf(std::move(bufs));
         if (tmp != buf) {
             throw std::runtime_error(
-              "Iobuf as scattered message doesn't match original data");
+              "as_scattered roundtrip doesn't match original data");
         }
     }
 
@@ -699,14 +695,13 @@ private:
         explicit op_spec(op_type op)
           : op(op) {}
 
-        friend std::ostream& operator<<(std::ostream& os, const op_spec& op) {
-            fmt::print(
-              os,
+        fmt::iterator format_to(fmt::iterator it) const {
+            return fmt::format_to(
+              it,
               "{}(size={}, data.size={})",
-              op.op,
-              (op.size.has_value() ? fmt::format("{}", *op.size) : "null"),
-              op.data.size());
-            return os;
+              op,
+              (size.has_value() ? fmt::format("{}", *size) : "null"),
+              data.size());
         }
     };
 

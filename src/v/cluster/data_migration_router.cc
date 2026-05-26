@@ -10,6 +10,7 @@
  */
 #include "cluster/data_migration_router.h"
 
+#include "cluster/errc.h"
 #include "cluster_utils.h"
 #include "container/chunked_vector.h"
 #include "errc.h"
@@ -17,17 +18,12 @@
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "partition_leaders_table.h"
-#include "partition_manager.h"
 #include "rpc/connection_cache.h"
 #include "ssx/abort_source.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/sleep.hh>
-#include <seastar/coroutine/all.hh>
-
-#include <fmt/ostream.h>
 
 #include <chrono>
 

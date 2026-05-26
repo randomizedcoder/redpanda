@@ -12,23 +12,17 @@
 #include "base/likely.h"
 #include "base/vlog.h"
 #include "bytes/iobuf.h"
-#include "bytes/iobuf_parser.h"
 #include "bytes/iostream.h"
 #include "model/record.h"
 #include "model/record_utils.h"
-#include "reflection/adl.h"
 #include "storage/logger.h"
 #include "storage/parser.h"
 #include "storage/parser_utils.h"
 #include "storage/record_batch_utils.h"
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
-#include <seastar/util/variant_utils.hh>
-
-#include <bits/stdint-uintn.h>
-#include <fmt/format.h>
+#include <seastar/coroutine/exception.hh>
 
 #include <algorithm>
 #include <exception>
@@ -146,8 +140,9 @@ static ss::future<result<model::record_batch_header>> read_header_impl(
     }
     auto header = batch_header_from_disk_iobuf(std::move(b));
 
-    if (auto computed_crc = model::internal_header_only_crc(header);
-        unlikely(header.header_crc != computed_crc)) {
+    if (
+      auto computed_crc = model::internal_header_only_crc(header);
+      unlikely(header.header_crc != computed_crc)) {
         if (!recovery) {
             vlog(
               stlog.error,
@@ -213,7 +208,7 @@ ss::future<result<stop_parser>> continuous_batch_parser::consume_records() {
                   _recovery ? ss::log_level::debug : ss::log_level::error,
                   "parser::consume_records error: {} (record_batch_header: {}, "
                   "batch consumer: {}) ",
-                  to_string(record.error()),
+                  to_string_view(record.error()),
                   *_header,
                   *_consumer);
                 return ss::make_ready_future<result<stop_parser>>(
@@ -232,10 +227,11 @@ static constexpr std::array<parser_errc, 3> benign_error_codes{
    parser_errc::fallocated_file_read_zero_bytes_for_header}};
 
 ss::future<result<size_t>> continuous_batch_parser::consume() {
-    if (unlikely(!std::any_of(
-          benign_error_codes.begin(),
-          benign_error_codes.end(),
-          [v = _err](parser_errc e) { return e == v; }))) {
+    if (
+      unlikely(!std::any_of(
+        benign_error_codes.begin(),
+        benign_error_codes.end(),
+        [v = _err](parser_errc e) { return e == v; }))) {
         return ss::make_ready_future<result<size_t>>(_err);
     }
     return ss::repeat([this] {
@@ -258,10 +254,11 @@ ss::future<result<size_t>> continuous_batch_parser::consume() {
               // support partial reads
               return result<size_t>(_bytes_consumed);
           }
-          if (std::any_of(
-                benign_error_codes.begin(),
-                benign_error_codes.end(),
-                [v = _err](parser_errc e) { return e == v; })) {
+          if (
+            std::any_of(
+              benign_error_codes.begin(),
+              benign_error_codes.end(),
+              [v = _err](parser_errc e) { return e == v; })) {
               return result<size_t>(_bytes_consumed);
           }
           return result<size_t>(_err);
@@ -353,10 +350,10 @@ public:
             vlog(stlog.error, "Output stram close error: {}", ex);
         }
         if (fo.failed()) {
-            std::rethrow_exception(fo.get_exception());
+            co_await ss::coroutine::return_exception_ptr(fo.get_exception());
         }
         if (fi.failed()) {
-            std::rethrow_exception(fi.get_exception());
+            co_await ss::coroutine::return_exception_ptr(fi.get_exception());
         }
     }
 

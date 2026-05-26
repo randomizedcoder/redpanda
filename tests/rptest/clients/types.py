@@ -27,6 +27,7 @@ class TopicSpec:
     STORAGE_MODE_LOCAL = "local"
     STORAGE_MODE_TIERED = "tiered"
     STORAGE_MODE_CLOUD = "cloud"
+    STORAGE_MODE_TIERED_CLOUD = "tiered_cloud"
     STORAGE_MODE_UNSET = "unset"
 
     PROPERTY_COMPRESSSION = "compression.type"
@@ -48,6 +49,7 @@ class TopicSpec:
     PROPERTY_ICEBERG_INVALID_RECORD_ACTION = "redpanda.iceberg.invalid.record.action"
     PROPERTY_ICEBERG_TARGET_LAG_MS = "redpanda.iceberg.target.lag.ms"
     PROPERTY_ICEBERG_PARTITION_SPEC = "redpanda.iceberg.partition.spec"
+    PROPERTY_SCHEMA_REGISTRY_CONTEXT = "redpanda.schema.registry.context"
     PROPERTY_MIN_CLEANABLE_DIRTY_RATIO = "min.cleanable.dirty.ratio"
     PROPERTY_MIN_COMPACTION_LAG_MS = "min.compaction.lag.ms"
     PROPERTY_MAX_COMPACTION_LAG_MS = "max.compaction.lag.ms"

@@ -11,7 +11,6 @@
 #include "azure_aks_refresh_impl.h"
 
 #include "http/utils.h"
-#include "json/schema.h"
 #include "request_response_helpers.h"
 #include "utils/file_io.h"
 
@@ -19,7 +18,6 @@
 #include <seastar/coroutine/exception.hh>
 
 #include <boost/algorithm/string/trim.hpp>
-#include <rapidjson/error/en.h>
 
 #include <ada.h>
 
@@ -54,7 +52,8 @@ azure_aks_refresh_impl::azure_aks_refresh_impl(
   aws_service_name, // Ignored for Azure AKS
   aws_region_name region,
   ss::abort_source& as,
-  retry_params retry_params)
+  retry_params retry_params,
+  ss::sstring metrics_tag)
   : refresh_credentials::impl(
       [&] {
           if (!address.host().empty()) {
@@ -65,8 +64,8 @@ azure_aks_refresh_impl::azure_aks_refresh_impl(
           // try to interpret AZURE_AUTHORITY_HOST as a URL, if it fails,
           // assume it's an hostname
           auto authority_host = load_from_env(env_var_azure_authority_host);
-          if (auto url = ada::parse<ada::url>(authority_host);
-              url.has_value()) {
+          if (
+            auto url = ada::parse<ada::url>(authority_host); url.has_value()) {
               auto is_https = url->get_protocol() == "https:";
               // use port if it's set, otherwise fallback on the default 443 for
               // https and 80 for http
@@ -79,14 +78,15 @@ azure_aks_refresh_impl::azure_aks_refresh_impl(
       }(),
       std::move(region),
       as,
-      retry_params)
+      retry_params,
+      std::move(metrics_tag))
   , client_id_{load_from_env(env_var_azure_client_id)}
   , tenant_id_{load_from_env(env_var_azure_tenant_id)}
   , federated_token_file_{load_from_env(env_var_azure_federated_token_file)} {}
 
-std::ostream& azure_aks_refresh_impl::print(std::ostream& os) const {
-    fmt::print(os, "azure_aks_refresh_impl{{address:{}}}", address());
-    return os;
+fmt::iterator azure_aks_refresh_impl::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it, "azure_aks_refresh_impl{{address:{}}}", address());
 }
 
 ss::future<api_response> azure_aks_refresh_impl::fetch_credentials() {

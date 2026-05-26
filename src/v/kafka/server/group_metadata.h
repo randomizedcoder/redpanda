@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "bytes/iobuf.h"
 #include "kafka/protocol/wire.h"
@@ -57,7 +58,7 @@ struct member_state {
           .assignment = assignment.copy(),
         };
     }
-    friend std::ostream& operator<<(std::ostream&, const member_state&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     friend bool operator==(const member_state&, const member_state&) = default;
 
@@ -72,9 +73,9 @@ struct group_metadata_key {
     static constexpr group_metadata_version version{2};
     kafka::group_id group_id;
 
-    friend std::ostream& operator<<(std::ostream&, const group_metadata_key&);
-    friend bool operator==(const group_metadata_key&, const group_metadata_key&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+    friend bool
+    operator==(const group_metadata_key&, const group_metadata_key&) = default;
     static group_metadata_key decode(protocol::decoder&);
     static void encode(protocol::encoder&, const group_metadata_key&);
 };
@@ -109,10 +110,9 @@ struct group_metadata_value {
         return ret;
     }
 
-    friend std::ostream& operator<<(std::ostream&, const group_metadata_value&);
-    friend bool
-    operator==(const group_metadata_value&, const group_metadata_value&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+    friend bool operator==(
+      const group_metadata_value&, const group_metadata_value&) = default;
 
     static group_metadata_value decode(protocol::decoder&);
     static void encode(protocol::encoder&, const group_metadata_value&);
@@ -124,10 +124,9 @@ struct offset_metadata_key {
     model::topic topic;
     model::partition_id partition;
 
-    friend std::ostream& operator<<(std::ostream&, const offset_metadata_key&);
-    friend bool
-    operator==(const offset_metadata_key&, const offset_metadata_key&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+    friend bool operator==(
+      const offset_metadata_key&, const offset_metadata_key&) = default;
     static offset_metadata_key decode(protocol::decoder&);
     static void encode(protocol::encoder&, const offset_metadata_key&);
 };
@@ -152,11 +151,9 @@ struct offset_metadata_value {
      */
     bool non_reclaimable{true};
 
-    friend std::ostream&
-    operator<<(std::ostream&, const offset_metadata_value&);
-    friend bool
-    operator==(const offset_metadata_value&, const offset_metadata_value&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+    friend bool operator==(
+      const offset_metadata_value&, const offset_metadata_value&) = default;
     static offset_metadata_value decode(protocol::decoder&);
     static void encode(protocol::encoder&, const offset_metadata_value&);
 };
@@ -186,10 +183,10 @@ struct group_block_info
     model::revision_id revision_id;
 
     auto serde_fields() { return std::tie(is_blocked, revision_id); }
-    friend bool operator==(const group_block_info&, const group_block_info&)
-      = default;
+    friend bool
+    operator==(const group_block_info&, const group_block_info&) = default;
 
-    friend std::ostream& operator<<(std::ostream&, const group_block_info&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 struct group_block {
     kafka::group_id group_id;
@@ -199,7 +196,7 @@ struct group_block {
     explicit group_block(model::record record);
     void add_to_batch_builder(storage::record_batch_builder&) const;
 
-    friend std::ostream& operator<<(std::ostream&, const group_block&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 namespace group_metadata_serializer {
 struct key_value {
@@ -217,14 +214,14 @@ namespace group_tx {
 
 struct fence_metadata_v0 {
     kafka::group_id group_id;
-    friend std::ostream& operator<<(std::ostream&, const fence_metadata_v0&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct fence_metadata_v1 {
     kafka::group_id group_id;
     model::tx_seq tx_seq;
     model::timeout_clock::duration transaction_timeout_ms;
-    friend std::ostream& operator<<(std::ostream&, const fence_metadata_v1&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 /**
  * Fence is set by the transaction manager when consumer adds an offset to
@@ -235,7 +232,7 @@ struct fence_metadata {
     model::tx_seq tx_seq;
     model::timeout_clock::duration transaction_timeout_ms;
     model::partition_id tm_partition;
-    friend std::ostream& operator<<(std::ostream&, const fence_metadata&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 /**
  * Single partition committed offset
@@ -245,7 +242,7 @@ struct partition_offset {
     model::offset offset;
     int32_t leader_epoch;
     std::optional<ss::sstring> metadata;
-    friend std::ostream& operator<<(std::ostream&, const partition_offset&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 /**
  * Consumer offsets commited as a part of transaction
@@ -255,7 +252,7 @@ struct offsets_metadata {
     model::producer_identity pid;
     model::tx_seq tx_seq;
     std::vector<partition_offset> offsets;
-    friend std::ostream& operator<<(std::ostream&, const offsets_metadata&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /**

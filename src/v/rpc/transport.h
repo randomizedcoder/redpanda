@@ -13,6 +13,7 @@
 
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
+#include "base/format_to.h"
 #include "base/outcome.h"
 #include "base/seastarx.h"
 #include "container/chunked_hash_map.h"
@@ -36,6 +37,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -114,25 +116,13 @@ public:
     client_probe& operator=(client_probe&&) = delete;
     ~client_probe() = default;
 
-    void request() {
-        ++_requests;
-        ++_requests_pending;
-    }
+    void request() { ++_requests; }
 
-    void request_completed() {
-        ++_requests_completed;
-        --_requests_pending;
-    }
+    void request_completed() { ++_requests_completed; }
 
-    void request_timeout() {
-        ++_request_timeouts;
-        --_requests_pending;
-    }
+    void request_timeout() { ++_request_timeouts; }
 
-    void request_error() {
-        ++_request_errors;
-        --_requests_pending;
-    }
+    void request_error() { ++_request_errors; }
 
     void add_bytes_sent(size_t sent) { _out_bytes += sent; }
 
@@ -150,11 +140,11 @@ public:
 
     std::vector<ss::metrics::metric_definition> defs(
       const std::vector<ss::metrics::label_instance>& labels,
-      const std::vector<ss::metrics::label>& aggregate_labels);
+      const std::vector<ss::metrics::label>& aggregate_labels,
+      std::function<size_t()> pending_count);
 
 private:
     uint64_t _requests = 0;
-    uint32_t _requests_pending = 0;
     uint32_t _request_errors = 0;
     uint64_t _request_timeouts = 0;
     uint64_t _requests_completed = 0;
@@ -166,7 +156,10 @@ private:
     uint32_t _client_correlation_errors = 0;
     uint32_t _requests_blocked_memory = 0;
 
-    friend std::ostream& operator<<(std::ostream& o, const client_probe& p);
+    friend struct fmt::formatter<client_probe>;
+
+public:
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 /**
@@ -208,10 +201,12 @@ public:
 
     transport_version version() const { return _version; }
 
+    fmt::iterator format_to(fmt::iterator it) const;
+
 private:
     using sequence_t = named_type<uint64_t, struct sequence_tag>;
     struct entry {
-        ss::scattered_message<char> scattered_message;
+        scattered_buffer bufs;
         uint32_t correlation_id;
     };
     using requests_queue_t
@@ -295,8 +290,6 @@ private:
     friend class ::rpc_integration_fixture_oc_ns_adl_serde_no_upgrade;
     friend class ::rpc_integration_fixture_oc_ns_adl_only_no_upgrade;
     void set_version(transport_version v) { _version = v; }
-
-    friend std::ostream& operator<<(std::ostream&, const transport&);
 
     std::unique_ptr<client_probe> _probe;
 };
@@ -453,3 +446,23 @@ transport::send_typed_versioned(
 }
 
 } // namespace rpc
+
+template<>
+struct fmt::formatter<rpc::client_probe> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    auto format(const rpc::client_probe& v, fmt::format_context& ctx) const {
+        return v.format_to(ctx.out());
+    }
+};
+
+template<>
+struct fmt::formatter<rpc::transport> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    auto format(const rpc::transport& v, fmt::format_context& ctx) const {
+        return v.format_to(ctx.out());
+    }
+};

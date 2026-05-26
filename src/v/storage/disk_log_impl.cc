@@ -13,7 +13,6 @@
 #include "base/vlog.h"
 #include "compaction/key_offset_map.h"
 #include "config/configuration.h"
-#include "model/adl_serde.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/offset_interval.h"
@@ -26,9 +25,6 @@
 #include "ssx/semaphore.h"
 #include "ssx/watchdog.h"
 #include "storage/api.h"
-#include "storage/chunk_cache.h"
-#include "storage/compacted_offset_list.h"
-#include "storage/compaction_reducers.h"
 #include "storage/disk_log_appender.h"
 #include "storage/exceptions.h"
 #include "storage/fwd.h"
@@ -36,7 +32,6 @@
 #include "storage/log_manager.h"
 #include "storage/log_reader.h"
 #include "storage/logger.h"
-#include "storage/offset_assignment.h"
 #include "storage/offset_to_filepos.h"
 #include "storage/readers_cache.h"
 #include "storage/scoped_file_tracker.h"
@@ -45,12 +40,9 @@
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
 #include "storage/types.h"
-#include "storage/version.h"
 #include "utils/human.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/fair_queue.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
@@ -59,9 +51,8 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
-
-#include <fmt/format.h>
-#include <roaring/roaring.hh>
+#include <seastar/coroutine/exception.hh>
+#include <seastar/util/defer.hh>
 
 #include <algorithm>
 #include <chrono>
@@ -69,7 +60,6 @@
 #include <iterator>
 #include <limits>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 
 using namespace std::literals::chrono_literals;
@@ -157,9 +147,9 @@ public:
 
     ss::future<> finally() noexcept final { return _rdr.close(); }
 
-    void print(std::ostream& os) final {
-        fmt::print(
-          os,
+    fmt::iterator format_to(fmt::iterator it) const final {
+        return fmt::format_to(
+          it,
           "storage::single_segment_reader for {}, config {}",
           _seg->filename(),
           _config);
@@ -182,6 +172,7 @@ disk_log_impl::disk_log_impl(
   ss::sharded<features::feature_table>& feature_table,
   std::vector<model::record_batch_type> translator_batch_types)
   : log(std::move(cfg))
+  , _stm_hookset(ss::make_lw_shared<storage::stm_hookset>())
   , _manager(manager)
   , _segment_size_jitter(
       internal::random_jitter(_manager.config().segment_size_jitter))
@@ -245,30 +236,24 @@ ss::future<> disk_log_impl::remove() {
     _closed = true;
     // wait for compaction to finish
     co_await _compaction_housekeeping_gate.close();
-    // gets all the futures started in the background
-    std::vector<ss::future<>> permanent_delete;
-    permanent_delete.reserve(_segs.size());
-    while (!_segs.empty()) {
-        auto s = _segs.back();
-        _segs.pop_back();
-        permanent_delete.emplace_back(
-          remove_segment_permanently(s, "disk_log_impl::remove()"));
-    }
-    co_await _offset_translator.remove_persistent_state();
 
-    co_await _readers_cache->stop()
-      .then([this, permanent_delete = std::move(permanent_delete)]() mutable {
-          // wait for all futures
-          return ss::when_all_succeed(
-                   permanent_delete.begin(), permanent_delete.end())
-            .then([this]() {
-                vlog(stlog.info, "Finished removing all segments:{}", config());
-            })
-            .then([this] {
-                return remove_kvstore_state(config().ntp(), _kvstore);
-            });
-      })
-      .finally([this] { _probe->clear_metrics(); });
+    auto _ = ss::defer([this] { _probe->clear_metrics(); });
+
+    // Clear segments.
+    auto segments_to_remove = std::move(_segs).release();
+    _segs = segment_set(segment_set::underlying_t{});
+
+    co_await ss::max_concurrent_for_each(
+      segments_to_remove, 128, [this](ss::lw_shared_ptr<segment>& s) {
+          return remove_segment_permanently(s, "disk_log_impl::remove()");
+      });
+
+    vlog(stlog.info, "Finished removing all segments:{}", config());
+
+    co_await _offset_translator.remove_persistent_state();
+    co_await _readers_cache->stop();
+
+    co_await remove_kvstore_state(config().ntp(), _kvstore);
 }
 
 ss::future<> disk_log_impl::start(
@@ -327,8 +312,8 @@ ss::future<std::optional<ss::sstring>> disk_log_impl::close() {
     bool errors = false;
 
     co_await _readers_cache->stop().then([this, &errors] {
-        return ss::parallel_for_each(
-          _segs, [&errors](ss::lw_shared_ptr<segment>& h) {
+        return ss::max_concurrent_for_each(
+          _segs, 128, [&errors](ss::lw_shared_ptr<segment>& h) {
               return h->close().handle_exception(
                 [&errors, h](std::exception_ptr e) {
                     vlog(stlog.error, "Error closing segment:{} - {}", e, h);
@@ -540,7 +525,7 @@ ss::future<compaction_result> disk_log_impl::segment_self_compact(
   bool force_compaction) {
     co_return co_await storage::internal::self_compact_segment(
       seg,
-      _stm_manager,
+      _stm_hookset,
       cfg,
       *_probe,
       *_readers_cache,
@@ -787,7 +772,7 @@ ss::future<bool> disk_log_impl::sliding_window_compact(
         idx_start_offset = co_await build_offset_map(
           cfg,
           segs,
-          _stm_manager,
+          _stm_hookset,
           _manager.resources(),
           *_probe,
           map,
@@ -1056,8 +1041,9 @@ disk_log_impl::compact_adjacent_segment_ranges(
   compaction::compaction_config cfg,
   std::optional<model::offset> new_start_offset) {
     chunked_vector<compaction_result> rs;
-    if (auto ranges = find_adjacent_compaction_ranges(cfg, new_start_offset);
-        ranges) {
+    if (
+      auto ranges = find_adjacent_compaction_ranges(cfg, new_start_offset);
+      ranges) {
         // lightweight copy of segments in all of the found ranges. once a
         // scheduling event occurs in this method we can't rely on the iterators
         // in the range remaining valid. for example, a concurrent truncate may
@@ -1160,7 +1146,7 @@ ss::future<compaction_result> disk_log_impl::do_compact_adjacent_segments(
           = co_await storage::internal::concatenate_and_rebuild_target_segment(
             target,
             segments,
-            _stm_manager,
+            _stm_hookset,
             cfg,
             *_probe,
             *_readers_cache,
@@ -1409,11 +1395,9 @@ ss::future<> disk_log_impl::housekeeping(housekeeping_config cfg) {
             leftovers.erase(first_leftover);
         }
         if (fut.failed()) {
-            std::rethrow_exception(fut.get_exception());
+            co_await ss::coroutine::return_exception_ptr(fut.get_exception());
         }
     }
-
-    _probe->set_compaction_ratio(_compaction_ratio.get());
 }
 
 ss::future<> disk_log_impl::do_compact(
@@ -1468,7 +1452,7 @@ ss::future<> disk_log_impl::do_compact(
               config().ntp());
             co_return;
         }
-        std::rethrow_exception(eptr);
+        co_await ss::coroutine::return_exception_ptr(std::move(eptr));
     }
 }
 
@@ -1691,7 +1675,7 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
           seg,
           *appender,
           *compacted_idx_writer,
-          _stm_manager,
+          _stm_hookset,
           *_probe,
           storage::internal::should_apply_delta_time_offset(_feature_table),
           _feature_table);
@@ -1702,7 +1686,7 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
     co_await compacted_idx_writer->close();
     co_await appender->close();
     if (eptr) {
-        std::rethrow_exception(eptr);
+        co_await ss::coroutine::return_exception_ptr(std::move(eptr));
     }
 
     vlog(
@@ -2087,7 +2071,7 @@ ss::future<> disk_log_impl::new_segment(model::offset o, model::term_id t) {
                 }
                 _segs.add(std::move(h));
                 _probe->segment_created();
-                _stm_manager->make_snapshot_in_background();
+                _stm_hookset->request_make_snapshot_in_background();
                 _stm_dirty_bytes_units.return_all();
             });
       });
@@ -3070,8 +3054,9 @@ bool disk_log_impl::is_compacted(
 
 bool disk_log_impl::eligible_for_compacted_reupload(
   model::offset first, model::offset last) const {
-    if (auto mco = max_eligible_for_compacted_reupload_offset(first);
-        mco.has_value()) {
+    if (
+      auto mco = max_eligible_for_compacted_reupload_offset(first);
+      mco.has_value()) {
         return last <= mco.value();
     }
     return false;
@@ -3433,6 +3418,29 @@ ss::future<> disk_log_impl::truncate_prefix(truncate_prefix_config cfg) {
           })
           .discard_result();
     });
+
+    std::optional<ss::rwlock::holder> front_lock;
+    if (
+      !_segs.empty()
+      && _segs.front()->offsets().get_base_offset() < cfg.start_offset) {
+        // If after removing full segments, the new start offset is still within
+        // the front segment there is a chance that there are active readers
+        // that rely on offset translation state which we are about to prefix
+        // truncate.
+        //
+        // To avoid interfering with those readers, we acquire the front
+        // segment's write lock to wait for those readers to finish.
+        //
+        // The correct reading protocol (safe from races) is to acquire read
+        // locks and only then check log start offset.
+
+        // Evict readers before acquiring the segment write lock to avoid
+        // deadlocks.
+        auto cache_lock = co_await _readers_cache->evict_segment_readers(
+          _segs.front());
+        front_lock = co_await _segs.front()->write_lock();
+    }
+
     // We truncate the segments before truncating offset translator to wait for
     // readers that started reading from the start of the log before we advanced
     // the start offset and thus can still need offset translation info.
@@ -3506,14 +3514,12 @@ ss::future<> disk_log_impl::do_truncate_prefix(truncate_prefix_config cfg) {
 
 ss::future<> disk_log_impl::truncate(truncate_config cfg) {
     throw_if_closed();
-    // We are truncating the offset translator before truncating the log
-    // because if saving offset translator state fails (e.g. because of a
-    // crash), we can retry and eventually log and offset translator will
-    // become consistent. OTOH if log truncation were first and saving offset
-    // translator state failed, we wouldn't retry and log and offset translator
-    // could diverge.
-    co_await _offset_translator.truncate(cfg.base_offset);
-
+    // Truncate the log before the offset translator. This ordering ensures
+    // that if the OT update fails (I/O error on checkpoint), the in-memory
+    // OT state is already correct (the map erase happens before the
+    // checkpoint) so runtime offset translations remain accurate. On
+    // restart, sync_with_log will reconcile the on-disk OT state with the
+    // actual log.
     co_await _failure_probes.truncate().then([this, cfg]() mutable {
         // Before truncation, erase any claim about a particular segment being
         // clean: this may refer to a segment we are about to delete, or it
@@ -3530,6 +3536,7 @@ ss::future<> disk_log_impl::truncate(truncate_config cfg) {
               return do_truncate(cfg, std::nullopt);
           });
     });
+    co_await _offset_translator.truncate(cfg.base_offset);
 }
 
 ss::future<> disk_log_impl::do_truncate(
@@ -3793,27 +3800,23 @@ void disk_log_impl::wrote_stm_bytes(size_t byte_size) {
     auto checkpoint_hint = _manager.resources().stm_take_bytes(
       byte_size, _stm_dirty_bytes_units);
     if (checkpoint_hint) {
-        _stm_manager->make_snapshot_in_background();
-        _stm_dirty_bytes_units.return_all();
+        if (_stm_hookset->request_make_snapshot_in_background()) [[likely]] {
+            _stm_dirty_bytes_units.return_all();
+        }
     }
 }
 
 storage_resources& disk_log_impl::resources() { return _manager.resources(); }
 
-std::ostream& disk_log_impl::print(std::ostream& o) const {
-    fmt::print(
-      o,
+fmt::iterator disk_log_impl::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{offsets: {}, is_closed: {}, segments: "
       "[{}], config: {}}}",
       offsets(),
       _closed,
       _segs,
       config());
-    return o;
-}
-
-std::ostream& operator<<(std::ostream& o, const disk_log_impl& d) {
-    return d.print(o);
 }
 
 ss::shared_ptr<log> make_disk_backed_log(
@@ -3875,7 +3878,7 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
      * max removable offset from stm. A future refactoring may consider moving
      * more of the retention controls into a higher level location.
      */
-    const auto max_removable = stm_manager()->max_removable_local_log_offset();
+    const auto max_removable = stm_hookset()->max_removable_local_log_offset();
     const auto retention_offset = [&]() -> std::optional<model::offset> {
         if (max_offset.has_value()) {
             return std::min(max_offset.value(), max_removable);
@@ -4212,8 +4215,11 @@ ss::future<usage_report> disk_log_impl::disk_usage(gc_config cfg) {
             config::shard_local_cfg()
               .space_management_max_segment_concurrency()));
 
+        // Copy segment pointers so that concurrent modification of
+        // _segs does not invalidate the range we iterate over.
+        auto segments = _segs.copy();
         use = co_await ss::map_reduce(
-          _segs,
+          segments,
           [&limit](const segment_set::type& seg) {
               return ss::with_semaphore(
                 limit, 1, [&seg] { return seg->persistent_size(); });
@@ -4270,7 +4276,7 @@ disk_log_impl::cloud_gc_eligible_segments() {
      * topics max removable will include a reflection of how much data has
      * been uploaded into the cloud.
      */
-    const auto max_removable = stm_manager()->max_removable_local_log_offset();
+    const auto max_removable = stm_hookset()->max_removable_local_log_offset();
 
     // collect eligible segments
     chunked_vector<segment_set::type> segments;
@@ -4366,7 +4372,7 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
      * for a cloud-backed topic the max collecible offset is the threshold below
      * which data has been uploaded and can safely be removed from local disk.
      */
-    const auto max_removable = stm_manager()->max_removable_local_log_offset();
+    const auto max_removable = stm_hookset()->max_removable_local_log_offset();
 
     /*
      * lightweight segment set copy for safe iteration

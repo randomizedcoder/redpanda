@@ -10,29 +10,23 @@
  */
 #include "cluster/data_migration_worker.h"
 
-#include "archival/ntp_archiver_service.h"
 #include "base/vassert.h"
 #include "cluster/data_migration_types.h"
-#include "cluster/types.h"
+#include "cluster/errc.h"
+#include "cluster/logger.h"
 #include "cluster_utils.h"
 #include "container/chunked_vector.h"
-#include "errc.h"
 #include "kafka/protocol/types.h"
-#include "logger.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "partition_leaders_table.h"
 #include "partition_manager.h"
-#include "rpc/connection_cache.h"
 #include "ssx/future-util.h"
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sleep.hh>
-#include <seastar/coroutine/all.hh>
-
-#include <fmt/ostream.h>
 
 #include <chrono>
 #include <memory>
@@ -280,7 +274,7 @@ ss::future<errc> worker::do_work(
     } catch (...) {
         vlog(
           dm_log.warn,
-          "exception occured during partition work on migration {} ntp {} "
+          "exception occurred during partition work on migration {} ntp {} "
           "towards {} state: {}",
           running_work.work->migration_id,
           ntp,

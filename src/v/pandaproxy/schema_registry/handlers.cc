@@ -20,6 +20,7 @@
 #include "pandaproxy/logger.h"
 #include "pandaproxy/parsing/httpd.h"
 #include "pandaproxy/schema_registry/authorization.h"
+#include "pandaproxy/schema_registry/context_router.h"
 #include "pandaproxy/schema_registry/error.h"
 #include "pandaproxy/schema_registry/errors.h"
 #include "pandaproxy/schema_registry/exceptions.h"
@@ -31,6 +32,8 @@
 #include "pandaproxy/schema_registry/requests/get_subject_versions_version.h"
 #include "pandaproxy/schema_registry/requests/mode.h"
 #include "pandaproxy/schema_registry/requests/post_subject_versions.h"
+#include "pandaproxy/schema_registry/seq_writer.h"
+#include "pandaproxy/schema_registry/sharded_store.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "pandaproxy/server.h"
 #include "security/acl.h"
@@ -238,8 +241,9 @@ ss::future<schema_resolution_result> resolve_schema_id_extended(
       subject());
 
     // First, try default context with the provided subject
-    if (context_subject ctx_sub{default_context, subject};
-        co_await store.has_version(ctx_sub, id, include_deleted::yes)) {
+    if (
+      context_subject ctx_sub{default_context, subject};
+      co_await store.has_version(ctx_sub, id, include_deleted::yes)) {
         vlog(
           srlog.debug,
           "Schema ID {} was found in default context with subject '{}'",
@@ -257,8 +261,9 @@ ss::future<schema_resolution_result> resolve_schema_id_extended(
             continue;
         }
 
-        if (context_subject ctx_sub{ctx, subject};
-            co_await store.has_version(ctx_sub, id, include_deleted::yes)) {
+        if (
+          context_subject ctx_sub{ctx, subject};
+          co_await store.has_version(ctx_sub, id, include_deleted::yes)) {
             vlog(
               srlog.debug,
               "Schema ID {} was found in context '{}' with subject '{}'",
@@ -313,12 +318,15 @@ ss::future<schema_resolution_result> resolve_schema_id(
 ss::future<server::reply_t>
 get_config(server::request_t rq, server::reply_t rp) {
     parse_accept_header(rq, rp);
+    auto fallback = parse::query_param<std::optional<default_to_global>>(
+                      *rq.req, "defaultToGlobal")
+                      .value_or(default_to_global::no);
 
     // Ensure we see latest writes
     co_await rq.service().writer().read_sync();
 
     auto res = co_await rq.service().schema_store().get_compatibility(
-      default_context);
+      default_context, fallback);
 
     auto resp = ppj::rjson_serialize_iobuf(get_config_req_rep{.compat = res});
     log_response(*rq.req, resp);
@@ -344,7 +352,8 @@ put_config(server::request_t rq, server::reply_t rp) {
 ss::future<server::reply_t> get_config_subject(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto ctx_sub = context_subject::from_string(
       parse::request_param<ss::sstring>(*rq.req, "subject"));
@@ -354,7 +363,7 @@ ss::future<server::reply_t> get_config_subject(
 
     enterprise::handle_config_mode_authz(
       rq,
-      ss::httpd::schema_registry_json::get_config_subject.operations.nickname,
+      operation_name,
       auth_result,
       ctx_sub,
       security::acl_operation::describe_configs);
@@ -365,7 +374,7 @@ ss::future<server::reply_t> get_config_subject(
     compatibility_level res;
     if (ctx_sub.is_context_only()) {
         res = co_await rq.service().schema_store().get_compatibility(
-          ctx_sub.ctx);
+          ctx_sub.ctx, fallback);
     } else {
         res = co_await rq.service().schema_store().get_compatibility(
           ctx_sub, fallback);
@@ -411,7 +420,8 @@ std::invoke_result_t<F> get_or_load(server::request_t& rq, F f) {
 ss::future<server::reply_t> put_config_subject(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_content_type_header(rq);
     parse_accept_header(rq, rp);
     auto ctx_sub = context_subject::from_string(
@@ -420,7 +430,7 @@ ss::future<server::reply_t> put_config_subject(
 
     enterprise::handle_config_mode_authz(
       rq,
-      ss::httpd::schema_registry_json::put_config_subject.operations.nickname,
+      operation_name,
       auth_result,
       ctx_sub,
       security::acl_operation::alter_configs);
@@ -440,15 +450,15 @@ ss::future<server::reply_t> put_config_subject(
 ss::future<server::reply_t> delete_config_subject(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto ctx_sub = context_subject::from_string(
       parse::request_param<ss::sstring>(*rq.req, "subject"));
 
     enterprise::handle_config_mode_authz(
       rq,
-      ss::httpd::schema_registry_json::delete_config_subject.operations
-        .nickname,
+      operation_name,
       auth_result,
       ctx_sub,
       security::acl_operation::alter_configs);
@@ -463,7 +473,7 @@ ss::future<server::reply_t> delete_config_subject(
     try {
         if (ctx_sub.is_context_only()) {
             lvl = co_await rq.service().schema_store().get_compatibility(
-              ctx_sub.ctx);
+              ctx_sub.ctx, default_to_global::no);
         } else {
             lvl = co_await rq.service().schema_store().get_compatibility(
               ctx_sub, default_to_global::no);
@@ -476,7 +486,10 @@ ss::future<server::reply_t> delete_config_subject(
         }
     }
 
-    co_await rq.service().writer().delete_config(ctx_sub);
+    auto deleted = co_await rq.service().writer().delete_config(ctx_sub);
+    if (!deleted) {
+        throw as_exception(not_found(ctx_sub));
+    }
 
     auto resp = ppj::rjson_serialize_iobuf(get_config_req_rep{.compat = lvl});
     log_response(*rq.req, resp);
@@ -486,11 +499,15 @@ ss::future<server::reply_t> delete_config_subject(
 
 ss::future<server::reply_t> get_mode(server::request_t rq, server::reply_t rp) {
     parse_accept_header(rq, rp);
+    auto fallback = parse::query_param<std::optional<default_to_global>>(
+                      *rq.req, "defaultToGlobal")
+                      .value_or(default_to_global::no);
 
     // Ensure we see latest writes
     co_await rq.service().writer().read_sync();
 
-    auto res = co_await rq.service().schema_store().get_mode(default_context);
+    auto res = co_await rq.service().schema_store().get_mode(
+      default_context, fallback);
 
     auto resp = ppj::rjson_serialize_iobuf(mode_req_rep{.mode = res});
     log_response(*rq.req, resp);
@@ -519,7 +536,8 @@ ss::future<server::reply_t> put_mode(server::request_t rq, server::reply_t rp) {
 ss::future<server::reply_t> get_mode_subject(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto ctx_sub = context_subject::from_string(
       parse::request_param<ss::sstring>(*rq.req, "subject"));
@@ -529,7 +547,7 @@ ss::future<server::reply_t> get_mode_subject(
 
     enterprise::handle_config_mode_authz(
       rq,
-      ss::httpd::schema_registry_json::get_mode_subject.operations.nickname,
+      operation_name,
       auth_result,
       ctx_sub,
       security::acl_operation::describe_configs);
@@ -539,7 +557,8 @@ ss::future<server::reply_t> get_mode_subject(
 
     mode res;
     if (ctx_sub.is_context_only()) {
-        res = co_await rq.service().schema_store().get_mode(ctx_sub.ctx);
+        res = co_await rq.service().schema_store().get_mode(
+          ctx_sub.ctx, fallback);
     } else {
         res = co_await rq.service().schema_store().get_mode(ctx_sub, fallback);
     }
@@ -553,7 +572,8 @@ ss::future<server::reply_t> get_mode_subject(
 ss::future<server::reply_t> put_mode_subject(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_content_type_header(rq);
     parse_accept_header(rq, rp);
     auto frc = parse::query_param<std::optional<force>>(*rq.req, "force")
@@ -564,7 +584,7 @@ ss::future<server::reply_t> put_mode_subject(
 
     enterprise::handle_config_mode_authz(
       rq,
-      ss::httpd::schema_registry_json::put_mode_subject.operations.nickname,
+      operation_name,
       auth_result,
       ctx_sub,
       security::acl_operation::alter_configs);
@@ -584,14 +604,15 @@ ss::future<server::reply_t> put_mode_subject(
 ss::future<server::reply_t> delete_mode_subject(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto ctx_sub = context_subject::from_string(
       parse::request_param<ss::sstring>(*rq.req, "subject"));
 
     enterprise::handle_config_mode_authz(
       rq,
-      ss::httpd::schema_registry_json::delete_mode_subject.operations.nickname,
+      operation_name,
       auth_result,
       ctx_sub,
       security::acl_operation::alter_configs);
@@ -602,7 +623,8 @@ ss::future<server::reply_t> delete_mode_subject(
     mode m{};
     try {
         if (ctx_sub.is_context_only()) {
-            m = co_await rq.service().schema_store().get_mode(ctx_sub.ctx);
+            m = co_await rq.service().schema_store().get_mode(
+              ctx_sub.ctx, default_to_global::no);
         } else {
             m = co_await rq.service().schema_store().get_mode(
               ctx_sub, default_to_global::no);
@@ -615,7 +637,10 @@ ss::future<server::reply_t> delete_mode_subject(
         throw;
     }
 
-    co_await rq.service().writer().delete_mode(ctx_sub);
+    auto deleted = co_await rq.service().writer().delete_mode(ctx_sub);
+    if (!deleted) {
+        throw as_exception(not_found(ctx_sub));
+    }
 
     auto resp = ppj::rjson_serialize_iobuf(mode_req_rep{.mode = m});
     log_response(*rq.req, resp);
@@ -637,7 +662,8 @@ get_schemas_types(server::request_t rq, server::reply_t rp) {
 ss::future<server::reply_t> get_schemas_ids_id(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto id = parse::request_param<schema_id>(*rq.req, "id");
     const auto format = parse_output_format(*rq.req);
@@ -656,7 +682,7 @@ ss::future<server::reply_t> get_schemas_ids_id(
 
     // Subject-based deferred authz (handles 403 vs 404)
     enterprise::handle_get_schemas_ids_id_authz(
-      rq, auth_result, result.matched_subjects);
+      rq, operation_name, auth_result, result.matched_subjects);
 
     if (!result.found()) {
         throw as_exception(not_found(id));
@@ -674,7 +700,8 @@ ss::future<server::reply_t> get_schemas_ids_id(
 ss::future<server::reply_t> get_schemas_ids_id_schema(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto id = parse::request_param<schema_id>(*rq.req, "id");
     const auto format = parse_output_format(*rq.req);
@@ -693,7 +720,7 @@ ss::future<server::reply_t> get_schemas_ids_id_schema(
 
     // Subject-based deferred authz (handles 403 vs 404)
     enterprise::handle_get_schemas_ids_id_authz(
-      rq, auth_result, result.matched_subjects);
+      rq, operation_name, auth_result, result.matched_subjects);
 
     if (!result.found()) {
         throw as_exception(not_found(id));
@@ -786,7 +813,8 @@ ss::future<ctx_server<service>::reply_t> get_schemas_ids_id_subjects(
 ss::future<server::reply_t> get_subjects(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
     auto inc_del{
       parse::query_param<std::optional<include_deleted>>(*rq.req, "deleted")
@@ -802,7 +830,7 @@ ss::future<server::reply_t> get_subjects(
 
     // Handle AuthZ - Filters res for the subjects the user is allowed to
     // see
-    enterprise::handle_get_subjects_authz(rq, auth_result, res);
+    enterprise::handle_get_subjects_authz(rq, operation_name, auth_result, res);
 
     // Convert context_subject to qualified string format for JSON response
     auto subjects_str = std::move(res) | std::views::as_rvalue
@@ -1194,8 +1222,9 @@ delete_subject_version(server::request_t rq, server::reply_t rp) {
           ctx_sub, version);
     } else {
         // Refuse to soft-delete the same thing twice
-        if (co_await rq.service().schema_store().is_subject_version_deleted(
-              ctx_sub, version)) {
+        if (
+          co_await rq.service().schema_store().is_subject_version_deleted(
+            ctx_sub, version)) {
             throw as_exception(soft_deleted(ctx_sub, version));
         }
 
@@ -1374,7 +1403,7 @@ post_security_acls(server::request_t rq, server::reply_t rp) {
     auto raw_acls = co_await rjson_parse(
       *rq.req, acl_handler<>{acl_handler<>::require_fields::yes});
 
-    std::vector<security::acl_binding> bindings;
+    chunked_vector<security::acl_binding> bindings;
     bindings.reserve(raw_acls.size());
 
     for (const auto& acl : raw_acls) {
@@ -1396,7 +1425,8 @@ post_security_acls(server::request_t rq, server::reply_t rp) {
 
     check_feature_ready(rq);
 
-    auto err_vec = co_await security_frontend.create_acls(bindings, 5s);
+    auto err_vec = co_await security_frontend.create_acls(
+      std::move(bindings), 5s);
 
     auto it = std::find_if(err_vec.begin(), err_vec.end(), [](const auto& err) {
         return err != cluster::errc::success;
@@ -1424,7 +1454,7 @@ delete_security_acls(server::request_t rq, server::reply_t rp) {
     auto raw_acls = co_await rjson_parse(
       *rq.req, acl_handler<>{acl_handler<>::require_fields::no});
 
-    std::vector<security::acl_binding_filter> filters;
+    chunked_vector<security::acl_binding_filter> filters;
     filters.reserve(raw_acls.size());
 
     for (const auto& acl : raw_acls) {
@@ -1445,7 +1475,7 @@ delete_security_acls(server::request_t rq, server::reply_t rp) {
       std::move(filters), 5s);
 
     auto res = chunked_vector<acl>{};
-    std::ranges::for_each(deleted, [&res](cluster::delete_acls_result r) {
+    std::ranges::for_each(deleted, [&res](cluster::delete_acls_result& r) {
         if (r.error != cluster::errc::success) {
             throw exception(
               error_code::internal_server_error,
@@ -1468,7 +1498,8 @@ delete_security_acls(server::request_t rq, server::reply_t rp) {
 ss::future<server::reply_t> get_contexts(
   server::request_t rq,
   server::reply_t rp,
-  std::optional<request_auth_result> auth_result) {
+  std::optional<request_auth_result> auth_result,
+  std::string_view operation_name) {
     parse_accept_header(rq, rp);
 
     co_await rq.service().writer().read_sync();
@@ -1477,7 +1508,7 @@ ss::future<server::reply_t> get_contexts(
       = co_await rq.service().schema_store().get_materialized_contexts();
 
     co_await enterprise::handle_get_contexts_authz(
-      rq, rq.service().schema_store(), auth_result, contexts);
+      rq, operation_name, rq.service().schema_store(), auth_result, contexts);
 
     auto contexts_str = std::move(contexts) | std::views::as_rvalue
                         | std::ranges::views::transform([](context&& ctx) {
@@ -1495,8 +1526,7 @@ ss::future<server::reply_t>
 delete_context(server::request_t rq, server::reply_t rp) {
     parse_accept_header(rq, rp);
 
-    auto ctx_str = parse::request_param<ss::sstring>(*rq.req, "context");
-    auto ctx = context{ctx_str};
+    auto ctx = context{parse_normalized_context(*rq.req)};
 
     if (ctx == default_context) {
         throw as_exception(

@@ -30,7 +30,8 @@ redpanda_cc_gtest(
     cpu = 1,
     deps = [
         ":state_test_utils",
-        "//src/v/cluster",
+        "//src/v/cluster:data_migrated_resources",
+        "//src/v/cluster:topic_table",
         "//src/v/config",
         "//src/v/datalake:catalog_schema_manager",
         "//src/v/datalake:logger",
@@ -72,6 +73,7 @@ redpanda_cc_gtest(
         "//src/v/datalake/coordinator:iceberg_file_committer",
         "//src/v/datalake/tests:test_utils",
         "//src/v/features",
+        "//src/v/iceberg:field_name_comparison",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/iceberg:manifest_entry",
         "//src/v/iceberg:manifest_io",
@@ -115,6 +117,23 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "catalog_config_test",
+    timeout = "short",
+    srcs = [
+        "catalog_config_test.cc",
+    ],
+    deps = [
+        "//src/v/datalake/coordinator:catalog_config",
+        "//src/v/iceberg:field_name_comparison",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:scoped_config",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "state_update_test",
     timeout = "short",
     srcs = [
@@ -143,7 +162,8 @@ redpanda_cc_gtest(
     cpu = 1,
     deps = [
         ":state_test_utils",
-        "//src/v/cluster",
+        "//src/v/cluster:data_migrated_resources",
+        "//src/v/cluster:topic_table",
         "//src/v/config",
         "//src/v/datalake:catalog_schema_manager",
         "//src/v/datalake:record_schema_resolver",
@@ -152,6 +172,7 @@ redpanda_cc_gtest(
         "//src/v/datalake/coordinator:stm",
         "//src/v/raft/tests:stm_test_fixture",
         "//src/v/storage",
+        "//src/v/test_utils:container_ostream",
         "@googletest//:gtest",
         "@seastar",
     ],

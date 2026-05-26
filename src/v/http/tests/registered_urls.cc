@@ -128,8 +128,9 @@ response registered_urls::lookup(const request_info& req) const {
 
     auto content_mapping = m_it->second;
     auto content = req.content;
-    if (auto c_it = content_mapping.find(content);
-        c_it != content_mapping.end()) {
+    if (
+      auto c_it = content_mapping.find(content);
+      c_it != content_mapping.end()) {
         return c_it->second;
     }
 
@@ -138,15 +139,6 @@ response registered_urls::lookup(const request_info& req) const {
       "The request map is not set with a default content key: {}",
       default_content);
     return content_mapping[default_content.data()];
-}
-
-std::ostream& operator<<(std::ostream& os, const response& resp) {
-    fmt::print(
-      os,
-      "{{status: {}, body: {}}}",
-      static_cast<uint>(resp.status),
-      resp.body);
-    return os;
 }
 
 } // namespace http_test_utils

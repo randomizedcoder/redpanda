@@ -18,7 +18,6 @@
 #include "model/fundamental.h"
 #include "model/tests/random_batch.h"
 #include "test_utils/async.h"
-#include "test_utils/test.h"
 
 #include <seastar/util/defer.hh>
 using namespace kafka::client;
@@ -456,8 +455,7 @@ TEST_F(consumer_test_mock, TestLeadershipChange) {
         .leader);
     cluster_mock.get_topics()[test_topic]
       .partitions[model::partition_id(0)]
-      .leader
-      = model::node_id(2);
+      .leader = model::node_id(2);
     // add some more data to partition 0
     make_data_available(test_topic, 0, 23);
 

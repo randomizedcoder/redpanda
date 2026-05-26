@@ -238,6 +238,37 @@ TEST(TableMetadataJsonSerde, TestTableMetadataNoOptionals) {
     ASSERT_EQ(roundtrip, parsed);
 }
 
+// Regression test: the Iceberg spec defines a sort field's column reference as
+// a single "source-id" int. Some catalogs (and our own writer) emit the
+// "source-ids" array form; the parser must accept both.
+TEST(TableMetadataJsonSerde, TestParseSortFieldSourceIdSingular) {
+    const auto* const field_json = R"JSON({
+      "transform": "identity",
+      "source-id": 5,
+      "direction": "asc",
+      "null-order": "nulls-first"
+    })JSON";
+    json::Document doc;
+    doc.Parse(field_json);
+    const auto parsed = parse_sort_field(doc);
+    ASSERT_EQ(1, parsed.source_ids.size());
+    EXPECT_EQ(nested_field::id_t{5}, parsed.source_ids[0]);
+    EXPECT_EQ(sort_direction::asc, parsed.direction);
+    EXPECT_EQ(null_order::nulls_first, parsed.null_order);
+}
+
+TEST(TableMetadataJsonSerde, TestParseSortFieldSourceIdNotInt) {
+    const auto* const field_json = R"JSON({
+      "transform": "identity",
+      "source-id": "five",
+      "direction": "asc",
+      "null-order": "nulls-first"
+    })JSON";
+    json::Document doc;
+    doc.Parse(field_json);
+    EXPECT_THROW(parse_sort_field(doc), std::invalid_argument);
+}
+
 TEST(TableMetadataJsonSerde, TestSchemaLookup) {
     const auto test_str = test_table_meta_json;
     json::Document parsed_orig_json;
@@ -249,11 +280,13 @@ TEST(TableMetadataJsonSerde, TestSchemaLookup) {
     ASSERT_NE(schema_by_id, nullptr);
 
     auto* schema_by_struct = parsed.get_equivalent_schema(
-      schema_by_id->schema_struct);
+      schema_by_id->schema_struct, iceberg::field_name_comparison::verbatim);
     ASSERT_NE(schema_by_struct, nullptr);
 
     EXPECT_EQ(*schema_by_id, *schema_by_struct);
     EXPECT_TRUE(
       iceberg::schemas_equivalent(
-        schema_by_id->schema_struct, schema_by_struct->schema_struct));
+        schema_by_id->schema_struct,
+        schema_by_struct->schema_struct,
+        iceberg::field_name_comparison::verbatim));
 }

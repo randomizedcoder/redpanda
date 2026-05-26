@@ -10,15 +10,17 @@
 
 #include "cloud_topics/level_one/domain/domain_supervisor.h"
 
+#include "cloud_io/cache_service.h"
 #include "cloud_topics/level_one/common/abstract_io.h"
 #include "cloud_topics/level_one/domain/db_domain_manager.h"
+#include "cloud_topics/level_one/domain/domain_manager_probe.h"
 #include "cloud_topics/level_one/domain/simple_domain_manager.h"
 #include "cloud_topics/level_one/metastore/lsm/stm.h"
 #include "cloud_topics/logger.h"
-#include "cloud_topics/types.h"
 #include "cluster/controller.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
+#include "config/configuration.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "ssx/when_all.h"
@@ -34,19 +36,22 @@ public:
     explicit impl(
       cluster::controller* controller,
       io* io,
-      std::filesystem::path staging_dir,
+      cloud_io::cache* cache,
       cloud_io::remote* remote,
-      cloud_storage_clients::bucket_name bucket)
+      cloud_storage_clients::bucket_name bucket,
+      ss::scheduling_group sg)
       : _controller(controller)
       , _object_io(io)
-      , _staging_dir(std::move(staging_dir))
+      , _cache(cache)
       , _remote(remote)
       , _bucket(std::move(bucket))
+      , _sg(sg)
       , _queue([](const std::exception_ptr& ex) {
           vlog(cd_log.error, "Unexpected domain supervisor error: {}", ex);
       }) {}
 
     ss::future<> start() {
+        _probe.setup_metrics();
         if (ss::this_shard_id() == 0) {
             _as = {};
             _loop = do_topic_reconciliation_loop();
@@ -104,8 +109,9 @@ public:
 
     ss::future<bool>
     maybe_create_metastore_topic(std::optional<int> num_partitions) {
-        if (_controller->get_topics_state().local().contains(
-              model::l1_metastore_nt)) {
+        if (
+          _controller->get_topics_state().local().contains(
+            model::l1_metastore_nt)) {
             co_return true;
         }
         co_return co_await create_domains_topic(num_partitions);
@@ -128,8 +134,9 @@ private:
         auto backoff = make_exponential_backoff_policy<ss::lowres_clock>(
           1s, 10s);
         while (!_as.abort_requested()) {
-            if (_controller->get_topics_state().local().contains(
-                  model::l1_metastore_nt)) {
+            if (
+              _controller->get_topics_state().local().contains(
+                model::l1_metastore_nt)) {
                 if (co_await ensure_domains_replication_factor()) {
                     break;
                 }
@@ -200,10 +207,11 @@ private:
           = tristate<std::chrono::milliseconds>();
         topic_props.cleanup_policy_bitflags
           = model::cleanup_policy_bitflags::none;
-        // NOTE: For now we just have a fixed number of domains for the entire
-        // cluster.
         co_return co_await create_topic(
-          tp_ns, num_partitions.value_or(default_num_l1_domains), topic_props);
+          tp_ns,
+          num_partitions.value_or(
+            config::shard_local_cfg().cloud_topics_num_metastore_partitions()),
+          topic_props);
     }
 
     ss::future<> update_topic(cluster::topic_properties_update update) {
@@ -323,10 +331,12 @@ private:
             domain_mgr = ss::make_shared<db_domain_manager>(
               *expected_term,
               stm_manager->get<stm>(),
-              _staging_dir,
+              _cache,
               _remote,
               _bucket,
-              _object_io);
+              _object_io,
+              _sg,
+              &_probe);
         } else {
             domain_mgr = ss::make_shared<simple_domain_manager>(
               stm_manager->get<simple_stm>(), _object_io);
@@ -337,9 +347,10 @@ private:
 
     cluster::controller* _controller;
     io* _object_io;
-    std::filesystem::path _staging_dir;
+    cloud_io::cache* _cache;
     cloud_io::remote* _remote;
     cloud_storage_clients::bucket_name _bucket;
+    ss::scheduling_group _sg;
 
     // Queue to process async work associated with starting and stopping domain
     // managers when handling partition notifications.
@@ -351,6 +362,8 @@ private:
     chunked_hash_map<domain_manager_id, ss::shared_ptr<domain_manager>>
       _domains;
 
+    domain_manager_probe _probe;
+
     std::optional<ss::future<>> _loop;
     ss::abort_source _as;
 };
@@ -358,12 +371,13 @@ private:
 domain_supervisor::domain_supervisor(
   cluster::controller* controller,
   io* io,
-  std::filesystem::path staging_dir,
+  cloud_io::cache* cache,
   cloud_io::remote* remote,
-  cloud_storage_clients::bucket_name bucket)
+  cloud_storage_clients::bucket_name bucket,
+  ss::scheduling_group sg)
   : _impl(
       std::make_unique<impl>(
-        controller, io, std::move(staging_dir), remote, std::move(bucket))) {}
+        controller, io, cache, remote, std::move(bucket), sg)) {}
 
 domain_supervisor::~domain_supervisor() = default;
 

@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "base/format_to.h"
 #include "cluster/cloud_metadata/error_outcome.h"
 #include "cluster/errc.h"
 #include "model/fundamental.h"
@@ -38,14 +39,13 @@ struct offsets_recovery_request
     operator==(const offsets_recovery_request&, const offsets_recovery_request&)
       = default;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const offsets_recovery_request& r) {
-        o << ssx::sformat(
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
           "{{ntp: {}, bucket: {}, offsets_snapshot_paths: {}}}",
-          r.offsets_ntp,
-          r.bucket,
-          r.offsets_snapshot_paths);
-        return o;
+          offsets_ntp,
+          bucket,
+          offsets_snapshot_paths);
     }
 };
 
@@ -59,14 +59,11 @@ struct offsets_recovery_reply
 
     auto serde_fields() { return std::tie(ec); }
 
-    friend bool
-    operator==(const offsets_recovery_reply&, const offsets_recovery_reply&)
-      = default;
+    friend bool operator==(
+      const offsets_recovery_reply&, const offsets_recovery_reply&) = default;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const offsets_recovery_reply& r) {
-        o << ssx::sformat("{{ec: {}}}", r.ec);
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "{{ec: {}}}", ec);
     }
 };
 
@@ -75,8 +72,7 @@ public:
     virtual ss::future<error_outcome> recover(
       retry_chain_node& parent_retry,
       const cloud_storage_clients::bucket_name& bucket,
-      std::vector<std::vector<cloud_storage::remote_segment_path>>)
-      = 0;
+      std::vector<std::vector<cloud_storage::remote_segment_path>>) = 0;
     virtual ~offsets_recovery_requestor() = default;
 };
 

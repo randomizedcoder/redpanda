@@ -15,18 +15,14 @@
 #include "cloud_topics/level_one/frontend_reader/level_one_reader.h"
 #include "cloud_topics/level_one/frontend_reader/tests/l1_reader_fixture.h"
 #include "cloud_topics/level_one/metastore/simple_metastore.h"
-#include "cloud_topics/log_reader_config.h"
 #include "container/chunked_circular_buffer.h"
 #include "model/fundamental.h"
 #include "model/record.h"
 #include "model/record_batch_reader.h"
 #include "model/tests/random_batch.h"
-#include "test_utils/test.h"
 
 #include <gtest/gtest.h>
 
-#include <chrono>
-#include <map>
 #include <optional>
 
 using namespace cloud_topics;
@@ -72,6 +68,10 @@ chunked_circular_buffer<model::record_batch> slice_by_offset(
 }
 
 } // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Correctness tests.
+// ---------------------------------------------------------------------------
 
 class l1_reader_test : public l1::l1_reader_fixture {};
 
@@ -232,11 +232,11 @@ TEST_F(l1_reader_test, read_with_strict_max_bytes) {
     make_l1_objects(std::move(tidp_batches)).get();
 
     {
-        // Set tiny max bytes to check we get no batches
+        // Set tiny max bytes — still returns one batch for progress.
         auto reader = make_reader(
           ntp, tidp, kafka::offset::min(), kafka::offset::max(), 1, true);
         auto result = read_all(std::move(reader));
-        EXPECT_TRUE(result.empty());
+        EXPECT_EQ(result.size(), 1);
     }
 
     {
@@ -282,7 +282,7 @@ TEST_F(l1_reader_test, missing_object) {
     // Register object in metastore but don't upload.
     // This is corruption and readers should throw.
     auto builder = _metastore.object_builder().get().value();
-    auto oid = builder->get_or_create_object_for(tidp).value();
+    auto oid = builder->get_or_create_object_for(tidp).get().value();
     builder
       ->add(
         oid,
@@ -329,7 +329,7 @@ TEST_F(l1_reader_test, empty_offset_range) {
     // to cover a non-empty offset range in the metastore.
     auto meta_builder = _metastore.object_builder().get().value();
 
-    auto oid = meta_builder->get_or_create_object_for(tidp).value();
+    auto oid = meta_builder->get_or_create_object_for(tidp).get().value();
 
     auto buf = iobuf{};
     auto builder = l1::object_builder::create(
@@ -575,4 +575,86 @@ TEST_F(l1_reader_test, read_offset_range_multiple_objects2) {
         EXPECT_EQ(batch.last_offset(), expected_offset);
         expected_offset += 1;
     }
+}
+
+// Lookahead tests: verify that lookahead_objects > 1 produces the same results
+// as the default single-object lookup path.
+TEST_F(l1_reader_test, lookahead_single_object) {
+    auto [ntp, tidp] = make_ntidp("test_topic");
+
+    auto batches = model::test::make_random_batches(model::offset{0}, 10).get();
+    auto expected = copy(batches);
+
+    std::vector<tidp_batches_t> tidp_batches;
+    tidp_batches.emplace_back(tidp, std::move(batches));
+    make_l1_objects(std::move(tidp_batches)).get();
+
+    // Read with lookahead enabled — should produce identical results.
+    auto reader = make_reader(
+      ntp,
+      tidp,
+      kafka::offset{0},
+      kafka::offset::max(),
+      std::numeric_limits<size_t>::max(),
+      /*strict_max_bytes=*/false,
+      /*lookahead_objects=*/10);
+    auto result = read_all(std::move(reader));
+    EXPECT_EQ(result, expected);
+}
+
+TEST_F(l1_reader_test, lookahead_multiple_objects) {
+    auto [ntp, tidp] = make_ntidp("test_topic");
+
+    // Create 3 separate objects with batches at increasing offsets.
+    auto batches1 = model::test::make_random_batches(model::offset{0}, 5).get();
+    auto next_offset = batches1.back().last_offset() + model::offset{1};
+    auto batches2 = model::test::make_random_batches(next_offset, 5).get();
+    next_offset = batches2.back().last_offset() + model::offset{1};
+    auto batches3 = model::test::make_random_batches(next_offset, 5).get();
+
+    // Collect expected batches.
+    chunked_circular_buffer<model::record_batch> expected;
+    for (auto& b : batches1) {
+        expected.push_back(b.share());
+    }
+    for (auto& b : batches2) {
+        expected.push_back(b.share());
+    }
+    for (auto& b : batches3) {
+        expected.push_back(b.share());
+    }
+
+    // Create three separate L1 objects.
+    {
+        std::vector<tidp_batches_t> tb;
+        tb.emplace_back(tidp, std::move(batches1));
+        make_l1_objects(std::move(tb)).get();
+    }
+    {
+        std::vector<tidp_batches_t> tb;
+        tb.emplace_back(tidp, std::move(batches2));
+        make_l1_objects(std::move(tb)).get();
+    }
+    {
+        std::vector<tidp_batches_t> tb;
+        tb.emplace_back(tidp, std::move(batches3));
+        make_l1_objects(std::move(tb)).get();
+    }
+
+    // Read with lookahead=10, which should batch-lookup all 3 objects.
+    auto reader = make_reader(
+      ntp,
+      tidp,
+      kafka::offset{0},
+      kafka::offset::max(),
+      std::numeric_limits<size_t>::max(),
+      /*strict_max_bytes=*/false,
+      /*lookahead_objects=*/10);
+    auto result = read_all(std::move(reader));
+    EXPECT_EQ(result, expected);
+
+    // Also verify without lookahead (regression test).
+    auto reader_no_prefetch = make_reader(ntp, tidp);
+    auto result_no_prefetch = read_all(std::move(reader_no_prefetch));
+    EXPECT_EQ(result_no_prefetch, expected);
 }

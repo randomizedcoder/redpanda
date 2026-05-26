@@ -12,16 +12,15 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_map.h"
+#include "base/format_to.h"
 #include "base/outcome.h"
 #include "base/vassert.h"
-#include "cloud_storage/remote_path_provider.h"
 #include "cluster/archival/archival_metadata_stm.h"
 #include "cluster/cluster_utils.h"
+#include "cluster/controller_utils.h"
 #include "cluster/errc.h"
 #include "cluster/fwd.h"
 #include "cluster/logger.h"
-#include "cluster/members_backend.h"
-#include "cluster/members_table.h"
 #include "cluster/partition.h"
 #include "cluster/partition_leaders_table.h"
 #include "cluster/partition_manager.h"
@@ -44,22 +43,14 @@
 #include "types.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/coroutine/switch_to.hh>
-#include <seastar/util/later.hh>
-#include <seastar/util/variant_utils.hh>
-
-#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <exception>
 #include <optional>
-#include <variant>
 
 /// on every core, sharded
 namespace cluster {
@@ -246,19 +237,21 @@ struct controller_backend::ntp_reconciliation_state {
         cur_operation->assignment = std::move(p_as);
     }
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const ntp_reconciliation_state& rs) {
-        fmt::print(
-          o,
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
           "{{pending_notifies: {},  properties_changed_at: {}, removed_at: {}, "
           "cur_operation: {}}}",
-          rs.pending_notifies,
-          rs.properties_changed_at,
-          rs.removed_at,
-          rs.cur_operation);
-        return o;
+          pending_notifies,
+          properties_changed_at,
+          removed_at,
+          cur_operation);
     }
 };
+
+} // namespace cluster
+
+namespace cluster {
 
 controller_backend::controller_backend(
   ss::sharded<topic_table>& tp_state,
@@ -509,8 +502,9 @@ controller_backend::calculate_learner_initial_offset(
      * Initial learner start offset only makes sense for partitions with cloud
      * storage data
      */
-    if (auto tp_cfg = p->get_topic_config();
-        tp_cfg.has_value() && tp_cfg->get().is_internal()) {
+    if (
+      auto tp_cfg = p->get_topic_config();
+      tp_cfg.has_value() && tp_cfg->get().is_internal()) {
         vlog(clusterlog.trace, "{} is part of an internal topic", p->ntp());
         return std::nullopt;
     }
@@ -964,7 +958,7 @@ ss::future<> controller_backend::try_reconcile_ntp(
         } catch (...) {
             vlog(
               clusterlog.warn,
-              "[{}] exception occured during reconciliation: {}",
+              "[{}] exception occurred during reconciliation: {}",
               ntp,
               std::current_exception());
             last_error = errc::partition_operation_failed;
@@ -1336,8 +1330,9 @@ controller_backend::reconcile_partition_reconfiguration(
           "(leader: {})",
           partition->ntp(),
           leader);
-        if (can_finish_update(
-              leader, update.get_state(), update.get_resulting_replicas())) {
+        if (
+          can_finish_update(
+            leader, update.get_state(), update.get_resulting_replicas())) {
             auto ec = co_await dispatch_update_finished(
               partition->ntp(), update.get_resulting_replicas());
             if (ec) {
@@ -2145,20 +2140,18 @@ controller_backend::split_voters_learners_for_force_reconfiguration(
       command_revision);
     return std::make_pair(std::move(voters), std::move(learners));
 }
-
-std::ostream& operator<<(
-  std::ostream& o, const controller_backend::in_progress_operation& op) {
-    fmt::print(
-      o,
+fmt::iterator
+controller_backend::in_progress_operation::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{revision: {}, type: {}, assignment: {}, retries: {}, "
       "last_error: {} ({})}}",
-      op.revision,
-      op.type,
-      op.assignment,
-      op.retries,
-      op.last_error,
-      std::error_code{op.last_error}.message());
-    return o;
+      revision,
+      type,
+      assignment,
+      retries,
+      last_error,
+      std::error_code{last_error}.message());
 }
 
 } // namespace cluster

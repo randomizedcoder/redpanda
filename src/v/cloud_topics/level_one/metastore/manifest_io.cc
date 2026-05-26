@@ -16,8 +16,6 @@
 
 #include <seastar/coroutine/as_future.hh>
 
-#include <fmt/format.h>
-
 using namespace std::chrono_literals;
 
 namespace cloud_topics::l1 {
@@ -25,8 +23,8 @@ namespace cloud_topics::l1 {
 namespace {
 cloud_storage_clients::object_key
 manifest_path(const cloud_storage::remote_label& remote_label) {
-    return cloud_storage_clients::object_key{
-      fmt::format("{}/level_one/metastore.bin", remote_label.cluster_uuid)};
+    return cloud_storage_clients::object_key{fmt::format(
+      "level_one/meta/metastore/{}/manifest.bin", remote_label.cluster_uuid)};
 }
 } // namespace
 

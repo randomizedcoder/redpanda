@@ -9,6 +9,7 @@
  * by the Apache License, Version 2.0
  */
 
+#include "cluster/cluster_utils.h"
 #include "cluster/controller.h"
 #include "cluster/controller_api.h"
 #include "cluster/metadata_cache.h"
@@ -28,9 +29,8 @@
 
 #include <seastar/json/json_elements.hh>
 
-#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/trim.hpp>
 #include <boost/lexical_cast.hpp>
 
 using admin::apply_validator;
@@ -462,8 +462,9 @@ ss::future<std::vector<model::broker_shard>> validate_set_replicas(
 ss::future<ss::json::json_return_type>
 admin_server::force_set_partition_replicas_handler(
   std::unique_ptr<ss::http::request> req) {
-    if (unlikely(!_controller->get_feature_table().local().is_active(
-          features::feature::force_partition_reconfiguration))) {
+    if (
+      unlikely(!_controller->get_feature_table().local().is_active(
+        features::feature::force_partition_reconfiguration))) {
         throw ss::httpd::bad_request_exception(
           "Feature not active yet, upgrade in progress?");
     }

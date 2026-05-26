@@ -12,6 +12,7 @@
 #include "model/metadata.h"
 #include "net/dns.h"
 #include "net/tls_certificate_probe.h"
+#include "pandaproxy/default_404_handler.h"
 #include "pandaproxy/json/types.h"
 #include "pandaproxy/logger.h"
 #include "pandaproxy/probe.h"
@@ -19,13 +20,10 @@
 #include "rpc/rpc_utils.h"
 #include "utils/truncating_logger.h"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/http/function_handlers.hh>
+#include <seastar/core/coroutine.hh> // NOLINT(misc-include-cleaner): required for co_await/co_return coroutine support
+#include <seastar/http/function_handlers.hh> // NOLINT(misc-include-cleaner): provides ss::httpd::handler_base
 #include <seastar/http/reply.hh>
 #include <seastar/net/tls.hh>
-
-#include <fmt/chrono.h>
-#include <fmt/ranges.h>
 
 #include <charconv>
 #include <exception>
@@ -261,6 +259,10 @@ ss::future<> server::start(
     _server._routes.register_exeption_handler(
       exception_replier{ss::sstring{name(_exceptional_mime_type)}, _log});
 
+    _default_handler = std::make_unique<default_404_handler>(
+      ss::sstring{name(_exceptional_mime_type)});
+    _server._routes.add_default_handler(_default_handler.get());
+
     _probe = std::make_unique<server_probe>(_ctx, _public_metrics_group_name);
 
     _ctx.advertised_listeners.reserve(endpoints.size());
@@ -310,7 +312,7 @@ ss::future<> server::stop() {
     return _pending_reqs.close().finally([this]() {
         _ctx.as.request_abort();
         _probe.reset(nullptr);
-        return _server.stop();
+        return _server.stop().finally([this]() { _default_handler.reset(); });
     });
 }
 

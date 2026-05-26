@@ -17,11 +17,10 @@
 #include "kafka/protocol/types.h"
 #include "model/record.h"
 #include "raft/errc.h"
+#include "ssx/future-util.h"
 #include "storage/record_batch_builder.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/util/bool_class.hh>
 
 #include <cstdint>
 #include <optional>
@@ -878,7 +877,7 @@ void tm_stm_factory::create(
   raft::consensus* raft,
   const cluster::stm_instance_config&) {
     auto tm_stm = builder.create_stm<cluster::tm_stm>(txlog, raft);
-    raft->log()->stm_manager()->add_stm(tm_stm);
+    raft->log()->stm_hookset()->add_stm(tm_stm);
 }
 
 } // namespace cluster

@@ -8,41 +8,28 @@
  * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
  */
 
-#include "base/vlog.h"
 #include "bytes/bytes.h"
-#include "bytes/iostream.h"
-#include "cloud_io/io_result.h"
-#include "cloud_io/remote.h"
 #include "cloud_topics/level_zero/batcher/batcher.h"
 #include "cloud_topics/level_zero/common/extent_meta.h"
 #include "cloud_topics/object_utils.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/record.h"
-#include "model/record_batch_reader.h"
-#include "model/tests/random_batch.h"
-#include "model/timeout_clock.h"
 #include "model/timestamp.h"
-#include "random/generators.h"
 #include "remote_mock.h"
 #include "storage/record_batch_builder.h"
 #include "test_utils/random_bytes.h"
+#include "test_utils/scoped_config.h"
 #include "test_utils/test.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/loop.hh>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/manual_clock.hh>
-#include <seastar/core/sharded.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/log.hh>
-#include <seastar/util/noncopyable_function.hh>
 
 #include <chrono>
-#include <exception>
 #include <iterator>
-#include <memory>
 #include <system_error>
 
 inline ss::logger test_log("aggregated_uploader_gtest");
@@ -89,6 +76,11 @@ public:
     seastar::future<cloud_topics::cluster_epoch>
     current_epoch(seastar::abort_source*) override {
         return seastar::make_ready_future<cloud_topics::cluster_epoch>(0);
+    }
+
+    seastar::future<>
+    invalidate_epoch_below(cloud_topics::cluster_epoch) override {
+        return ss::now();
     }
 };
 
@@ -179,8 +171,8 @@ TEST_CORO(batcher_test, single_write_request) {
     // Check that uuid in the placeholder can be used to
     // access the data in S3.
     auto placeholder_batches = std::move(write_res.value());
-    ASSERT_EQ_CORO(placeholder_batches.size(), num_batches);
-    for (const cloud_topics::extent_meta& ext : placeholder_batches) {
+    ASSERT_EQ_CORO(placeholder_batches.extents.size(), num_batches);
+    for (const cloud_topics::extent_meta& ext : placeholder_batches.extents) {
         auto sid = cloud_topics::object_path_factory::level_zero_path(ext.id);
         ASSERT_EQ_CORO(sid, id);
     }
@@ -227,9 +219,8 @@ TEST_CORO(batcher_test, many_write_requests) {
 
     const auto timeout = 1s;
     auto deadline = ss::manual_clock::now() + timeout;
-    std::vector<ss::future<std::expected<
-      chunked_vector<cloud_topics::extent_meta>,
-      std::error_code>>>
+    std::vector<
+      ss::future<std::expected<cloud_topics::upload_meta, std::error_code>>>
       futures;
     futures.push_back(pipeline.write_and_debounce(
       model::controller_ntp, min_epoch, std::move(reader1), deadline));
@@ -260,8 +251,10 @@ TEST_CORO(batcher_test, many_write_requests) {
         // access the data in S3. All placeholders should share the same
         // uuid.
         auto placeholder_batches = std::move(write_res.value());
-        ASSERT_EQ_CORO(placeholder_batches.size(), expected_num_batches.at(ix));
-        for (const cloud_topics::extent_meta& ext : placeholder_batches) {
+        ASSERT_EQ_CORO(
+          placeholder_batches.extents.size(), expected_num_batches.at(ix));
+        for (const cloud_topics::extent_meta& ext :
+             placeholder_batches.extents) {
             auto sid = cloud_topics::object_path_factory::level_zero_path(
               ext.id);
             ASSERT_EQ_CORO(sid, id);
@@ -345,13 +338,86 @@ TEST_CORO(batcher_test, expired_write_request) {
     ASSERT_TRUE_CORO(pass_result.has_value());
     auto placeholder_batches = std::move(pass_result.value());
 
-    ASSERT_EQ_CORO(placeholder_batches.size(), expected_num_batches);
-    for (const cloud_topics::extent_meta& ext : placeholder_batches) {
+    ASSERT_EQ_CORO(placeholder_batches.extents.size(), expected_num_batches);
+    for (const cloud_topics::extent_meta& ext : placeholder_batches.extents) {
         auto sid = cloud_topics::object_path_factory::level_zero_path(ext.id);
         ASSERT_EQ_CORO(sid, id);
     }
 }
 
-// TODO: add more tests
-// - behaviour in case if pending write request sizes exceed L0 object size
-// limit
+TEST_CORO(batcher_test, chunk_splitting_balances_upload_sizes) {
+    scoped_config cfg;
+    // Use a small threshold so test data splits into multiple chunks.
+    cfg.get("cloud_topics_produce_batching_size_threshold")
+      .set_value(size_t{4096});
+
+    remote_mock mock;
+    mock.expect_upload_object_repeatedly();
+
+    cloud_storage_clients::bucket_name bucket("foo");
+    cloud_topics::l0::write_pipeline<ss::manual_clock> pipeline;
+    static_cluster_services cluster_services;
+    cloud_topics::l0::batcher<ss::manual_clock> batcher(
+      pipeline.register_write_pipeline_stage(),
+      bucket,
+      mock,
+      &cluster_services);
+    cloud_topics::l0::write_pipeline_accessor pipeline_accessor{
+      .pipeline = &pipeline,
+    };
+
+    // Push several write requests. Each has 1 batch with 10 records
+    // (~3KB serialized), so 6 requests total ~18KB. With threshold=4096
+    // this should produce multiple balanced chunks.
+    const int num_requests = 6;
+    std::vector<
+      ss::future<std::expected<cloud_topics::upload_meta, std::error_code>>>
+      futures;
+
+    const auto timeout = 10s;
+    auto deadline = ss::manual_clock::now() + timeout;
+
+    for (int i = 0; i < num_requests; i++) {
+        auto [_, records, batches] = get_random_batches(1, 10);
+        futures.push_back(pipeline.write_and_debounce(
+          model::controller_ntp, min_epoch, std::move(batches), deadline));
+    }
+
+    // Wait for all write requests to be staged in the pipeline
+    // before starting the batcher. subscribe() checks pre-existing
+    // pending data, so bg_controller_loop's wait_next will return
+    // immediately seeing all requests at once.
+    co_await sleep_until(10ms, [&] {
+        return pipeline_accessor.write_requests_pending(num_requests);
+    });
+
+    // Start the batcher — bg_controller_loop will pull all 6 requests
+    // in one batch and split them into balanced chunks.
+    co_await batcher.start();
+
+    // Wait for all write request futures to resolve (the batcher
+    // loop processes chunks via spawn_with_gate, which sets the
+    // promises on each write request).
+    auto results = co_await ss::when_all_succeed(std::move(futures));
+    for (auto& res : results) {
+        ASSERT_TRUE_CORO(res.has_value());
+    }
+
+    co_await batcher.stop();
+
+    // Multiple uploads should happen since total data exceeds threshold.
+    ASSERT_GT_CORO(mock.payloads.size(), size_t{1});
+
+    // Verify uploads are balanced: no upload should be excessively small
+    // compared to the average.
+    size_t total_payload = 0;
+    for (const auto& p : mock.payloads) {
+        total_payload += p.size();
+    }
+    size_t avg_size = total_payload / mock.payloads.size();
+    for (size_t i = 0; i < mock.payloads.size(); i++) {
+        EXPECT_GE(mock.payloads[i].size(), avg_size / 3)
+          << "Upload " << i << " size " << mock.payloads[i].size()
+          << " is too small relative to average " << avg_size;
+    }
+}

@@ -10,11 +10,12 @@
 
 #include "cloud_topics/level_zero/stm/ctp_stm_state.h"
 #include "cloud_topics/types.h"
-#include "gtest/gtest.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
-#include "test_utils/test.h"
-#include "utils/uuid.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/optional.h"
+#include "serde/rw/rw.h"
+#include "serde/rw/vector.h"
 
 #include <gtest/gtest.h>
 
@@ -26,7 +27,7 @@ namespace {
 TEST(ctp_stm_state_test, initial_state) {
     ct::ctp_stm_state state;
     EXPECT_FALSE(state.get_max_applied_epoch().has_value());
-    EXPECT_FALSE(state.get_max_seen_epoch().has_value());
+    EXPECT_FALSE(state.get_max_seen_epoch(model::term_id(1)).has_value());
     EXPECT_FALSE(state.get_last_reconciled_offset().has_value());
     EXPECT_FALSE(state.get_last_reconciled_log_offset().has_value());
     EXPECT_EQ(state.get_max_collectible_offset(), model::offset::min());
@@ -40,14 +41,14 @@ TEST(ctp_stm_state_test, advance_max_seen_epoch) {
     model::term_id term(1);
 
     state.advance_max_seen_epoch(term, epoch1);
-    EXPECT_EQ(state.get_max_seen_epoch().value(), epoch1);
+    EXPECT_EQ(state.get_max_seen_epoch(term).value(), epoch1);
 
     state.advance_max_seen_epoch(term, epoch2);
-    EXPECT_EQ(state.get_max_seen_epoch().value(), epoch2);
+    EXPECT_EQ(state.get_max_seen_epoch(term).value(), epoch2);
 
     // Should not go backwards
     state.advance_max_seen_epoch(term, epoch3);
-    EXPECT_EQ(state.get_max_seen_epoch().value(), epoch2);
+    EXPECT_EQ(state.get_max_seen_epoch(term).value(), epoch2);
 }
 
 TEST(ctp_stm_state_test, advance_epoch) {
@@ -55,20 +56,21 @@ TEST(ctp_stm_state_test, advance_epoch) {
     ct::cluster_epoch epoch1(15);
     ct::cluster_epoch epoch2(25);
     ct::cluster_epoch epoch3(10);
+    model::term_id term(1);
 
     state.advance_epoch(epoch1, model::offset(1));
     EXPECT_EQ(state.get_max_applied_epoch().value(), epoch1);
     // advance_epoch does not update the seen window
-    EXPECT_FALSE(state.get_max_seen_epoch().has_value());
+    EXPECT_FALSE(state.get_max_seen_epoch(term).has_value());
 
     state.advance_epoch(epoch2, model::offset(2));
     EXPECT_EQ(state.get_max_applied_epoch().value(), epoch2);
-    EXPECT_FALSE(state.get_max_seen_epoch().has_value());
+    EXPECT_FALSE(state.get_max_seen_epoch(term).has_value());
 
     // Should not go backwards
     state.advance_epoch(epoch3, model::offset(3));
     EXPECT_EQ(state.get_max_applied_epoch().value(), epoch2);
-    EXPECT_FALSE(state.get_max_seen_epoch().has_value());
+    EXPECT_FALSE(state.get_max_seen_epoch(term).has_value());
 }
 
 TEST(ctp_stm_state_test, advance_epoch_on_a_follower) {
@@ -80,7 +82,7 @@ TEST(ctp_stm_state_test, advance_epoch_on_a_follower) {
 
     state.advance_epoch(advance_epoch, model::offset(1));
 
-    EXPECT_FALSE(state.get_max_seen_epoch().has_value());
+    EXPECT_FALSE(state.get_max_seen_epoch(model::term_id{1}).has_value());
     EXPECT_EQ(state.get_max_applied_epoch().value(), advance_epoch);
 }
 
@@ -467,6 +469,29 @@ TEST(ctp_stm_state_test, l0_simulation) {
         auto op = random_generators::random_choice(possible_operations);
         op();
     }
+}
+
+TEST(ctp_stm_state_test, allowed_local_start_offset_defaults_to_nullopt) {
+    ct::ctp_stm_state s;
+    EXPECT_FALSE(s.get_allowed_local_start_offset().has_value());
+}
+
+TEST(ctp_stm_state_test, set_then_get_allowed_local_start_offset) {
+    ct::ctp_stm_state s;
+    s.set_allowed_local_start_offset(kafka::offset{42});
+    ASSERT_TRUE(s.get_allowed_local_start_offset().has_value());
+    EXPECT_EQ(*s.get_allowed_local_start_offset(), kafka::offset{42});
+    s.set_allowed_local_start_offset(std::nullopt);
+    EXPECT_FALSE(s.get_allowed_local_start_offset().has_value());
+}
+
+TEST(ctp_stm_state_test, allowed_local_start_offset_round_trips_through_serde) {
+    ct::ctp_stm_state s;
+    s.set_allowed_local_start_offset(kafka::offset{1234});
+    auto buf = serde::to_iobuf(s);
+    auto s2 = serde::from_iobuf<ct::ctp_stm_state>(std::move(buf));
+    ASSERT_TRUE(s2.get_allowed_local_start_offset().has_value());
+    EXPECT_EQ(*s2.get_allowed_local_start_offset(), kafka::offset{1234});
 }
 
 } // anonymous namespace

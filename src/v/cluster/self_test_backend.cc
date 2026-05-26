@@ -14,13 +14,9 @@
 #include "base/seastarx.h"
 #include "base/vlog.h"
 #include "cluster/logger.h"
-#include "json/document.h"
 #include "ssx/future-util.h"
 
-#include <seastar/core/abort_source.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/loop.hh>
 #include <seastar/util/log.hh>
 
 namespace cluster {
@@ -243,10 +239,11 @@ ss::future<netcheck_response>
 self_test_backend::netcheck(model::node_id source, iobuf&& iob) {
     static const auto reset_threshold = 200ms;
     auto now = ss::lowres_clock::now();
-    if (likely(
-          _prev_nc.source == source
-          || _prev_nc.source == previous_netcheck_entity::unassigned
-          || ((_prev_nc.last_request + reset_threshold) < now))) {
+    if (
+      likely(
+        _prev_nc.source == source
+        || _prev_nc.source == previous_netcheck_entity::unassigned
+        || ((_prev_nc.last_request + reset_threshold) < now))) {
         _prev_nc = previous_netcheck_entity{
           .source = source, .last_request = now};
         co_return netcheck_response{.bytes_read = iob.size_bytes()};

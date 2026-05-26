@@ -246,6 +246,7 @@ translation_task::translation_task(
   record_translator& record_translator,
   table_creator& table_creator,
   model::iceberg_invalid_record_action invalid_record_action,
+  iceberg::field_name_comparison norm,
   location_provider location_provider,
   translation_probe& probe)
   : _log(datalake_log, fmt::format("{}", ntp))
@@ -266,6 +267,7 @@ translation_task::translation_task(
       *_record_translator,
       *_table_creator,
       _invalid_record_action,
+      norm,
       _location_provider,
       *_translation_probe,
       features) {}
@@ -408,26 +410,4 @@ size_t translation_task::buffered_bytes() const {
     return _multiplexer.buffered_bytes();
 }
 
-std::ostream& operator<<(std::ostream& o, translation_task::errc ec) {
-    switch (ec) {
-    case translation_task::errc::file_io_error:
-        return o << "local file IO error";
-    case translation_task::errc::cloud_io_error:
-        return o << "cloud IO error";
-    case translation_task::errc::flush_error:
-        return o << "writer flush error";
-    case translation_task::errc::no_data:
-        return o << "no data to translate";
-    case translation_task::errc::oom_error:
-        return o << "memory exhausted";
-    case translation_task::errc::time_limit_exceeded:
-        return o << "time limit exceeded";
-    case translation_task::errc::shutting_down:
-        return o << "shutting down";
-    case translation_task::errc::out_of_disk:
-        return o << "disk exhausted";
-    case translation_task::errc::type_resolution_error:
-        return o << "type resolution error";
-    }
-}
 } // namespace datalake

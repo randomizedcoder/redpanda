@@ -65,14 +65,13 @@ bool datalake_throttle_manager::needs_throttling() const {
                 > ratio.value() * _disk_space_info->total;
 }
 
-std::ostream&
-operator<<(std::ostream& o, const datalake_throttle_manager::status& s) {
-    fmt::print(
-      o,
+fmt::iterator
+datalake_throttle_manager::status::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{max_shares_assigned: {}, total_translation_backlog: {}}}",
-      s.max_shares_assigned,
-      human::bytes(s.total_translation_backlog));
-    return o;
+      max_shares_assigned,
+      human::bytes(total_translation_backlog));
 }
 
 datalake_throttle_manager::datalake_throttle_manager(
@@ -158,7 +157,7 @@ ss::future<> datalake_throttle_manager::gc_and_update_global_producers_map() {
      * total backlog
      */
     auto shard_local_maps = co_await ssx::parallel_transform(
-      boost::irange(ss::smp::count), [this](auto shard_id) {
+      boost::irange(ss::this_smp_shard_count()), [this](auto shard_id) {
           return container().invoke_on(
             shard_id,
             [status = _translation_status, disk_space_info = _disk_space_info](

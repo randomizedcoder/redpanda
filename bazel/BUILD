@@ -70,3 +70,27 @@ filegroup(
     srcs = ["bench_wrapper.py"],
     visibility = ["//visibility:public"],
 )
+
+bool_flag(
+    name = "io_uring",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "io_uring_enabled",
+    flag_values = {
+        ":io_uring": "true",
+    },
+)
+
+bool_flag(
+    name = "antithesis",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "antithesis_enabled",
+    flag_values = {
+        ":antithesis": "true",
+    },
+)

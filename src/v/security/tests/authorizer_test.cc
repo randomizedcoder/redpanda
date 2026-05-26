@@ -8,18 +8,17 @@
 // by the Apache License, Version 2.0
 #include "absl/container/flat_hash_set.h"
 #include "config/mock_property.h"
+#include "container/chunked_vector.h"
+#include "kafka/protocol/types.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "random/generators.h"
 #include "security/acl.h"
 #include "security/authorizer.h"
 #include "security/role.h"
 #include "security/role_store.h"
-#include "utils/base64.h"
 
 #include <seastar/util/defer.hh>
 
-#include <boost/algorithm/string.hpp>
-#include <fmt/ostream.h>
 #include <gtest/gtest.h>
 
 namespace security {
@@ -137,7 +136,7 @@ TEST(AUTHORIZER_TEST, authz_empty_resource_name) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::group, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, acl);
@@ -177,7 +176,7 @@ TEST(AUTHORIZER_TEST, authz_deny_applies_first) {
 
     acl_entry deny(user, host, acl_operation::all, acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, allow);
@@ -215,7 +214,7 @@ TEST(AUTHORIZER_TEST, authz_allow_all) {
       acl_operation::all,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, acl);
@@ -255,7 +254,7 @@ TEST(AUTHORIZER_TEST, authz_super_user_allow) {
       acl_operation::all,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, acl);
@@ -406,7 +405,7 @@ TEST(AUTHORIZER_TEST, authz_wildcards) {
     acl_entry read_acl(
       user1, host1, acl_operation::read, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern wildcard_resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(wildcard_resource, read_acl);
@@ -534,7 +533,7 @@ static void do_implied_acls(
         auto auth = make_test_instance(
           authorizer::allow_empty_matches::no, roles);
 
-        std::vector<acl_binding> bindings;
+        chunked_vector<acl_binding> bindings;
         resource_pattern resource(
           resource_type::cluster, default_cluster_name, pattern_type::literal);
         bindings.emplace_back(resource, acl);
@@ -603,7 +602,7 @@ static void do_implied_acls(
         auto auth = make_test_instance(
           authorizer::allow_empty_matches::no, roles);
 
-        std::vector<acl_binding> bindings;
+        chunked_vector<acl_binding> bindings;
         resource_pattern resource(
           resource_type::cluster, default_cluster_name, pattern_type::literal);
         bindings.emplace_back(resource, deny);
@@ -704,7 +703,7 @@ TEST(AUTHORIZER_TEST, authz_allow_for_all_wildcard_resource) {
 
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, acl);
@@ -733,13 +732,13 @@ TEST(AUTHORIZER_TEST, authz_allow_for_all_wildcard_resource) {
 TEST(AUTHORIZER_TEST, authz_remove_acl_wildcard_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(wildcard_resource, allow_read_acl);
     bindings.emplace_back(wildcard_resource, allow_write_acl);
     auth.add_bindings(bindings);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(wildcard_resource, allow_read_acl);
         auth.remove_bindings(filters);
     }
@@ -751,12 +750,12 @@ TEST(AUTHORIZER_TEST, authz_remove_acl_wildcard_resource) {
 TEST(AUTHORIZER_TEST, authz_remove_all_acl_wildcard_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(wildcard_resource, allow_read_acl);
     auth.add_bindings(bindings);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(wildcard_resource, acl_entry_filter::any());
         auth.remove_bindings(filters);
     }
@@ -778,7 +777,7 @@ TEST(AUTHORIZER_TEST, authz_allow_for_all_prefixed_resource) {
 
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, "foo", pattern_type::prefixed);
     bindings.emplace_back(resource, acl);
@@ -807,13 +806,13 @@ TEST(AUTHORIZER_TEST, authz_allow_for_all_prefixed_resource) {
 TEST(AUTHORIZER_TEST, authz_remove_acl_prefixed_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(prefixed_resource, allow_read_acl);
     bindings.emplace_back(prefixed_resource, allow_write_acl);
     auth.add_bindings(bindings);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(prefixed_resource, allow_read_acl);
         auth.remove_bindings(filters);
     }
@@ -825,12 +824,12 @@ TEST(AUTHORIZER_TEST, authz_remove_acl_prefixed_resource) {
 TEST(AUTHORIZER_TEST, authz_remove_all_acl_prefixed_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(prefixed_resource, allow_read_acl);
     auth.add_bindings(bindings);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(prefixed_resource, acl_entry_filter::any());
         auth.remove_bindings(filters);
     }
@@ -843,7 +842,7 @@ TEST(AUTHORIZER_TEST, authz_remove_all_acl_prefixed_resource) {
 TEST(AUTHORIZER_TEST, authz_acls_on_literal_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(default_resource, allow_read_acl);
     bindings.emplace_back(default_resource, allow_write_acl);
     auth.add_bindings(bindings);
@@ -879,7 +878,7 @@ TEST(AUTHORIZER_TEST, authz_acls_on_literal_resource) {
 TEST(AUTHORIZER_TEST, authz_acls_on_wildcard_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(wildcard_resource, allow_read_acl);
     bindings.emplace_back(wildcard_resource, allow_write_acl);
     auth.add_bindings(bindings);
@@ -905,7 +904,7 @@ TEST(AUTHORIZER_TEST, authz_acls_on_wildcard_resource) {
 TEST(AUTHORIZER_TEST, authz_acls_on_prefixed_resource) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(prefixed_resource, allow_read_acl);
     bindings.emplace_back(prefixed_resource, allow_write_acl);
     auth.add_bindings(bindings);
@@ -935,7 +934,7 @@ TEST(AUTHORIZER_TEST, authz_auth_prefix_resource) {
     auto auth = make_test_instance();
 
     auto add_acl = [&auth](ss::sstring name, pattern_type type) {
-        std::vector<acl_binding> bindings;
+        chunked_vector<acl_binding> bindings;
         bindings.emplace_back(
           resource_pattern(resource_type::topic, name, type), deny_read_acl);
         auth.add_bindings(bindings);
@@ -979,7 +978,7 @@ TEST(AUTHORIZER_TEST, authz_auth_prefix_resource) {
     ASSERT_EQ(result.resource_type, security::resource_type::topic);
     ASSERT_EQ(result.resource_name, default_resource.name());
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(prefixed_resource, allow_read_acl);
     auth.add_bindings(bindings);
 
@@ -1008,7 +1007,7 @@ TEST(AUTHORIZER_TEST, authz_single_char) {
 
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource{resource_type::topic, "f", pattern_type::literal};
     bindings.emplace_back(resource, allow_read_acl);
     auth.add_bindings(bindings);
@@ -1081,7 +1080,7 @@ TEST(AUTHORIZER_TEST, authz_get_acls_principal) {
 
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(
       default_resource,
       acl_entry(
@@ -1094,7 +1093,7 @@ TEST(AUTHORIZER_TEST, authz_get_acls_principal) {
     ASSERT_EQ(get_acls(auth, user).size(), 1);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(default_resource, acl_entry_filter::any());
         auth.remove_bindings(filters);
     }
@@ -1156,7 +1155,7 @@ TEST(AUTHORIZER_TEST, authz_acl_filter) {
     auto auth = make_test_instance();
     auth.add_bindings({acl1, acl2, acl3, acl4});
 
-    auto to_set = [](std::vector<acl_binding> bindings) {
+    auto to_set = [](chunked_vector<acl_binding> bindings) {
         absl::flat_hash_set<acl_binding> ret(bindings.begin(), bindings.end());
         return ret;
     };
@@ -1215,7 +1214,7 @@ TEST(AUTHORIZER_TEST, authz_topic_acl) {
     acl_entry acl7(
       user3, acl_wildcard_host, acl_operation::write, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, "topic1", pattern_type::literal);
     bindings.emplace_back(resource, acl1);
@@ -1367,7 +1366,7 @@ TEST(AUTHORIZER_TEST, authz_topic_acl) {
 TEST(AUTHORIZER_TEST, authz_topic_group_same_name) {
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
 
     resource_pattern resource(
       resource_type::topic, "topic-foo", pattern_type::prefixed);
@@ -1451,7 +1450,7 @@ TEST(AUTHORIZER_TEST, role_authz_simple_allow) {
     acl_entry acl3(
       user4, host_any, acl_operation::write, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
 
     resource_pattern resource(
       resource_type::topic, topic1(), pattern_type::literal);
@@ -1576,7 +1575,7 @@ TEST(AUTHORIZER_TEST, role_authz_user_deny_applies_first) {
       acl_operation::all,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, deny_user);
@@ -1659,7 +1658,7 @@ TEST(AUTHORIZER_TEST, role_authz_role_deny_applies_first) {
       acl_operation::write,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_user);
@@ -1729,7 +1728,7 @@ TEST(AUTHORIZER_TEST, role_authz_get_acls_principal) {
 
     auto auth = make_test_instance();
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(
       default_resource,
       acl_entry(
@@ -1740,7 +1739,7 @@ TEST(AUTHORIZER_TEST, role_authz_get_acls_principal) {
     ASSERT_EQ(get_acls(auth, role).size(), 1);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(default_resource, acl_entry_filter::any());
         auth.remove_bindings(filters);
     }
@@ -1776,7 +1775,7 @@ TEST(AUTHORIZER_TEST, role_authz_wildcard_no_auth) {
 
     // NOTE(oren): again, note that this usage would be rejected at Kafka layer,
     // but it's probably a good idea to codify expected behavior somewhere.
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(
       resource_pattern{
         resource_type::topic, default_topic(), pattern_type::literal},
@@ -1827,7 +1826,7 @@ TEST(AUTHORIZER_TEST, role_authz_user_same_name) {
       acl_operation::read,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_user);
@@ -1899,13 +1898,13 @@ TEST(AUTHORIZER_TEST, role_authz_remove_binding_multiple_match) {
     static const acl_entry allow_write_acl(
       user_p, acl_wildcard_host, acl_operation::write, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(wildcard_resource, allow_read_acl);
     bindings.emplace_back(wildcard_resource, allow_write_acl);
     auth.add_bindings(bindings);
 
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(wildcard_resource, allow_read_acl);
         filters.emplace_back(wildcard_resource, allow_write_acl);
         auth.remove_bindings(filters);
@@ -1917,10 +1916,6 @@ TEST(AUTHORIZER_TEST, role_authz_remove_binding_multiple_match) {
 
 TEST(AUTHORIZER_TEST, authz_filter_out_non_kafka_resources) {
     namespace ppsr = pandaproxy::schema_registry;
-    ppsr::enable_qualified_subjects::set_local(true);
-    auto reset_flag = ss::defer(
-      [] { ppsr::enable_qualified_subjects::reset_local(); });
-
     acl_principal user(principal_type::user, "alice");
     acl_host host("192.168.2.1");
 
@@ -1944,7 +1939,7 @@ TEST(AUTHORIZER_TEST, authz_filter_out_non_kafka_resources) {
       acl_operation::describe,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern subject_resource(
       resource_type::sr_subject, "model-", pattern_type::prefixed);
     resource_pattern registry_resource(
@@ -2043,7 +2038,7 @@ TEST(AUTHORIZER_TEST, authz_superuser_required) {
       acl_operation::all,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, acl);
@@ -2121,7 +2116,7 @@ TEST(AUTHORIZER_TEST, group_authz_simple_allow) {
     acl_entry acl1(
       group1, host_any, acl_operation::read, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, topic1(), pattern_type::literal);
 
@@ -2163,7 +2158,7 @@ TEST(AUTHORIZER_TEST, group_authz_user_deny_applies_first) {
       acl_operation::all,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, deny_user);
@@ -2218,7 +2213,7 @@ TEST(AUTHORIZER_TEST, group_authz_group_deny_applies_first) {
       acl_operation::write,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_user);
@@ -2274,7 +2269,7 @@ TEST(AUTHORIZER_TEST, group_authz_multiple_groups_deny_precedence) {
       acl_operation::write,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_all_group);
@@ -2382,7 +2377,7 @@ TEST(AUTHORIZER_TEST, group_authz_empty_groups_no_auth) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_group);
@@ -2415,7 +2410,7 @@ TEST(AUTHORIZER_TEST, group_authz_host_specific) {
     acl_entry allow_group_host1(
       group1, host1, acl_operation::read, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_group_host1);
@@ -2472,7 +2467,7 @@ TEST(AUTHORIZER_TEST, group_authz_roles_and_groups_priority) {
       acl_operation::read,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_role);
@@ -2517,7 +2512,7 @@ TEST(AUTHORIZER_TEST, group_authz_different_resource_types) {
       acl_operation::write,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern topic_resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     resource_pattern group_resource(
@@ -2586,7 +2581,7 @@ TEST(AUTHORIZER_TEST, group_authz_prefixed_and_wildcard_resources) {
       acl_operation::write,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern prefixed_resource(
       resource_type::topic, "test-", pattern_type::prefixed);
     resource_pattern wildcard_resource(
@@ -2639,7 +2634,7 @@ TEST(AUTHORIZER_TEST, group_authz_get_acls_by_group_principal) {
     acl_entry group2_acl(
       group2, acl_wildcard_host, acl_operation::write, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(default_resource, group1_acl);
     bindings.emplace_back(default_resource, group2_acl);
     auth.add_bindings(bindings);
@@ -2671,7 +2666,7 @@ TEST(AUTHORIZER_TEST, group_authz_superuser_overrides_group_deny) {
     acl_entry deny_group(
       group1, acl_wildcard_host, acl_operation::all, acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, resource_pattern::wildcard, pattern_type::literal);
     bindings.emplace_back(resource, deny_group);
@@ -2705,7 +2700,7 @@ TEST(AUTHORIZER_TEST, group_authz_remove_bindings_with_groups) {
     acl_entry group2_read(
       group2, acl_wildcard_host, acl_operation::read, acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(default_resource, group1_read);
     bindings.emplace_back(default_resource, group1_write);
     bindings.emplace_back(default_resource, group2_read);
@@ -2713,7 +2708,7 @@ TEST(AUTHORIZER_TEST, group_authz_remove_bindings_with_groups) {
 
     // Remove only group1's read permission
     {
-        std::vector<acl_binding_filter> filters;
+        chunked_vector<acl_binding_filter> filters;
         filters.emplace_back(default_resource, group1_read);
         auth.remove_bindings(filters);
     }
@@ -2732,7 +2727,7 @@ TEST(AUTHORIZER_TEST, group_authz_large_number_of_groups) {
 
     // Create many groups (simulate realistic scenario)
     chunked_vector<acl_principal> many_groups;
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
 
     for (int i = 0; i < 50; ++i) {
         acl_principal group(principal_type::group, fmt::format("group{}", i));
@@ -2782,7 +2777,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_simple_allow) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_role);
@@ -2828,7 +2823,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_deny_takes_precedence) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, deny_role);
@@ -2869,7 +2864,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_multiple_groups_one_in_role) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_role);
@@ -2910,7 +2905,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_group_not_in_role) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_role);
@@ -2957,7 +2952,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_user_and_group_in_different_roles) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, deny_user_role);
@@ -3005,7 +3000,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_group_deny_via_role) {
       acl_operation::read,
       acl_permission::deny);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_user);
@@ -3055,7 +3050,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_multiple_roles_for_group) {
       acl_operation::write,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_role1);
@@ -3109,7 +3104,7 @@ TEST(AUTHORIZER_TEST, group_role_authz_implied_operations) {
       acl_operation::read,
       acl_permission::allow);
 
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     resource_pattern resource(
       resource_type::topic, default_topic(), pattern_type::literal);
     bindings.emplace_back(resource, allow_role);
@@ -3136,10 +3131,6 @@ TEST(AUTHORIZER_TEST, group_role_authz_implied_operations) {
 // Test ACL pattern types (prefix, literal, wildcard) for context subjects.
 TEST(AUTHORIZER_TEST, authz_sr_context_subject_patterns) {
     namespace ppsr = pandaproxy::schema_registry;
-    ppsr::enable_qualified_subjects::set_local(true);
-    auto reset_flag = ss::defer(
-      [] { ppsr::enable_qualified_subjects::reset_local(); });
-
     auto user = acl_principal{principal_type::user, "user"};
     auto host = acl_host{"192.168.2.1"};
 
@@ -3281,7 +3272,7 @@ TEST(AUTHORIZER_TEST, authorize_with_group_principal_acls) {
     // Create resource and binding
     resource_pattern resource(
       resource_type::topic, topic(), pattern_type::literal);
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(resource, allow_read);
 
     // Setup authorizer
@@ -3337,7 +3328,7 @@ TEST(AUTHORIZER_TEST, group_principal_acl_deny_precedence) {
     // Create resource and bindings
     resource_pattern resource(
       resource_type::topic, topic(), pattern_type::literal);
-    std::vector<acl_binding> bindings;
+    chunked_vector<acl_binding> bindings;
     bindings.emplace_back(resource, deny_write);
     bindings.emplace_back(resource, allow_write);
 

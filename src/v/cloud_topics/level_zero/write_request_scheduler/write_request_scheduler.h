@@ -296,12 +296,14 @@ struct scheduler_context {
     /// \param max_buffer_size Data threshold for triggering upload
     /// \param scheduling_interval Time threshold for triggering upload
     /// \param now Current time
+    /// \param probe Is a metrics probe
     /// \return schedule_result with action and optional lock
     schedule_result<Clock> try_schedule_upload(
       ss::shard_id shard,
       size_t max_buffer_size,
       std::chrono::milliseconds scheduling_interval,
-      time_point now);
+      time_point now,
+      write_request_scheduler_probe& probe);
 
     /// Update last upload time for a group after successful upload
     void record_upload_time(group_id gid, time_point upload_time);
@@ -360,8 +362,7 @@ private:
     /// \return next wake up time
     ss::future<time_point> run_once();
 
-    using foreign_ptr_t
-      = ss::foreign_ptr<ss::lw_shared_ptr<chunked_vector<extent_meta>>>;
+    using foreign_ptr_t = ss::foreign_ptr<ss::lw_shared_ptr<upload_meta>>;
 
     using gate_holder_ptr = std::unique_ptr<ss::gate::holder>;
 

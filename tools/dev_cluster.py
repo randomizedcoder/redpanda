@@ -11,9 +11,15 @@
 # by the Apache License, Version 2.0
 # ==================================================================
 #
-# Start a 3 node cluster:
+# Start a 3 node cluster via bazel (builds redpanda automatically):
 #
-#   [jerry@winterland]$ dev_cluster.py -e vbuild/debug/clang/bin/redpanda
+#   bazel run --config=fastbuild //tools:dev_cluster -- [dev_cluster args] -- [redpanda args]
+#
+# Examples:
+#
+#   bazel run --config=fastbuild //tools:dev_cluster
+#   bazel run --config=fastbuild //tools:dev_cluster -- --nodes 1
+#   bazel run --config=release //tools:dev_cluster -- --nodes 1 -- --logger-log-level=io=debug
 #
 import argparse
 import asyncio
@@ -24,6 +30,8 @@ import pathlib
 from pathlib import Path
 import shutil
 import signal
+import subprocess
+import sys
 import time
 from typing import Optional, Any
 
@@ -116,6 +124,47 @@ class NodeMetadata:
     config_dict: dict[str, Any]
 
 
+def cpuset_cpu(
+    hardware_core_count: int, stride: int, smp: int, node_index: int, core_index: int
+) -> int:
+    # Map a (node_index, core_index) pair to a physical CPU index using an
+    # interleaved layout that spaces assigned CPUs `stride` apart. This is
+    # useful for spreading nodes across physical cores so that co-located
+    # hyper-thread siblings or NUMA-adjacent cores are left unused between them.
+    #
+    # Example: 12 CPUs, stride=2, 3 nodes with smp=2
+    #
+    #   slot: 0  1 | 2  3 | 4  5
+    #    cpu: 0  2 | 4  6 | 8 10
+    #         n0   | n1   | n2
+    #
+    # With stride=1 the layout is contiguous, matching the default.
+    # Global slot for this node/core pair.
+    slot = (node_index * smp) + core_index
+    # Number of CPUs available per interleave group. With stride=16 on a
+    # 32-CPU machine there are 2 CPUs per group (0,16 / 1,17 / 2,18 / ...).
+    slots_per_group = hardware_core_count // stride
+    # Which interleave group this slot falls into.
+    group = slot // slots_per_group
+    # Position within that group.
+    index_in_group = slot % slots_per_group
+    return group + (index_in_group * stride)
+
+
+def cpuset_hardware_core_count() -> int:
+    try:
+        # this will also include offline CPUs (SMT etc.)
+        configured_count = int(subprocess.check_output(["nproc", "--all"]))
+        if configured_count > 0:
+            return int(configured_count)
+    except Exception:
+        pass
+
+    fallback_count = psutil.cpu_count(logical=True)
+    assert fallback_count
+    return fallback_count
+
+
 async def stream_until_eof(
     process: asyncio.subprocess.Process, name: str, stdout: bool, log_path: Path
 ) -> None:
@@ -195,6 +244,84 @@ class Minio:
         return await self.process.wait()
 
 
+class IcebergRESTCatalog:
+    """Iceberg REST catalog backed by JDBC/SQLite, using Minio for S3 storage."""
+
+    def __init__(
+        self,
+        jar_path: Path,
+        directory: Path,
+        rp_config: dict[str, Any],
+        port: int,
+    ) -> None:
+        self.jar_path = jar_path
+        self.directory = directory
+        self.rp_cfg = rp_config
+        self.port = port
+        self.stopped = False
+        self.process: asyncio.subprocess.Process
+
+    def stop(self) -> None:
+        if not self.stopped:
+            self.stopped = True
+            send_signal(self.process, signal.SIGINT, "iceberg-rest-catalog")
+
+    async def run(self) -> int:
+        log_path = self.directory / "iceberg-rest-catalog.log"
+        db_path = self.directory / "catalog.db"
+
+        # NOTE: we'll only configure this when using MinIO from this file
+        # (assume no TLS).
+        s3_endpoint = f"http://{self.rp_cfg['cloud_storage_api_endpoint']}:{self.rp_cfg['cloud_storage_api_endpoint_port']}"
+        warehouse = f"s3://{self.rp_cfg['cloud_storage_bucket']}/iceberg"
+
+        env = {
+            **os.environ,
+            "REST_PORT": str(self.port),
+            "CATALOG_CATALOG__IMPL": "org.apache.iceberg.jdbc.JdbcCatalog",
+            "CATALOG_URI": f"jdbc:sqlite:file:{db_path}",
+            "CATALOG_JDBC_USER": "user",
+            "CATALOG_JDBC_PASSWORD": "password",
+            "CATALOG_WAREHOUSE": warehouse,
+            "CATALOG_IO__IMPL": "org.apache.iceberg.aws.s3.S3FileIO",
+            "CATALOG_S3_ENDPOINT": s3_endpoint,
+            "AWS_ACCESS_KEY_ID": self.rp_cfg["cloud_storage_access_key"],
+            "AWS_SECRET_ACCESS_KEY": self.rp_cfg["cloud_storage_secret_key"],
+            "AWS_REGION": self.rp_cfg["cloud_storage_region"],
+        }
+
+        # Write a log4j config that suppresses debug noise.
+        log4j_props = self.directory / "log4j.properties"
+        log4j_props.write_text(
+            "log4j.rootLogger=WARN, stdout\n"
+            "log4j.appender.stdout=org.apache.log4j.ConsoleAppender\n"
+            "log4j.appender.stdout.Target=System.out\n"
+            "log4j.appender.stdout.layout=org.apache.log4j.PatternLayout\n"
+            "log4j.appender.stdout.layout.ConversionPattern="
+            "%d{HH:mm:ss} %-5p [%c{1}] %m%n\n"
+        )
+        args = [
+            "java",
+            f"-Dlog4j.configuration=file:{log4j_props}",
+            "-jar",
+            str(self.jar_path),
+        ]
+        print(f"Running: {args}")
+        print(f"  warehouse: {warehouse}")
+        print(f"  s3_endpoint: {s3_endpoint}")
+        print(f"  port: {self.port}")
+        self.process = await asyncio.create_subprocess_exec(
+            *args,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        await stream_until_eof(self.process, "iceberg-catalog", True, log_path)
+
+        return await self.process.wait()
+
+
 class Prometheus:
     def __init__(
         self,
@@ -203,6 +330,7 @@ class Prometheus:
         listen_address: str = "127.0.0.1",
         port: int = 3001,
         redpanda_admin_ports: list[int] = [],
+        scrape_interval: str = "5s",
     ) -> None:
         self.binary = binary
         self.directory = directory
@@ -210,6 +338,7 @@ class Prometheus:
         self.listen_address = listen_address
         self.port = port
         self.redpanda_admin_ports = redpanda_admin_ports
+        self.scrape_interval = scrape_interval
         self.process: asyncio.subprocess.Process
 
     def stop(self) -> None:
@@ -225,10 +354,10 @@ class Prometheus:
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # Create a basic Prometheus configuration
-        config = {
+        config: dict[str, Any] = {
             "global": {
-                "scrape_interval": "5s",
-                "evaluation_interval": "5s",
+                "scrape_interval": self.scrape_interval,
+                "evaluation_interval": self.scrape_interval,
             },
             "scrape_configs": [
                 {
@@ -291,14 +420,16 @@ class Grafana:
         self,
         binary: Path,
         directory: Path,
-        port: int = 3000,
+        port: int,
         prometheus_url: str | None = None,
+        scrape_interval: str = "5s",
     ) -> None:
         self.binary = binary
         self.directory = directory
         self.stopped = False
         self.port = port
         self.prometheus_url = prometheus_url
+        self.scrape_interval = scrape_interval
         self.process: asyncio.subprocess.Process
 
     def stop(self) -> None:
@@ -339,6 +470,9 @@ class Grafana:
                         "url": self.prometheus_url,
                         "isDefault": True,
                         "editable": True,
+                        "jsonData": {
+                            "timeInterval": self.scrape_interval,
+                        },
                     }
                 ],
             }
@@ -408,16 +542,33 @@ class Redpanda:
         self,
         binary: Path,
         cores: int,
+        cpuset_stride: int,
         node_meta: NodeMetadata,
         extra_args: list[str],
         env: dict[str, str],
     ) -> None:
         self.binary = binary
         self.cores = cores
+        self.cpuset_stride = cpuset_stride
         self.node_meta = node_meta
         self.process: asyncio.subprocess.Process | None = None
         self.extra_args = extra_args
         self.env = env
+
+    def cpuset(self) -> str:
+        hardware_core_count = cpuset_hardware_core_count()
+        return ",".join(
+            str(
+                cpuset_cpu(
+                    hardware_core_count,
+                    self.cpuset_stride,
+                    self.cores,
+                    self.node_meta.index,
+                    core,
+                )
+            )
+            for core in range(self.cores)
+        )
 
     def stop(self) -> None:
         print(f"node-{self.node_meta.index}: dev_cluster stop requested")
@@ -435,9 +586,7 @@ class Redpanda:
         if not has_arg("-c", "--smp"):
             # Caller is required to pass a finite core count
             assert self.cores > 0
-            base_core = self.cores * self.node_meta.index
-
-            cores_args = f"--cpuset {base_core}-{base_core + self.cores - 1}"
+            cores_args = f"--cpuset {self.cpuset()}"
         else:
             cores_args = ""
 
@@ -534,7 +683,19 @@ async def main() -> None:
         "--cores", type=int, help="number of cores per node", default=None
     )
     parser.add_argument(
+        "--cpuset-stride",
+        type=int,
+        help="stride between assigned cpuset CPUs. 1 means no gaps",
+        default=1,
+    )
+    parser.add_argument(
         "-d", "--directory", type=Path, help="data directory", default=None
+    )
+    parser.add_argument(
+        "--delete-data-dir",
+        action=argparse.BooleanOptionalAction,
+        help="delete the data directory before starting",
+        default=False,
     )
     parser.add_argument("--base-rpc-port", type=int, help="rpc port", default=33145)
     parser.add_argument("--base-kafka-port", type=int, help="kafka port", default=9092)
@@ -581,6 +742,24 @@ async def main() -> None:
         help="whether to spin up an instance of minio and use Redpanda configuration presets for it",
         default=True,
     )
+    parser.add_argument(
+        "--use-iceberg-catalog",
+        action=argparse.BooleanOptionalAction,
+        help="spin up an Iceberg REST catalog backed by Minio (requires --use-minio)",
+        default=True,
+    )
+    parser.add_argument(
+        "--iceberg-catalog-jar",
+        type=Path,
+        help="path to iceberg-rest-catalog-all.jar",
+        default=None,
+    )
+    parser.add_argument(
+        "--iceberg-catalog-port",
+        type=int,
+        help="Iceberg REST catalog listening port",
+        default=8181,
+    )
     parser.add_argument("--rpk", type=Path, help="path to rpk executable", default=None)
     parser.add_argument(
         "--prometheus",
@@ -595,6 +774,12 @@ async def main() -> None:
         default=True,
     )
     parser.add_argument(
+        "--scrape-interval",
+        type=str,
+        help="prometheus scrape interval (e.g. '1s', '5s', '15s')",
+        default="5s",
+    )
+    parser.add_argument(
         "--grafana",
         type=Path,
         help="path to grafana executable",
@@ -605,6 +790,12 @@ async def main() -> None:
         action=argparse.BooleanOptionalAction,
         help="whether to spin up an instance of grafana",
         default=True,
+    )
+    parser.add_argument(
+        "--grafana-port",
+        type=int,
+        help="grafana listening port",
+        default=3000,
     )
     parser.add_argument(
         "--config-overrides",
@@ -622,6 +813,26 @@ async def main() -> None:
 
     if args.directory is None:
         args.directory = Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY", ".")) / "data"
+
+    if (
+        args.use_iceberg_catalog
+        and args.use_minio
+        and args.iceberg_catalog_jar
+        and not shutil.which("java")
+    ):
+        sys.exit(
+            "ERROR: --use-iceberg-catalog requires 'java' in PATH; "
+            "install a JDK or pass --no-use-iceberg-catalog"
+        )
+
+    if (
+        args.delete_data_dir
+        and args.directory.exists()
+        # safety check that we are dealing with a dev cluster data dir
+        and (args.directory / "node0/config.yaml").exists()
+    ):
+        print(f"Deleting existing data directory: {args.directory}")
+        shutil.rmtree(args.directory)
 
     # Apply port offset to all base ports
     if args.port_offset:
@@ -687,6 +898,12 @@ async def main() -> None:
             default_minio_rp_config = dataclasses.asdict(DefaultMinioRedpandaConfig())
             config_dict["redpanda"] = config_dict["redpanda"] | default_minio_rp_config
 
+        if args.use_iceberg_catalog and args.use_minio and args.iceberg_catalog_jar:
+            config_dict["redpanda"] = config_dict["redpanda"] | {
+                "iceberg_catalog_type": "rest",
+                "iceberg_rest_catalog_endpoint": f"http://{args.listen_address}:{args.iceberg_catalog_port}",
+            }
+
         if args.config_overrides:
             try:
                 config_overrides = json.loads(args.config_overrides)
@@ -723,6 +940,19 @@ async def main() -> None:
         minio_task = asyncio.create_task(minio.run())
         await ensure_bucket_exists(node_metas[0].config_dict["redpanda"])
 
+    iceberg_catalog = None
+    iceberg_catalog_task = None
+    if args.use_iceberg_catalog and args.use_minio and args.iceberg_catalog_jar:
+        catalog_dir = args.directory / "iceberg-catalog"
+        catalog_dir.mkdir(parents=True, exist_ok=True)
+        iceberg_catalog = IcebergRESTCatalog(
+            args.iceberg_catalog_jar,
+            catalog_dir,
+            node_metas[0].config_dict["redpanda"],
+            port=args.iceberg_catalog_port,
+        )
+        iceberg_catalog_task = asyncio.create_task(iceberg_catalog.run())
+
     prometheus = None
     prometheus_task = None
     if args.use_prometheus and args.prometheus:
@@ -733,6 +963,7 @@ async def main() -> None:
             prometheus_dir,
             args.listen_address,
             redpanda_admin_ports=[args.base_admin_port + i for i in range(args.nodes)],
+            scrape_interval=args.scrape_interval,
         )
         prometheus_task = asyncio.create_task(prometheus.run())
 
@@ -750,7 +981,9 @@ async def main() -> None:
         grafana = Grafana(
             args.grafana,
             grafana_dir,
+            port=args.grafana_port,
             prometheus_url=prometheus_url,
+            scrape_interval=args.scrape_interval,
         )
         grafana_task = asyncio.create_task(grafana.run())
 
@@ -770,13 +1003,25 @@ async def main() -> None:
             env["UBSAN_OPTIONS"] += f":suppressions={args.ubsan_suppression_file}"
     if args.lsan_suppression_file and "LSAN_OPTIONS" not in env:
         env["LSAN_OPTIONS"] = f"suppressions={args.lsan_suppression_file}"
-    nodes = [Redpanda(args.executable, cores, m, extra_args, env) for m in node_metas]
+    nodes = [
+        Redpanda(
+            args.executable,
+            cores,
+            args.cpuset_stride,
+            m,
+            extra_args,
+            env,
+        )
+        for m in node_metas
+    ]
 
     all_coros = [r.run() for r in nodes]
 
     def stop() -> None:
         for n in nodes:
             n.stop()
+        if iceberg_catalog:
+            iceberg_catalog.stop()
         if minio:
             minio.stop()
         if prometheus:
@@ -813,6 +1058,7 @@ async def main() -> None:
 
     # Cleanup: if redpanda shuts down but we didn't request the shutdown
     # then let's go ahead and tear down other services too so we exit
+    await stop_and_wait("iceberg-catalog", iceberg_catalog, iceberg_catalog_task)
     await stop_and_wait("minio", minio, minio_task)
     await stop_and_wait("prometheus", prometheus, prometheus_task)
     await stop_and_wait("grafana", grafana, grafana_task)

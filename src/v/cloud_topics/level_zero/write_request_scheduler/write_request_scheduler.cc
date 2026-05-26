@@ -12,6 +12,7 @@
 
 #include "base/vassert.h"
 #include "cloud_topics/level_zero/common/extent_meta.h"
+#include "cloud_topics/level_zero/common/level_zero_probe.h"
 #include "cloud_topics/level_zero/pipeline/base_pipeline.h"
 #include "cloud_topics/level_zero/pipeline/write_pipeline.h"
 #include "cloud_topics/level_zero/pipeline/write_request.h"
@@ -215,7 +216,8 @@ schedule_result<Clock> scheduler_context<Clock>::try_schedule_upload(
   ss::shard_id shard,
   size_t max_buffer_size,
   std::chrono::milliseconds scheduling_interval,
-  time_point now) {
+  time_point now,
+  write_request_scheduler_probe& probe) {
     // Get group info for this shard
     auto gid = shard_to_group[shard].load();
     auto& group = groups[static_cast<size_t>(gid)];
@@ -241,8 +243,9 @@ schedule_result<Clock> scheduler_context<Clock>::try_schedule_upload(
 
         if (can_modify) {
             auto next_stage_bytes = get_group_next_stage_bytes(gid);
+            probe.set_next_stage_bytes(next_stage_bytes);
             // Calculate dynamic split threshold based on group size
-            size_t group_split_threshold = max_buffer_size * grp_size;
+            size_t group_split_threshold = 2 * max_buffer_size * grp_size;
             if (grp_size > 1 && next_stage_bytes > group_split_threshold) {
                 // Split: next stage is overloaded, work more independently
                 if (try_split_group(gid)) {
@@ -365,13 +368,13 @@ ss::future<> write_request_scheduler<Clock>::start() {
         // Create scheduler context on shard 0.
         // The context is shared between all shards.
         // FixedArrays are sized at construction time.
-        _shard_zero_context.emplace(ss::smp::count);
+        _shard_zero_context.emplace(ss::this_smp_shard_count());
 
         // Initialize shards with their backlog size references.
         // shard_to_group and groups are already default-initialized by
         // the FixedArray constructor (padded_atomic_group_id defaults to
         // group_id{0}, shard_group default-constructs with current time).
-        for (unsigned ix = 0; ix < ss::smp::count; ix++) {
+        for (unsigned ix = 0; ix < ss::this_smp_shard_count(); ix++) {
             for (const counter_shard& sc : shard_bytes) {
                 if (sc.shard == ix) {
                     _shard_zero_context->shards[ix] = shard_state<Clock>(
@@ -421,7 +424,7 @@ write_request_scheduler<Clock>::run_once() {
 
     // Let scheduler_context make the scheduling decision
     auto result = _context->try_schedule_upload(
-      this_shard, _max_buffer_size(), _scheduling_interval(), now);
+      this_shard, _max_buffer_size(), _scheduling_interval(), now, _probe);
 
     switch (result.action) {
     case schedule_action::skip:
@@ -435,7 +438,7 @@ write_request_scheduler<Clock>::run_once() {
     case schedule_action::upload: {
         // Collect shard info for shards in this group
         std::vector<shard_info> shard_bytes;
-        shard_bytes.resize(ss::smp::count);
+        shard_bytes.resize(ss::this_smp_shard_count());
         _context->get_shard_bytes_vec(shard_bytes, result.gid);
 
         // Only shutdown exceptions are expected here
@@ -611,13 +614,13 @@ write_request_scheduler<Clock>::proxy_write_request(
     auto fut = proxy.response.get_future();
     _stage.enqueue_foreign_request(proxy, false);
     target_gate_holder.release();
-    auto extents_fut = co_await ss::coroutine::as_future(std::move(fut));
-    if (extents_fut.failed()) {
-        auto ex = extents_fut.get_exception();
+    auto upload_fut = co_await ss::coroutine::as_future(std::move(fut));
+    if (upload_fut.failed()) {
+        auto ex = upload_fut.get_exception();
         vlog(cd_log.error, "Proxy write request failed: {}", ex);
         co_return std::unexpected(errc::upload_failure);
     }
-    auto extents = extents_fut.get();
+    auto extents = upload_fut.get();
     if (!extents.has_value()) {
         // Normal errors (S3 upload failure or timeout)
         // are handled here
@@ -625,7 +628,7 @@ write_request_scheduler<Clock>::proxy_write_request(
         vlog(cd_log.info, "Proxy write request failed: {}", e);
         co_return std::unexpected(e);
     }
-    auto ptr = ss::make_lw_shared<chunked_vector<extent_meta>>();
+    auto ptr = ss::make_lw_shared<upload_meta>();
     *ptr = std::move(extents.value());
     foreign_ptr_t fp(ss::make_foreign(std::move(ptr)));
     co_return std::move(fp);

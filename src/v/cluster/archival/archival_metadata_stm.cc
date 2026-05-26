@@ -45,13 +45,10 @@
 #include "storage/record_batch_utils.h"
 #include "utils/named_type.h"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/shared_future.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/bool_class.hh>
@@ -1127,9 +1124,10 @@ ss::future<> archival_metadata_stm::do_apply(const model::record_batch& b) {
                         r.release_value()));
                     break;
                 case read_write_fence_cmd::key:
-                    if (apply_read_write_fence(
-                          serde::from_iobuf<read_write_fence_cmd>(
-                            r.release_value()))) {
+                    if (
+                      apply_read_write_fence(
+                        serde::from_iobuf<read_write_fence_cmd>(
+                          r.release_value()))) {
                         // This means that there is a concurrency violation. The
                         // fence was created before some other command was
                         // applied. We can't apply the commands from this batch.
@@ -1751,7 +1749,7 @@ void archival_metadata_stm_factory::create(
       clusterlog,
       tcfg ? tcfg->properties.remote_label : std::nullopt,
       tcfg ? tcfg->properties.remote_topic_namespace_override : std::nullopt);
-    raft->log()->stm_manager()->add_stm(stm);
+    raft->log()->stm_hookset()->add_stm(stm);
 }
 
 } // namespace cluster

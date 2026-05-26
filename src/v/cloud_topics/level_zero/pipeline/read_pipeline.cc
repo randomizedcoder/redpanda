@@ -10,11 +10,9 @@
 
 #include "cloud_topics/level_zero/pipeline/read_pipeline.h"
 
-#include "base/units.h"
 #include "cloud_topics/level_zero/pipeline/circuit_breaker.h"
 #include "cloud_topics/level_zero/pipeline/event_filter.h"
 #include "cloud_topics/level_zero/pipeline/read_request.h"
-#include "cloud_topics/logger.h"
 #include "config/configuration.h"
 #include "resource_mgmt/memory_groups.h"
 #include "ssx/abort_source.h"
@@ -28,8 +26,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <exception>
-#include <variant>
 
 namespace cloud_topics::l0 {
 
@@ -204,7 +200,8 @@ read_pipeline<Clock>::get_fetch_requests(
         el._hook.unlink();
         result.requests.push_back(el);
     }
-    result.complete = pending.empty();
+    result.complete = std::none_of(
+      it, pending.end(), [stage](const auto& r) { return r.stage == stage; });
     vlog(
       logger.debug,
       "get_fetch_requests returned {} requests which are querying {} ({}B)",

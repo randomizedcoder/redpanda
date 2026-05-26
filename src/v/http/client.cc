@@ -9,17 +9,16 @@
 
 #include "http/client.h"
 
+#include "base/external_fmt.h"
 #include "base/likely.h"
 #include "base/vlog.h"
 #include "bytes/details/io_iterator_consumer.h"
 #include "bytes/iobuf.h"
-#include "bytes/scattered_message.h"
 #include "config/base_property.h"
 #include "http/logger.h"
 #include "ssx/sformat.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/condition-variable.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
@@ -28,12 +27,11 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/timed_out_error.hh>
-#include <seastar/core/timer.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/tls.hh>
 #include <seastar/util/defer.hh>
 
-#include <boost/beast/core/buffer_traits.hpp>
 #include <boost/beast/core/error.hpp>
 #include <boost/beast/core/impl/error.hpp>
 
@@ -46,15 +44,18 @@ namespace http {
 
 namespace {
 
-ss::sstring port_display_string(uint16_t port, bool has_tls) {
+bool is_default_port(uint16_t port, bool has_tls) {
     static constexpr uint16_t https_default_port = 443;
     static constexpr uint16_t http_default_port = 80;
-
     return (has_tls && port == https_default_port)
-               || (!has_tls && port == http_default_port)
+           || (!has_tls && port == http_default_port);
+}
+
+ss::sstring port_display_string(uint16_t port, bool has_tls) {
+    return is_default_port(port, has_tls)
              ? ss::sstring{}
              : ss::sstring{fmt::format(":{}", port)};
-};
+}
 
 } // namespace
 
@@ -127,14 +128,24 @@ ss::future<client::request_response_t> client::make_request(
     constexpr unsigned http_version = 11;
     header.version(http_version);
 
-    // The default host is derived from the transport configuration
-    if (header.find(boost::beast::http::field::host) == header.end()) {
-        header.insert(boost::beast::http::field::host, _host_with_port);
-    }
-
     auto verb = header.method();
     auto target = header.target();
     ss::sstring target_str(target.data(), target.size());
+
+    bool host_matches = false;
+    std::string_view host_hdr;
+    const auto host_header_it = header.find(boost::beast::http::field::host);
+    if (host_header_it == header.end()) {
+        header.insert(boost::beast::http::field::host, _host_with_port);
+        host_hdr = std::string_view{_host_with_port};
+        host_matches = true;
+    } else {
+        host_hdr = host_header_it->value();
+        host_matches
+          = host_hdr == _host_with_port
+            || (host_hdr == server_address().host()
+                && is_default_port(server_address().port(), has_tls()));
+    }
 
     _ctxlog = prefix_logger{
       http_log,
@@ -142,9 +153,14 @@ ss::future<client::request_response_t> client::make_request(
         "{} {}{}{}{}",
         verb,
         has_tls() ? "https://" : "http://",
-        server_address().host(),
-        port_display_string(server_address().port(), has_tls()),
-        target_str)};
+        host_hdr,
+        target_str,
+        host_matches
+          ? ""
+          : ssx::sformat(
+              " (via {}{})",
+              server_address().host(),
+              port_display_string(server_address().port(), has_tls())))};
     vlog(_ctxlog.trace, "client.make_request {}", header);
 
     auto req = ss::make_shared<request_stream>(this, std::move(header));
@@ -210,7 +226,8 @@ ss::future<reconnect_result_t> client::get_connected(
     auto clear_shutdown_signal = ss::defer(
       [this]() noexcept { _shutdown_now = false; });
     if (unlikely(_stopped)) {
-        throw std::runtime_error("client is stopped");
+        co_await ss::coroutine::return_exception(
+          std::runtime_error("client is stopped"));
     }
     vlog(
       ctxlog.debug,
@@ -229,7 +246,7 @@ ss::future<reconnect_result_t> client::get_connected(
         // Reconnect attempts have to stop if:
         // - shutdown method was called
         // - abort was requested
-        // - unrecoverable error occured
+        // - unrecoverable error occurred
         // - timeout reached
         try {
             // base_transport::connect calls _dispatcher_gate.close
@@ -303,13 +320,13 @@ ss::future<ss::temporary_buffer<char>> client::receive() {
       });
 }
 
-ss::future<> client::send(ss::scattered_message<char> msg) {
-    _probe->add_outbound_bytes(msg.size());
+ss::future<> client::send(scattered_buffer bufs) {
+    _probe->add_outbound_bytes(iobuf::scattered_size(bufs));
     // Protect the send operation with the dispatch gate to prevent
     // the output stream from being invalidated while writes are in flight
     auto holder = _dispatch_gate.hold();
     try {
-        co_await out().write(std::move(msg));
+        co_await out().write(std::move(bufs));
     } catch (...) {
         _probe->register_transport_error();
         throw;
@@ -591,7 +608,7 @@ ss::future<> client::request_stream::send_some(iobuf&& seq) {
         boost::system::system_error except(error_code);
         return ss::make_exception_future<>(except);
     }
-    auto scattered = iobuf_as_scattered(std::move(outbuf));
+    auto scattered = std::move(outbuf).as_scattered();
     return ss::with_gate(
       _gate,
       [this, seq = std::move(seq), scattered = std::move(scattered)]() mutable {
@@ -689,18 +706,10 @@ struct response_data_source final : ss::data_source_impl {
 struct request_data_sink final : ss::data_sink_impl {
     explicit request_data_sink(client::request_stream_ref req)
       : _io(std::move(req)) {}
-    ss::future<> put(ss::net::packet data) final { return put(data.release()); }
-    ss::future<> put(std::vector<ss::temporary_buffer<char>> all) final {
-        return ss::do_with(
-          std::move(all), [this](std::vector<ss::temporary_buffer<char>>& all) {
-              return ss::do_for_each(
-                all, [this](ss::temporary_buffer<char>& buf) {
-                    return put(std::move(buf));
-                });
-          });
-    }
-    ss::future<> put(ss::temporary_buffer<char> buf) final {
-        return _io->send_some(std::move(buf));
+    ss::future<> put(scattered_buffer_view data) final {
+        for (auto& buf : data) {
+            co_await _io->send_some(std::move(buf));
+        }
     }
     ss::future<> flush() final { return ss::now(); }
     ss::future<> close() final { return _io->send_eof(); }

@@ -17,19 +17,18 @@
 #include "config/sasl_mechanisms.h"
 #include "config/types.h"
 #include "datalake/partition_spec_parser.h"
+#include "datalake/validators.h"
 #include "model/namespace.h"
 #include "model/validation.h"
+#include "security/oidc_url_parser.h"
 #include "serde/rw/chrono.h"
 #include "ssx/sformat.h"
 #include "utils/inet_address_wrapper.h"
-
-#include <fmt/format.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <optional>
-#include <unordered_map>
 
 namespace config {
 
@@ -126,8 +125,9 @@ validate_http_authn_mechanisms(const std::vector<ss::sstring>& mechanisms) {
 
     // Validate results
     for (const auto& m : mechanisms) {
-        if (std::ranges::none_of(
-              supported, [&m](const auto& s) { return s == m; })) {
+        if (std::ranges::none_of(supported, [&m](const auto& s) {
+                return s == m;
+            })) {
             return ssx::sformat(
               "'{}' is not a supported HTTP authentication mechanism", m);
         }
@@ -194,19 +194,20 @@ std::optional<ss::sstring>
 validate_audit_excluded_topics(const std::vector<ss::sstring>& vs) {
     bool is_kafka_audit_topic = false;
     std::optional<ss::sstring> is_invalid_topic_name = std::nullopt;
-    if (std::any_of(
-          vs.begin(),
-          vs.end(),
-          [&is_kafka_audit_topic,
-           &is_invalid_topic_name](const ss::sstring& topic_name) {
-              auto t = model::topic{topic_name};
-              if (t == model::kafka_audit_logging_topic) {
-                  is_kafka_audit_topic = true;
-              } else if (model::validate_kafka_topic_name(t)) {
-                  is_invalid_topic_name = topic_name;
-              }
-              return is_kafka_audit_topic || is_invalid_topic_name.has_value();
-          })) {
+    if (
+      std::any_of(
+        vs.begin(),
+        vs.end(),
+        [&is_kafka_audit_topic,
+         &is_invalid_topic_name](const ss::sstring& topic_name) {
+            auto t = model::topic{topic_name};
+            if (t == model::kafka_audit_logging_topic) {
+                is_kafka_audit_topic = true;
+            } else if (model::validate_kafka_topic_name(t)) {
+                is_invalid_topic_name = topic_name;
+            }
+            return is_kafka_audit_topic || is_invalid_topic_name.has_value();
+        })) {
         if (is_kafka_audit_topic) {
             return ss::format(
               "Unable to exclude audit log '{}' from auditing",
@@ -222,8 +223,9 @@ validate_audit_excluded_topics(const std::vector<ss::sstring>& vs) {
 
 std::optional<ss::sstring>
 validate_api_endpoint(const std::optional<ss::sstring>& os) {
-    if (auto non_empty_string_opt = validate_non_empty_string_opt(os);
-        non_empty_string_opt.has_value()) {
+    if (
+      auto non_empty_string_opt = validate_non_empty_string_opt(os);
+      non_empty_string_opt.has_value()) {
         return non_empty_string_opt;
     }
 
@@ -261,6 +263,19 @@ validate_iceberg_partition_spec(const ss::sstring& value) {
     if (!parsed.value().is_valid_for_default_spec()) {
         return fmt::format(
           "partition spec `{}' can't be used as a default spec", value);
+    }
+    return std::nullopt;
+}
+
+std::optional<ss::sstring> validate_iceberg_rest_catalog_endpoint(
+  const std::optional<ss::sstring>& endpoint) {
+    if (!endpoint.has_value()) {
+        return std::nullopt;
+    }
+    auto parsed = datalake::parse_iceberg_rest_catalog_endpoint(
+      endpoint.value());
+    if (!parsed.has_value()) {
+        return std::move(parsed).error();
     }
     return std::nullopt;
 }
@@ -324,10 +339,12 @@ validate_iceberg_rest_catalog_auth_mode(const config::configuration& config) {
               ? config.iceberg_rest_catalog_aws_credentials_source().value()
               : config.cloud_storage_credentials_source();
 
-        // When using aws_instance_metadata, AWS credentials are not required
+        // When using aws_instance_metadata or sts, AWS credentials are not
+        // required
         if (
           effective_creds_source
-          == model::cloud_credentials_source::aws_instance_metadata) {
+            == model::cloud_credentials_source::aws_instance_metadata
+          || effective_creds_source == model::cloud_credentials_source::sts) {
             // We still require the region of the Glue endpoint.
             auto effective_region
               = config.iceberg_rest_catalog_aws_region().has_value()
@@ -336,7 +353,7 @@ validate_iceberg_rest_catalog_auth_mode(const config::configuration& config) {
             if (!effective_region.has_value()) {
                 return fmt::format(
                   "Must set AWS region when using SigV4 authentication with "
-                  "aws_instance_metadata credentials source.");
+                  "aws_instance_metadata or sts credentials source.");
             }
         } else {
             auto effective_access_key
@@ -398,8 +415,9 @@ validate_consumer_group_metrics(const std::vector<ss::sstring>& metrics) {
 
     // Validate results
     for (const auto& m : metrics) {
-        if (std::ranges::none_of(
-              supported, [&m](const auto& s) { return s == m; })) {
+        if (std::ranges::none_of(supported, [&m](const auto& s) {
+                return s == m;
+            })) {
             return ssx::sformat("'{}' is not a valid consumer group metric", m);
         }
     }
@@ -417,8 +435,9 @@ validate_cloud_storage_cluster_name(const std::optional<ss::sstring>& input) {
         return std::nullopt;
     }
 
-    if (auto non_empty_string_opt = validate_non_empty_string_opt(input);
-        non_empty_string_opt.has_value()) {
+    if (
+      auto non_empty_string_opt = validate_non_empty_string_opt(input);
+      non_empty_string_opt.has_value()) {
         return non_empty_string_opt;
     }
 
@@ -467,10 +486,18 @@ validate_default_redpanda_storage_mode(const configuration& config) {
 
     if (
       mode == model::redpanda_storage_mode::cloud
-      && !config.cloud_topics_enabled()) {
+      && !config.cloud_storage_enabled()) {
         return fmt::format(
           "default_redpanda_storage_mode cannot be set to cloud when "
-          "cloud_topics_enabled is false");
+          "cloud_storage_enabled is false");
+    }
+
+    if (
+      mode == model::redpanda_storage_mode::tiered_cloud
+      && !config.cloud_storage_enabled()) {
+        return fmt::format(
+          "default_redpanda_storage_mode cannot be set to tiered_cloud when "
+          "cloud_storage_enabled is false");
     }
 
     return std::nullopt;
@@ -544,6 +571,28 @@ validate_sane_partition_balancer_timeouts(const configuration& config) {
           "({})",
           node_availability,
           *maybe_auto_decom_timeout);
+    }
+    return std::nullopt;
+}
+
+std::optional<ss::sstring>
+validate_oidc_http_proxy_url(const config::configuration& config) {
+    // Only https oidc discovery URLs are supported when an HTTP proxy is
+    // configured
+    if (!config.oidc_http_proxy_url().has_value()) {
+        return std::nullopt;
+    }
+    auto discovery = security::oidc::parse_url(config.oidc_discovery_url());
+    if (discovery.has_error()) {
+        // The per-property oidc_discovery_url validator will flag
+        // unparseable URLs; avoid double-reporting.
+        return std::nullopt;
+    }
+    if (discovery.assume_value().scheme != "https") {
+        return fmt::format(
+          "oidc_http_proxy_url requires oidc_discovery_url to use https:// "
+          "(got {})",
+          discovery.assume_value().scheme);
     }
     return std::nullopt;
 }

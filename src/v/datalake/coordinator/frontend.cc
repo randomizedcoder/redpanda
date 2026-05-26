@@ -52,7 +52,7 @@ ss::future<ensure_table_exists_reply> do_ensure_table_exists(
     auto ret = co_await crd->sync_ensure_table_exists(
       req.topic, req.topic_revision, std::move(req.schema_components));
     if (ret.has_error()) {
-        co_return to_rpc_errc(ret.error());
+        co_return ensure_table_exists_reply{to_rpc_errc(ret.error())};
     }
     co_return ensure_table_exists_reply{errc::ok};
 }
@@ -67,7 +67,7 @@ ss::future<ensure_dlq_table_exists_reply> do_ensure_dlq_table_exists(
     auto ret = co_await crd->sync_ensure_dlq_table_exists(
       req.topic, req.topic_revision);
     if (ret.has_error()) {
-        co_return to_rpc_errc(ret.error());
+        co_return ensure_dlq_table_exists_reply{to_rpc_errc(ret.error())};
     }
     co_return ensure_dlq_table_exists_reply{errc::ok};
 }
@@ -82,7 +82,7 @@ ss::future<add_translated_data_files_reply> add_files(
     auto ret = co_await crd->sync_add_files(
       req.tp, req.topic_revision, std::move(req.ranges));
     if (ret.has_error()) {
-        co_return to_rpc_errc(ret.error());
+        co_return add_translated_data_files_reply{to_rpc_errc(ret.error())};
     }
     co_return add_translated_data_files_reply{errc::ok};
 }
@@ -97,7 +97,8 @@ ss::future<fetch_latest_translated_offset_reply> fetch_latest_offset(
     auto ret = co_await crd->sync_get_last_added_offsets(
       req.tp, req.topic_revision);
     if (ret.has_error()) {
-        co_return to_rpc_errc(ret.error());
+        co_return fetch_latest_translated_offset_reply{
+          to_rpc_errc(ret.error())};
     }
     auto& val = ret.value();
     co_return fetch_latest_translated_offset_reply{
@@ -497,6 +498,41 @@ ss::future<get_topic_state_reply> frontend::get_topic_state(
     co_return co_await process<
       &frontend::get_topic_state_locally,
       &client::get_topic_state>(std::move(request), bool(local_only_exec));
+}
+
+ss::future<get_topic_state_reply>
+frontend::get_topic_state(chunked_vector<model::topic> topics_filter) {
+    auto holder = _gate.hold();
+    auto success = co_await ensure_topic_exists();
+    if (!success) {
+        co_return get_topic_state_reply{errc::coordinator_topic_not_exists};
+    }
+    chunked_hash_map<model::partition_id, chunked_vector<model::topic>>
+      topics_by_partition;
+
+    for (auto& topic : topics_filter) {
+        auto partition_opt = coordinator_partition(topic);
+        if (!partition_opt.has_value()) {
+            co_return get_topic_state_reply{errc::coordinator_topic_not_exists};
+        }
+        topics_by_partition[partition_opt.value()].emplace_back(
+          std::move(topic));
+    }
+
+    get_topic_state_reply aggregated;
+    aggregated.errc = errc::ok;
+    for (auto& [partition_id, filter] : topics_by_partition) {
+        get_topic_state_request req{partition_id, std::move(filter)};
+        auto reply = co_await get_topic_state(std::move(req));
+        if (reply.errc != errc::ok) {
+            co_return reply;
+        }
+        for (auto& [topic, state] : reply.topic_states) {
+            aggregated.topic_states.insert({topic, std::move(state)});
+        }
+    }
+
+    co_return aggregated;
 }
 
 ss::future<reset_topic_state_reply> frontend::reset_topic_state_locally(

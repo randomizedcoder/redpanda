@@ -10,18 +10,13 @@
 #include "model/fundamental.h"
 #include "model/record_utils.h"
 #include "model/tests/random_batch.h"
-#include "random/generators.h"
 #include "storage/api.h"
 #include "storage/directories.h"
-#include "storage/disk_log_appender.h"
-#include "storage/file_sanitizer.h"
-#include "storage/record_batch_utils.h"
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
 #include "storage/segment_reader.h"
 #include "test_utils/random_bytes.h"
 
-#include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
 
 #include <gtest/gtest.h>
@@ -135,10 +130,17 @@ TEST(LogManagerTest, test_can_load_logs) {
     write_garbage(seg4->appender());
     seg4->close().get();
 
-    m.manage(config_from_ntp(ntps[0].ntp())).get();
-    m.manage(config_from_ntp(ntps[1].ntp())).get();
-    m.manage(config_from_ntp(ntps[2].ntp())).get();
-    m.manage(config_from_ntp(ntps[3].ntp())).get();
+    std::vector<ss::shared_ptr<storage::log>> logs;
+    for (size_t i = 0; i < 4; ++i) {
+        auto log = m.manage(config_from_ntp(ntps[i].ntp())).get();
+        log->stm_hookset()->start();
+        logs.push_back(std::move(log));
+    }
+    auto stop_stms = ss::defer([&logs] {
+        for (auto& log : logs) {
+            log->stm_hookset()->stop();
+        }
+    });
     EXPECT_EQ(4, m.size());
     EXPECT_EQ(m.get(ntps[0].ntp())->segment_count(), 0);
     EXPECT_EQ(m.get(ntps[1].ntp())->segment_count(), 0);

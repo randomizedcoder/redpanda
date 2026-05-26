@@ -46,7 +46,7 @@ class server_probe;
 
 inline ss::shard_id user_shard(const ss::sstring& name) {
     auto hash = xxhash_64(name.data(), name.length());
-    return jump_consistent_hash(hash, ss::smp::count);
+    return jump_consistent_hash(hash, ss::this_smp_shard_count());
 }
 
 namespace impl {
@@ -59,7 +59,7 @@ concept KafkaRequestFactory = KafkaRequestType<std::invoke_result_t<F>>;
 
 inline ss::shard_id consumer_shard(const kafka::group_id& g_id) {
     auto hash = xxhash_64(g_id().data(), g_id().length());
-    return jump_consistent_hash(hash, ss::smp::count);
+    return jump_consistent_hash(hash, ss::this_smp_shard_count());
 }
 
 } // namespace impl
@@ -136,6 +136,7 @@ public:
     ss::future<> stop();
 
 private:
+    std::unique_ptr<ss::httpd::handler_base> _default_handler;
     ss::httpd::http_server _server;
     ss::sstring _public_metrics_group_name;
     ss::gate _pending_reqs;

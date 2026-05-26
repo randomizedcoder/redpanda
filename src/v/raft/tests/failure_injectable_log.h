@@ -28,8 +28,8 @@ public:
       ss::shared_ptr<storage::log> underlying_log) noexcept;
 
     failure_injectable_log(failure_injectable_log&&) noexcept = delete;
-    failure_injectable_log& operator=(failure_injectable_log&&) noexcept
-      = delete;
+    failure_injectable_log&
+    operator=(failure_injectable_log&&) noexcept = delete;
     failure_injectable_log(const failure_injectable_log&) = delete;
     failure_injectable_log& operator=(const failure_injectable_log&) = delete;
     ~failure_injectable_log() noexcept final = default;
@@ -80,7 +80,7 @@ public:
 
     model::timestamp start_timestamp() const final;
 
-    std::ostream& print(std::ostream& o) const final;
+    fmt::iterator format_to(fmt::iterator it) const final;
 
     std::optional<model::term_id> get_term(model::offset) const final;
 
@@ -153,12 +153,10 @@ public:
 
     bool needs_compaction() const final;
 
+    ss::lw_shared_ptr<storage::stm_hookset> stm_hookset() final;
+
 private:
     ss::shared_ptr<storage::log> _underlying_log;
     std::optional<append_delay_generator> _append_delay_generator;
-    friend std::ostream&
-    operator<<(std::ostream& o, const failure_injectable_log& lg) {
-        return lg.print(o);
-    }
 };
 } // namespace raft

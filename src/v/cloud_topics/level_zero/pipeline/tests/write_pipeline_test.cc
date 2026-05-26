@@ -10,22 +10,13 @@
 
 #include "cloud_topics/level_zero/common/extent_meta.h"
 #include "cloud_topics/level_zero/pipeline/write_pipeline.h"
-#include "container/chunked_circular_buffer.h"
-#include "model/fundamental.h"
 #include "model/namespace.h"
-#include "model/record_batch_reader.h"
 #include "model/tests/random_batch.h"
 #include "test_utils/test.h"
 
-#include <seastar/core/abort_source.hh>
-#include <seastar/core/loop.hh>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/manual_clock.hh>
-#include <seastar/core/sharded.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/later.hh>
-#include <seastar/util/log.hh>
-#include <seastar/util/noncopyable_function.hh>
 
 #include <chrono>
 #include <iterator>
@@ -90,7 +81,7 @@ TEST_CORO(write_pipeline_test, single_write_request) {
     ASSERT_TRUE_CORO(res.complete);
     ASSERT_TRUE_CORO(res.requests.size() == 1);
 
-    res.requests.front().set_value(chunked_vector<cloud_topics::extent_meta>{});
+    res.requests.front().set_value(cloud_topics::upload_meta{});
 
     auto write_res = co_await std::move(fut);
     ASSERT_TRUE_CORO(write_res.has_value());
@@ -128,7 +119,7 @@ TEST_CORO(batcher_test, expired_write_request) {
 
     // One req has already expired at this point
     ASSERT_EQ_CORO(res.requests.size(), 1);
-    res.requests.back().set_value(chunked_vector<cloud_topics::extent_meta>{});
+    res.requests.back().set_value(cloud_topics::upload_meta{});
 
     auto [pass_result, fail_result] = co_await ss::when_all_succeed(
       std::move(expect_pass_fut), std::move(expect_fail_fut));
@@ -167,7 +158,7 @@ TEST_CORO(write_pipeline_test, stage_bytes_accounting) {
     auto res = stage.pull_write_requests(std::numeric_limits<size_t>::max());
     ASSERT_EQ_CORO(pipeline.stage_bytes(stage.id()), 0);
 
-    res.requests.front().set_value(chunked_vector<cloud_topics::extent_meta>{});
+    res.requests.front().set_value(cloud_topics::upload_meta{});
     auto write_res = co_await std::move(fut);
     ASSERT_TRUE_CORO(write_res.has_value());
 }
@@ -274,7 +265,7 @@ TEST_CORO(write_pipeline_test, interleaving_stages_bug) {
         // Stage should be unassigned after extraction
         ASSERT_TRUE_CORO(
           req.stage == cloud_topics::l0::unassigned_pipeline_stage);
-        req.set_value(chunked_vector<cloud_topics::extent_meta>{});
+        req.set_value(cloud_topics::upload_meta{});
     }
 
     // The remaining 3 requests should still be in the pending queue
@@ -288,7 +279,7 @@ TEST_CORO(write_pipeline_test, interleaving_stages_bug) {
     for (auto& req : result2.requests) {
         ASSERT_TRUE_CORO(
           req.stage == cloud_topics::l0::unassigned_pipeline_stage);
-        req.set_value(chunked_vector<cloud_topics::extent_meta>{});
+        req.set_value(cloud_topics::upload_meta{});
     }
 
     ASSERT_EQ_CORO(accessor.write_requests_pending(0), true);
@@ -360,8 +351,7 @@ TEST_CORO(write_pipeline_test, oversized_request) {
 
     // Should return exactly 1 request (the oversized one)
     ASSERT_EQ_CORO(result.requests.size(), 1);
-    result.requests.front().set_value(
-      chunked_vector<cloud_topics::extent_meta>{});
+    result.requests.front().set_value(cloud_topics::upload_meta{});
 
     // Second request should still be pending
     ASSERT_EQ_CORO(accessor.write_requests_pending(1), true);
@@ -370,8 +360,7 @@ TEST_CORO(write_pipeline_test, oversized_request) {
     auto result2 = stage.pull_write_requests(
       std::numeric_limits<size_t>::max());
     ASSERT_EQ_CORO(result2.requests.size(), 1);
-    result2.requests.front().set_value(
-      chunked_vector<cloud_topics::extent_meta>{});
+    result2.requests.front().set_value(cloud_topics::upload_meta{});
 
     ASSERT_EQ_CORO(accessor.write_requests_pending(0), true);
 }
@@ -439,7 +428,7 @@ TEST_CORO(write_pipeline_test, multiple_requests_within_limit) {
     ASSERT_EQ_CORO(result_all.requests.size(), 3);
 
     for (auto& req : result_all.requests) {
-        req.set_value(chunked_vector<cloud_topics::extent_meta>{});
+        req.set_value(cloud_topics::upload_meta{});
     }
 
     ASSERT_TRUE_CORO(accessor.write_requests_pending(0));
@@ -499,7 +488,7 @@ TEST_CORO(write_pipeline_test, max_requests_limit) {
     size_t first_batch_size = result.requests.size();
 
     for (auto& req : result.requests) {
-        req.set_value(chunked_vector<cloud_topics::extent_meta>{});
+        req.set_value(cloud_topics::upload_meta{});
     }
 
     // Remaining requests should still be pending
@@ -511,8 +500,49 @@ TEST_CORO(write_pipeline_test, max_requests_limit) {
     ASSERT_EQ_CORO(result2.requests.size(), 5 - first_batch_size);
 
     for (auto& req : result2.requests) {
-        req.set_value(chunked_vector<cloud_topics::extent_meta>{});
+        req.set_value(cloud_topics::upload_meta{});
     }
 
     ASSERT_TRUE_CORO(accessor.write_requests_pending(0));
+}
+
+TEST_CORO(write_pipeline_test, enqueue_foreign_request_accounts_bytes) {
+    // Verify that enqueue_foreign_request updates _stage_bytes for
+    // the destination stage. This was previously missing, causing
+    // the scheduler to underreport cross-shard work.
+    cloud_topics::l0::write_pipeline<ss::manual_clock> pipeline;
+
+    auto stage1 = pipeline.register_write_pipeline_stage();
+    auto stage2 = pipeline.register_write_pipeline_stage();
+
+    ASSERT_EQ_CORO(pipeline.stage_bytes(stage2.id()), 0);
+
+    const auto timeout = ss::manual_clock::now() + 10s;
+
+    auto make_chunk = [&]() -> ss::future<cloud_topics::l0::serialized_chunk> {
+        chunked_vector<model::record_batch> batches;
+        auto data = co_await model::test::make_random_batches(
+          {.count = 1, .records = 5});
+        std::ranges::move(std::move(data), std::back_inserter(batches));
+        co_return co_await cloud_topics::l0::serialize_batches(
+          std::move(batches));
+    };
+
+    auto chunk = co_await make_chunk();
+    auto req
+      = std::make_unique<cloud_topics::l0::write_request<ss::manual_clock>>(
+        model::controller_ntp, min_epoch, std::move(chunk), timeout);
+    auto expected_size = req->size_bytes();
+
+    // enqueue_foreign_request should account bytes at the next stage
+    stage1.enqueue_foreign_request(*req, false);
+
+    ASSERT_EQ_CORO(pipeline.stage_bytes(stage2.id()), expected_size);
+
+    // Pull from stage2 — bytes should be released
+    auto res = stage2.pull_write_requests(std::numeric_limits<size_t>::max());
+    ASSERT_EQ_CORO(res.requests.size(), 1);
+    ASSERT_EQ_CORO(pipeline.stage_bytes(stage2.id()), 0);
+
+    res.requests.front().set_value(cloud_topics::upload_meta{});
 }

@@ -34,10 +34,8 @@
 #include <avro/Compiler.hh>
 #include <avro/Exception.hh>
 #include <avro/GenericDatum.hh>
-#include <avro/Stream.hh>
 #include <avro/Types.hh>
 #include <avro/ValidSchema.hh>
-#include <boost/outcome/std_result.hpp>
 #include <boost/outcome/success_failure.hpp>
 #include <fmt/core.h>
 #include <fmt/format.h>
@@ -157,8 +155,9 @@ avro_compatibility_result check_compatible(
                 std::vector<std::string_view> missing;
                 for (size_t w_idx = 0; w_idx < writer.names(); ++w_idx) {
                     size_t r_idx{0};
-                    if (const auto& n = writer.nameAt(int(w_idx));
-                        !reader.nameIndex(n, r_idx)) {
+                    if (
+                      const auto& n = writer.nameAt(int(w_idx));
+                      !reader.nameIndex(n, r_idx)) {
                         missing.emplace_back(n);
                     }
                 }
@@ -280,6 +279,47 @@ result<void> sanitize(json::Value& v, sanitize_context& ctx);
 result<void> sanitize(json::Value::Object& o, sanitize_context& ctx);
 result<void> sanitize(json::Value::Array& a, sanitize_context& ctx);
 
+bool is_avro_type_name(std::string_view name) {
+    return string_switch<bool>(name)
+      .match("null", true)
+      .match("boolean", true)
+      .match("int", true)
+      .match("long", true)
+      .match("float", true)
+      .match("double", true)
+      .match("bytes", true)
+      .match("string", true)
+      .match("record", true)
+      .match("enum", true)
+      .match("array", true)
+      .match("map", true)
+      .match("fixed", true)
+      .default_match(false);
+}
+
+/// Shorten a fully-qualified named type reference to its simple name when the
+/// reference's namespace matches the enclosing namespace. Per the Avro spec
+/// (Names, section 2), such a reference is semantically equivalent to the
+/// unqualified form. This matches Confluent Schema Registry sanitization,
+/// which consistently unqualifies references so that equivalent schemas
+/// canonicalize identically.
+void unqualify_type_reference(json::Value& val, sanitize_context& ctx) {
+    if (!val.IsString() || val.GetStringLength() == 0) {
+        return;
+    }
+    std::string_view sv{val.GetString(), val.GetStringLength()};
+    auto last_dot = sv.find_last_of('.');
+    if (last_dot == std::string_view::npos) {
+        return;
+    }
+    std::string_view namespace_part = sv.substr(0, last_dot);
+    std::string_view name_part = sv.substr(last_dot + 1);
+    if (namespace_part == ctx.ns.top() && !is_avro_type_name(name_part)) {
+        auto shortened = ss::sstring{name_part};
+        val.SetString(shortened.data(), shortened.length(), ctx.alloc);
+    }
+}
+
 result<void>
 sanitize_union_symbol_name(json::Value& name, sanitize_context& ctx) {
     // A name should have the leading dot stripped iff it's the only one
@@ -297,6 +337,8 @@ sanitize_union_symbol_name(json::Value& name, sanitize_context& ctx) {
         // SetString uses memcpy, take a copy so the range doesn't overlap.
         auto new_name = ss::sstring{fullname_sv};
         name.SetString(new_name.data(), new_name.length(), ctx.alloc);
+    } else if (last_dot != std::string::npos) {
+        unqualify_type_reference(name, ctx);
     }
     return outcome::success();
 }
@@ -337,6 +379,13 @@ result<void> sanitize_avro_type(
         for (auto& i : o) {
             if (auto res = sanitize(i.value, ctx); !res.has_value()) {
                 return res;
+            }
+            if (i.value.IsString()) {
+                std::string_view member_name{
+                  i.name.GetString(), i.name.GetStringLength()};
+                if (member_name == "items" || member_name == "values") {
+                    unqualify_type_reference(i.value, ctx);
+                }
             }
         }
         break;
@@ -455,6 +504,7 @@ result<void> sanitize(json::Value::Object& o, sanitize_context& ctx) {
         if (res.has_error()) {
             return res.assume_error();
         } else if (t_it->value.GetType() == json::Type::kStringType) {
+            unqualify_type_reference(t_it->value, ctx);
             std::string_view type_sv = {
               t_it->value.GetString(), t_it->value.GetStringLength()};
             auto res = sanitize_avro_type(o, type_sv, ctx);
@@ -497,16 +547,22 @@ result<void> sanitize(json::Value::Array& a, sanitize_context& ctx) {
 
 } // namespace
 
+struct avro_schema_definition::impl {
+    explicit impl(avro::ValidSchema schema)
+      : schema(std::move(schema)) {}
+    avro::ValidSchema schema;
+};
+
 avro_schema_definition::avro_schema_definition(
   avro::ValidSchema vs,
   schema_definition::references refs,
   std::optional<schema_metadata> meta)
-  : _impl(std::move(vs))
+  : _impl(ss::make_shared<const impl>(std::move(vs)))
   , _refs(std::move(refs))
   , _meta(std::move(meta)) {}
 
 const avro::ValidSchema& avro_schema_definition::operator()() const {
-    return _impl;
+    return _impl->schema;
 }
 
 bool operator==(
@@ -514,25 +570,24 @@ bool operator==(
     return lhs.raw() == rhs.raw();
 }
 
-std::ostream& operator<<(std::ostream& os, const avro_schema_definition& def) {
-    fmt::print(
-      os,
+fmt::iterator avro_schema_definition::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "type: {}, definition: {}, references: {}, metadata: {}",
-      to_string_view(def.type()),
-      def().toJson(false),
-      def.refs(),
-      def.meta());
-    return os;
+      to_string_view(type()),
+      (*this)().toJson(false),
+      refs(),
+      meta());
 }
 
 schema_definition::raw_string avro_schema_definition::raw() const {
     iobuf_ostream os;
-    _impl.toJson(os.ostream());
+    _impl->schema.toJson(os.ostream());
     return schema_definition::raw_string{json::minify(std::move(os).buf())};
 }
 
 ss::sstring avro_schema_definition::name() const {
-    return _impl.root()->name().fullname();
+    return _impl->schema.root()->name().fullname();
 };
 
 class collected_schema {

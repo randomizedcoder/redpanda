@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/node_hash_set.h"
+#include "base/format_to.h"
 #include "hashing/murmur.h"
 #include "kafka/protocol/types.h"
 #include "model/fundamental.h"
@@ -58,8 +59,8 @@ struct tx_hash_range
       : first(f)
       , last(l) {}
 
-    friend bool operator==(const tx_hash_range&, const tx_hash_range&)
-      = default;
+    friend bool
+    operator==(const tx_hash_range&, const tx_hash_range&) = default;
 
     auto serde_fields() { return std::tie(first, last); }
 
@@ -73,11 +74,8 @@ struct tx_hash_range
         return (r.first >= first && r.first <= last)
                || (r.last >= first && r.last <= last) || r.contains(*this);
     }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const tx_hash_range& range) {
-        fmt::print(o, "[{}, {}]", range.first, range.last);
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "[{}, {}]", first, last);
     }
 };
 
@@ -104,8 +102,8 @@ struct tx_hash_ranges_set
     tx_hash_ranges_set(std::vector<tx_hash_range>&& hr)
       : ranges(hr) {}
 
-    friend bool operator==(const tx_hash_ranges_set&, const tx_hash_ranges_set&)
-      = default;
+    friend bool
+    operator==(const tx_hash_ranges_set&, const tx_hash_ranges_set&) = default;
 
     auto serde_fields() { return std::tie(ranges); }
 
@@ -163,11 +161,8 @@ struct tx_hash_ranges_set
               return range1.intersects(range2);
           });
     }
-
-    friend std::ostream&
-    operator<<(std::ostream& o, const tx_hash_ranges_set& ranges) {
-        fmt::print(o, "{{ {} }}", ranges.ranges);
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "{{ {} }}", ranges);
     }
 };
 
@@ -196,14 +191,13 @@ struct hosted_txs
           hash_ranges, excluded_transactions, included_transactions);
     }
 
-    friend std::ostream& operator<<(std::ostream& o, hosted_txs h) {
-        fmt::print(
-          o,
-          "{{ ranges: {}, excluded: {}, included: {} }}",
-          h.hash_ranges,
-          h.excluded_transactions.size(),
-          h.included_transactions.size());
-        return o;
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{ranges: {}, excluded: {}, included: {}}}",
+          hash_ranges,
+          excluded_transactions.size(),
+          included_transactions.size());
     }
 };
 

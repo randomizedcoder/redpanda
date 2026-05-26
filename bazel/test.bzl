@@ -10,7 +10,14 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
-load(":internal.bzl", "redpanda_copts")
+load(":internal.bzl", "antithesis_deps", "redpanda_copts")
+
+def _reactor_args():
+    """Returns additional reactor args for all reactor-using tests and benchmarks."""
+    return select({
+        "//bazel:io_uring_enabled": ["--reactor-backend=io_uring"],
+        "//conditions:default": [],
+    })
 
 def _has_flags(args, *flags):
     """
@@ -53,7 +60,7 @@ def _parse_bytes(value):
 
 def _test_options():
     """
-    Returns common data dependencies and environment variables for Redpanda tests.
+    Returns common data dependencies, environment variables, and library deps for Redpanda tests.
 
     This function provides a centralized place to define common settings for all
     C++ tests, ensuring consistency and making it easier to manage test
@@ -63,6 +70,7 @@ def _test_options():
         A tuple containing:
         - A list of common data dependencies needed by tests (e.g., suppression files).
         - A dictionary of common environment variables for test execution.
+        - A list of common library dependencies for all tests.
     """
     data = [
         "//:ubsan_suppressions",
@@ -82,7 +90,8 @@ def _test_options():
         # see https://redpandadata.atlassian.net/wiki/x/BwDSUw
         "REDPANDA_RNG_SEEDING_MODE_DEFAULT": "fixed",
     }
-    return data, env
+    deps = antithesis_deps()
+    return data, env, deps
 
 def _redpanda_cc_test(
         name,
@@ -147,13 +156,15 @@ def _redpanda_cc_test(
     if args and dash_dash_protocol:
         args = ["--"] + args
 
-    test_data, test_env = _test_options()
+    args = args + _reactor_args()
+
+    test_data, test_env, test_deps = _test_options()
     cc_test(
         name = name,
         timeout = timeout,
         srcs = srcs,
         defines = defines,
-        deps = deps,
+        deps = deps + test_deps,
         copts = redpanda_copts(),
         args = args,
         features = [
@@ -189,13 +200,13 @@ def _redpanda_cc_fuzz_test(
       env: environment variables
       data: data file dependencies
     """
-    test_data, test_env = _test_options()
+    test_data, test_env, test_deps = _test_options()
     cc_test(
         name = name,
         timeout = timeout,
         srcs = srcs,
         defines = defines,
-        deps = deps,
+        deps = deps + test_deps,
         copts = redpanda_copts(),
         args = custom_args,
         features = [
@@ -327,7 +338,7 @@ def redpanda_cc_btest_no_seastar(
         cpu = 1,
         memory = "128MiB",
         deps = []):
-    test_data, test_env = _test_options()
+    test_data, test_env, test_deps = _test_options()
     cc_test(
         name = name,
         timeout = timeout,
@@ -343,7 +354,7 @@ def redpanda_cc_btest_no_seastar(
             "//src/v/test_utils:boost_result_redirect",
             "//src/v/test_utils:boost_test_hooks",
             "@boost//:test.so",
-        ] + deps,
+        ] + deps + test_deps,
         data = test_data,
         env = test_env,
     )
@@ -390,7 +401,8 @@ def redpanda_cc_bench(
         duration = None,
         data = [],
         tags = [],
-        redirect_stderr = False):
+        redirect_stderr = False,
+        test_regex = None):
     """
     Create a seastar benchmark target
 
@@ -408,8 +420,10 @@ def redpanda_cc_bench(
       data: any data files available to the benchmark as runfiles
       tags: custom tags for the test
       timeout: the timeout for smoke testing the benchmark
-      redirect_stderr: if True, redirects stdout (seastar logging, mostly) to a file
+      redirect_stderr: if True, redirects stderr (seastar logging, mostly) to a file
                        so that it does not overwhelm the result output
+      test_regex: optional regex passed as `-t <regex>` to the smoke test to select
+                  a subset of benchmarks to run
     """
 
     # We require this naming convention as we do things like extract
@@ -451,12 +465,14 @@ def redpanda_cc_bench(
 
     tags = tags + ["bench"]
 
+    test_data, test_env, test_deps = _test_options()
+
     binary_name = name + "_binary"
     cc_binary(
         name = binary_name,
         srcs = srcs,
         defines = defines,
-        deps = deps,
+        deps = deps + test_deps,
         testonly = True,
         copts = redpanda_copts(),
         features = [
@@ -467,7 +483,7 @@ def redpanda_cc_bench(
         data = data,
     )
 
-    args = ["$(rootpath :{})".format(binary_name)] + args
+    args = ["$(rootpath :{})".format(binary_name)] + args + _reactor_args()
     env = env | {
         "MB_EXEC_IN_SHM": "1",
         "MB_REDIRECT_STDERR_DEFAULT": "1" if redirect_stderr else "0",
@@ -493,7 +509,9 @@ def redpanda_cc_bench(
 
     # we write a wrapper to test the benchmark, which tries to
     # run it as quickly as possible in order to smoke test it
-    test_data, test_env = _test_options()
+    test_args = args + ["--iterations=1 --runs=1 --duration=0 --no-stdout --overprovisioned"]
+    if test_regex != None:
+        test_args = test_args + ["-t {}".format(test_regex)]
     py_test(
         name = name + "_test",
         timeout = timeout,
@@ -501,6 +519,6 @@ def redpanda_cc_bench(
         tags = resource_tags + tags,
         srcs = ["//bazel:bench_wrapper"],
         env = test_env | env,
-        args = args + ["--iterations=1 --runs=1 --duration=0 --no-stdout --overprovisioned"],
+        args = test_args,
         data = [":" + binary_name] + data + test_data,
     )

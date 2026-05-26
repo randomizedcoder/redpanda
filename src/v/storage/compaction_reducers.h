@@ -142,7 +142,7 @@ public:
       model::offset segment_last_offset,
       bool compaction_placeholder_enabled,
       bool unset_transaction_bit_enabled,
-      ss::lw_shared_ptr<storage::stm_manager> stm_mgr,
+      ss::lw_shared_ptr<storage::stm_hookset> stm_mgr,
       compacted_index_writer* cidx = nullptr,
       bool inject_failure = false,
       ss::abort_source* as = nullptr)
@@ -170,7 +170,7 @@ private:
       const model::record_batch&,
       const model::record&,
       bool,
-      std::vector<int32_t>&);
+      chunked_vector<int32_t>&);
 
     ss::future<std::optional<model::record_batch>> filter(model::record_batch);
 
@@ -194,7 +194,7 @@ private:
 
     segment_appender* _appender;
 
-    ss::lw_shared_ptr<storage::stm_manager> _stm_mgr;
+    ss::lw_shared_ptr<storage::stm_hookset> _stm_mgr;
 
     // Compacted index writer for the newly written segment. May not be
     // supplied if the compacted index isn't expected to change, e.g. when
@@ -253,15 +253,16 @@ class tx_reducer : public compaction_reducer {
 public:
     explicit tx_reducer(
       model::ntp ntp,
-      ss::lw_shared_ptr<storage::stm_manager> stm_mgr,
+      ss::lw_shared_ptr<storage::stm_hookset> stm_mgr,
+      std::optional<storage::stm_type> transactional_stm_type,
       chunked_vector<model::tx_range>&& txs,
       compacted_index_writer* w,
-      bool tx_batch_compaction_enabled) noexcept
+      bool tx_batch_compaction_enabled)
       : _ntp(std::move(ntp))
       , _delegate(index_rebuilder_reducer(w))
       , _aborted_txs(model::tx_range_cmp(), std::move(txs))
       , _stm_mgr(stm_mgr)
-      , _transactional_stm_type(stm_mgr->transactional_stm_type())
+      , _transactional_stm_type(transactional_stm_type)
       , _tx_batch_compaction_enabled(tx_batch_compaction_enabled) {
         _stats.num_aborted_txes = _aborted_txs.size();
     }
@@ -272,15 +273,14 @@ public:
         size_t num_aborted_txes{0};
         size_t batches_processed{0};
 
-        friend std::ostream& operator<<(std::ostream& os, const stats& s) {
-            fmt::print(
-              os,
+        fmt::iterator format_to(fmt::iterator it) const {
+            return fmt::format_to(
+              it,
               "{{ batches processed: {}, aborted_txs: {}, "
               "discarded batches: {} }}",
-              s.batches_processed,
-              s.num_aborted_txes,
-              s.batches_discarded);
-            return os;
+              batches_processed,
+              num_aborted_txes,
+              batches_discarded);
         }
     };
 
@@ -308,7 +308,7 @@ private:
     // end offset of the batch we consumed.
     absl::flat_hash_map<model::producer_identity, model::tx_range>
       _ongoing_aborted_txs;
-    ss::lw_shared_ptr<storage::stm_manager> _stm_mgr;
+    ss::lw_shared_ptr<storage::stm_hookset> _stm_mgr;
     stats _stats;
     // Set if a transactional stm is attached to this partition.
     std::optional<storage::stm_type> _transactional_stm_type;

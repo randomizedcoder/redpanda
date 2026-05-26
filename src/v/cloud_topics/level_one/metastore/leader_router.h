@@ -63,6 +63,9 @@ public:
     ss::future<rpc::replace_objects_reply> replace_objects(
       rpc::replace_objects_request, local_only = local_only::no);
 
+    ss::future<rpc::compact_objects_reply> compact_objects(
+      rpc::compact_objects_request, local_only = local_only::no);
+
     ss::future<rpc::get_first_offset_ge_reply> get_first_offset_ge(
       rpc::get_first_offset_ge_request, local_only = local_only::no);
 
@@ -97,6 +100,9 @@ public:
     ss::future<rpc::get_compaction_infos_reply> get_compaction_infos(
       rpc::get_compaction_infos_request, local_only = local_only::no);
 
+    ss::future<rpc::get_leveling_infos_reply> get_leveling_infos(
+      rpc::get_leveling_infos_request, local_only = local_only::no);
+
     ss::future<rpc::get_extent_metadata_reply> get_extent_metadata(
       rpc::get_extent_metadata_request, local_only = local_only::no);
 
@@ -105,6 +111,9 @@ public:
 
     ss::future<rpc::restore_domain_reply>
       restore_domain(rpc::restore_domain_request, local_only = local_only::no);
+
+    ss::future<rpc::preregister_objects_reply> preregister_objects(
+      rpc::preregister_objects_request, local_only = local_only::no);
 
     std::optional<model::partition_id>
     metastore_partition(const model::topic_id_partition&) const;
@@ -150,6 +159,11 @@ private:
 
     ss::future<rpc::replace_objects_reply> replace_objects_locally(
       rpc::replace_objects_request,
+      const model::ntp& metastore_ntp,
+      ss::shard_id);
+
+    ss::future<rpc::compact_objects_reply> compact_objects_locally(
+      rpc::compact_objects_request,
       const model::ntp& metastore_ntp,
       ss::shard_id);
 
@@ -207,6 +221,11 @@ private:
       const model::ntp& metastore_ntp,
       ss::shard_id);
 
+    ss::future<rpc::get_leveling_infos_reply> get_leveling_infos_locally(
+      rpc::get_leveling_infos_request,
+      const model::ntp& metastore_ntp,
+      ss::shard_id);
+
     ss::future<rpc::get_extent_metadata_reply> get_extent_metadata_locally(
       rpc::get_extent_metadata_request,
       const model::ntp& metastore_ntp,
@@ -217,6 +236,11 @@ private:
 
     ss::future<rpc::restore_domain_reply> restore_domain_locally(
       rpc::restore_domain_request,
+      const model::ntp& metastore_ntp,
+      ss::shard_id);
+
+    ss::future<rpc::preregister_objects_reply> preregister_objects_locally(
+      rpc::preregister_objects_request,
       const model::ntp& metastore_ntp,
       ss::shard_id);
 

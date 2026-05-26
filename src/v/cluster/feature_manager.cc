@@ -11,9 +11,9 @@
 
 #include "feature_manager.h"
 
-#include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_service.h"
+#include "cluster/controller_utils.h"
 #include "cluster/health_monitor_backend.h"
 #include "cluster/health_monitor_frontend.h"
 #include "cluster/health_monitor_types.h"
@@ -32,6 +32,7 @@
 #include "model/timeout_clock.h"
 #include "pandaproxy/schema_registry/schema_id_validation.h"
 #include "raft/group_manager.h"
+#include "rpc/connection_cache.h"
 #include "security/role_store.h"
 #include "security/types.h"
 
@@ -138,6 +139,11 @@ feature_manager::start(std::vector<model::node_id>&& cluster_founder_nodes) {
             // ensures that we will populate it with fresh data when we next
             // see a health report from each node.
             _node_versions.clear();
+
+            // Manual finalization requests are term-scoped: a stale value
+            // carried across leadership changes would be misleading on
+            // re-election. Operators must re-issue against the new leader.
+            _manual_finalize_pending = false;
 
             vlog(
               clusterlog.debug, "Controller leader notification term {}", term);
@@ -275,9 +281,6 @@ feature_manager::report_enterprise_features() const {
     report.set(
       features::license_required_feature::shadow_linking,
       cfg.enable_shadow_linking());
-    report.set(
-      features::license_required_feature::cloud_topics,
-      cfg.cloud_topics_enabled());
     report.set(
       features::license_required_feature::topic_deletion_disabled,
       !cfg.delete_topic_enable());
@@ -528,7 +531,7 @@ void feature_manager::update_node_version(
       update_node,
       v);
 
-    _updates.emplace(update_node, v);
+    _updates.insert_or_assign(update_node, v);
     _update_wait.signal();
 }
 
@@ -541,6 +544,14 @@ void feature_manager::update_node_version(
  */
 ss::future<> feature_manager::do_maybe_update_active_version() {
     vassert(ss::this_shard_id() == backend_shard, "Wrong shard!");
+
+    // One-shot consume of the manual-finalization request: every
+    // invocation clears the flag and decides what to do based on the
+    // captured value. Any early return or throw below leaves the flag
+    // cleared, so the next loop tick will defer (until the operator
+    // re-issues) when auto-finalization is disabled.
+    const bool was_manual_finalize_pending = std::exchange(
+      _manual_finalize_pending, false);
 
     // Consume any accumulated updates.  Important to do this even if
     // not leader, so that we drain it and allow maybe_update_active_version
@@ -570,6 +581,21 @@ ss::future<> feature_manager::do_maybe_update_active_version() {
           "No update, max version {} not ahead of {}",
           max_version,
           active_version);
+        co_return;
+    }
+
+    // When auto-finalization is disabled and no manual request was
+    // captured this tick, defer the advance until the operator
+    // explicitly requests it via the admin API.
+    if (
+      !config::shard_local_cfg().features_auto_finalization()
+      && !was_manual_finalize_pending) {
+        vlog(
+          clusterlog.debug,
+          "Deferring cluster active version advance to {}: "
+          "features_auto_finalization is disabled and no manual request "
+          "is pending",
+          max_version);
         co_return;
     }
 
@@ -647,6 +673,23 @@ ss::future<> feature_manager::do_maybe_update_active_version() {
     co_await replicate_feature_update_cmd(std::move(data));
 
     vlog(clusterlog.info, "Updated cluster (logical version {})", max_version);
+}
+
+ss::future<feature_manager::finalize_status>
+feature_manager::submit_manual_finalize_request() {
+    vassert(ss::this_shard_id() == backend_shard, "Wrong shard!");
+
+    if (!_am_controller_leader) {
+        co_return finalize_status::not_leader;
+    }
+
+    // Arm the flag and wake the loop. The loop body validates cluster
+    // preconditions on its next tick; if they fail, the existing throw
+    // path triggers retry, but the flag is cleared at the start of the
+    // attempt so the retry will defer until the operator re-issues.
+    _manual_finalize_pending = true;
+    _update_wait.signal();
+    co_return finalize_status::ok;
 }
 
 ss::future<> feature_manager::do_maybe_activate_features() {
@@ -768,8 +811,9 @@ feature_manager::write_action(cluster::feature_update_action action) {
 void feature_manager::set_node_to_latest_version(const model::node_id node_id) {
     const cluster_version latest
       = features::feature_table::get_latest_logical_version();
-    if (const version_map::iterator i = _node_versions.find(node_id);
-        i != _node_versions.end()) {
+    if (
+      const version_map::iterator i = _node_versions.find(node_id);
+      i != _node_versions.end()) {
         if (i->second == latest) {
             return; // already there
         }

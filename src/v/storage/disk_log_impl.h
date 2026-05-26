@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
+#include "base/format_to.h"
 #include "compaction/fwd.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
@@ -148,7 +149,7 @@ public:
     std::optional<model::offset>
     index_batch_base_offset_lower_bound(model::offset o) const final;
 
-    std::ostream& print(std::ostream&) const final;
+    fmt::iterator format_to(fmt::iterator it) const final;
 
     // Must be called while _segments_rolling_lock is held.
     ss::future<> maybe_roll_unlocked(model::term_id, model::offset next_offset);
@@ -324,12 +325,15 @@ public:
     // transactional data or fence batches
     model::offset transaction_free_prefix_offset() const final;
 
+    ss::lw_shared_ptr<storage::stm_hookset> stm_hookset() override {
+        return _stm_hookset;
+    }
+
 private:
     friend class disk_log_appender; // for multi-term appends
     friend class disk_log_builder;  // for tests
     friend ::storage_e2e_fixture;
     friend ::reupload_fixture; // for tests
-    friend std::ostream& operator<<(std::ostream& o, const disk_log_impl& d);
 
     ss::future<model::record_batch_reader>
       make_unchecked_reader(local_log_reader_config);
@@ -457,6 +461,8 @@ private:
       model::offset& cached) const;
 
 private:
+    ss::lw_shared_ptr<storage::stm_hookset> _stm_hookset;
+
     // Computes the segment size based on the latest max_segment_size
     // configuration. This takes into consideration any segment size
     // overrides since the last time it was called.

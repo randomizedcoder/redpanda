@@ -1,13 +1,10 @@
-/*
- * Copyright 2025 Redpanda Data, Inc.
- *
- * Use of this software is governed by the Business Source License
- * included in the file licenses/BSL.md
- *
- * As of the Change Date specified in that file, in accordance with
- * the Business Source License, use of this software will be governed
- * by the Apache License, Version 2.0
- */
+// Copyright (c) 2014 The LevelDB Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found at https://github.com/google/leveldb/blob/main/LICENSE. See
+// https://github.com/google/leveldb/blob/main/AUTHORS for names of
+// contributors.
+//
+// Modifications copyright 2025 Redpanda Data, Inc.
 
 #include "lsm/db/memtable.h"
 
@@ -189,10 +186,6 @@ void memtable::merge(ss::lw_shared_ptr<memtable> other) {
 }
 
 lookup_result memtable::get(internal::key_view key) {
-    dassert(
-      key.type() == internal::value_type::value,
-      "when getting from the memtable, keys must be of value type",
-      key.decode());
     auto it = _table.lower_bound(key.without_type());
     if (it != _table.end() && it->first.user_key() == key.user_key()) {
         if (it->first.type() == internal::value_type::tombstone) {

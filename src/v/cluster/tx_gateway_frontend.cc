@@ -24,15 +24,14 @@
 #include "cluster/tx_gateway_service.h"
 #include "cluster/tx_helpers.h"
 #include "cluster/tx_topic_manager.h"
+#include "cluster/types.h"
 #include "config/configuration.h"
 #include "kafka/protocol/types.h"
 #include "model/fundamental.h"
 #include "model/namespace.h"
 #include "model/record.h"
 #include "rpc/connection_cache.h"
-#include "types.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -51,10 +50,12 @@ static auto with(
   const kafka::transactional_id& tx_id,
   const std::string_view name,
   Func&& func) {
+    auto gh = stm->gate().hold();
     return stm->lock_tx(tx_id, name)
-      .then([stm, func = std::forward<Func>(func)](auto units) mutable {
+      .then([stm, func = std::forward<Func>(func), gh = std::move(gh)](
+              auto units) mutable {
           return ss::futurize_invoke(std::forward<Func>(func))
-            .finally([units = std::move(units)] {});
+            .finally([units = std::move(units), gh = std::move(gh)] {});
       });
 }
 
@@ -64,6 +65,7 @@ static auto with_free(
   const kafka::transactional_id& tx_id,
   const std::string_view name,
   Func&& func) {
+    auto gh = stm->gate().hold();
     auto units = stm->try_lock_tx(tx_id, name);
     auto f = ss::now();
 
@@ -71,11 +73,12 @@ static auto with_free(
         f = ss::make_exception_future(ss::semaphore_timed_out());
     }
 
-    return f.then(
-      [units = std::move(units), func = std::forward<Func>(func)]() mutable {
-          return ss::futurize_invoke(std::forward<Func>(func))
-            .finally([units = std::move(units)] {});
-      });
+    return f.then([units = std::move(units),
+                   func = std::forward<Func>(func),
+                   gh = std::move(gh)]() mutable {
+        return ss::futurize_invoke(std::forward<Func>(func))
+          .finally([units = std::move(units), gh = std::move(gh)] {});
+    });
 }
 
 static auto send(tx_gateway_client_protocol& cp, try_abort_request&& request) {
@@ -709,9 +712,10 @@ ss::future<cluster::init_tm_tx_reply> tx_gateway_frontend::init_tm_tx_locally(
       tx_id,
       transaction_timeout_ms);
 
-    if (unlikely(
-          transaction_timeout_ms
-          > config::shard_local_cfg().transaction_max_timeout_ms())) {
+    if (
+      unlikely(
+        transaction_timeout_ms
+        > config::shard_local_cfg().transaction_max_timeout_ms())) {
         vlog(
           txlog.warn,
           "[tx_id={}] Transactional timeout requested {}ms exceeds configured "
@@ -2839,8 +2843,8 @@ ss::future<result<tx_metadata, tx::errc>> tx_gateway_frontend::describe_tx(
     auto term = sync_result.value();
     const auto timeout
       = config::shard_local_cfg().internal_rpc_request_timeout_ms();
-    co_return co_await find_and_try_progressing_transaction(
-      term, stm, tid, timeout);
+    co_return result<tx_metadata, tx::errc>(
+      co_await find_and_try_progressing_transaction(term, stm, tid, timeout));
 }
 
 ss::future<try_abort_reply>

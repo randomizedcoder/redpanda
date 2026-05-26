@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/btree_set.h"
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "container/chunked_vector.h"
 #include "model/metadata.h"
@@ -23,12 +24,14 @@
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/sstring.hh>
 
+#include <fmt/chrono.h>
 #include <fmt/core.h>
 #include <fmt/format.h>
 
 #include <chrono>
-#include <iosfwd>
+#include <ctime>
 #include <optional>
+#include <type_traits>
 #include <variant>
 namespace debug_bundle {
 
@@ -51,8 +54,10 @@ constexpr std::string_view to_string_view(special_date d) {
         return "tomorrow";
     }
 }
+inline fmt::iterator format_to(special_date d, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(d));
+}
 
-std::ostream& operator<<(std::ostream& o, const special_date& d);
 std::istream& operator>>(std::istream& i, special_date& d);
 
 /// Defines which clock the debug bundle will use
@@ -68,8 +73,18 @@ struct scram_creds {
 
     friend bool operator==(const scram_creds&, const scram_creds&) = default;
 };
+
+/// OAUTHBEARER credentials for authn; carries the raw bearer token
+struct bearer_creds {
+    ss::sstring token;
+    /// Always "OAUTHBEARER"
+    ss::sstring mechanism;
+
+    friend bool operator==(const bearer_creds&, const bearer_creds&) = default;
+};
+
 /// Variant so it can be expanded as new authn methods are added to rpk
-using debug_bundle_authn_options = std::variant<scram_creds>;
+using debug_bundle_authn_options = std::variant<scram_creds, bearer_creds>;
 
 /// Used to collect topics and partitions for the "--partitions" option for "rpk
 /// debug_bundle"
@@ -80,21 +95,25 @@ struct partition_selection {
     static std::optional<partition_selection>
       from_string_view(std::string_view);
 
-    friend bool
-    operator==(const partition_selection&, const partition_selection&)
-      = default;
-};
+    friend bool operator==(
+      const partition_selection&, const partition_selection&) = default;
 
-std::ostream& operator<<(std::ostream& o, const partition_selection& p);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it, "{}/{}/{}", tn.ns, tn.tp, fmt::join(partitions, ","));
+    }
+};
 
 struct label_selection {
     ss::sstring key;
     ss::sstring value;
 
-    friend bool operator==(const label_selection&, const label_selection&)
-      = default;
+    friend bool
+    operator==(const label_selection&, const label_selection&) = default;
 
-    friend std::ostream& operator<<(std::ostream& o, const label_selection& l);
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "{}={}", key, value);
+    }
 };
 
 /// Parameters used to spawn rpk debug bundle
@@ -113,9 +132,8 @@ struct debug_bundle_parameters {
     std::optional<ss::sstring> k8s_namespace;
     std::optional<std::vector<label_selection>> label_selector;
 
-    friend bool
-    operator==(const debug_bundle_parameters&, const debug_bundle_parameters&)
-      = default;
+    friend bool operator==(
+      const debug_bundle_parameters&, const debug_bundle_parameters&) = default;
 };
 
 /// The state of the debug bundle process
@@ -133,8 +151,9 @@ constexpr std::string_view to_string_view(debug_bundle_status s) {
         return "expired";
     }
 }
-
-std::ostream& operator<<(std::ostream& o, const debug_bundle_status& s);
+inline fmt::iterator format_to(debug_bundle_status s, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(s));
+}
 
 /// Status of the debug bundle process
 struct debug_bundle_status_data {
@@ -147,29 +166,28 @@ struct debug_bundle_status_data {
     chunked_vector<ss::sstring> cerr;
 
     friend bool operator==(
-      const debug_bundle_status_data& lhs, const debug_bundle_status_data& rhs)
-      = default;
+      const debug_bundle_status_data& lhs,
+      const debug_bundle_status_data& rhs) = default;
 };
 } // namespace debug_bundle
 
 template<>
-struct fmt::formatter<debug_bundle::special_date>
-  : formatter<std::string_view> {
-    auto format(debug_bundle::special_date d, format_context& ctx) const
-      -> format_context::iterator;
-};
-
-template<>
 struct fmt::formatter<debug_bundle::time_variant>
   : formatter<std::string_view> {
-    auto format(const debug_bundle::time_variant&, format_context& ctx) const
-      -> format_context::iterator;
-};
-
-template<>
-struct fmt::formatter<debug_bundle::partition_selection>
-  : formatter<std::string_view> {
-    auto
-    format(const debug_bundle::partition_selection&, format_context& ctx) const
-      -> format_context::iterator;
+    auto format(const debug_bundle::time_variant& t, format_context& ctx) const
+      -> format_context::iterator {
+        return std::visit(
+          [&ctx](const auto& value) -> format_context::iterator {
+              using T = std::decay_t<decltype(value)>;
+              if constexpr (
+                std::is_same_v<T, debug_bundle::clock::time_point>) {
+                  auto tt = debug_bundle::clock::to_time_t(value);
+                  auto tm = *std::localtime(&tt);
+                  return fmt::format_to(ctx.out(), "{:%FT%T}", tm);
+              } else {
+                  return fmt::format_to(ctx.out(), "{}", value);
+              }
+          },
+          t);
+    }
 };

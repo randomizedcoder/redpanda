@@ -29,7 +29,6 @@
 #include "raft/logger.h"
 #include "raft/recovery_stm.h"
 #include "raft/replicate_entries_stm.h"
-#include "raft/rpc_client_protocol.h"
 #include "raft/state_machine_manager.h"
 #include "raft/types.h"
 #include "raft/vote_stm.h"
@@ -44,16 +43,13 @@
 #include "storage/types.h"
 
 #include <seastar/core/condition-variable.hh>
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/fstream.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/switch_to.hh>
 #include <seastar/util/defer.hh>
-
-#include <fmt/ostream.h>
 
 #include <algorithm>
 #include <chrono>
@@ -292,6 +288,7 @@ ss::future<xshard_transfer_state> consensus::stop() {
     }
     co_await _replication_monitor.stop();
     co_await _event_manager.stop();
+    _log->stm_hookset()->stop();
     if (_stm_manager) {
         co_await _stm_manager->stop();
     }
@@ -1659,6 +1656,7 @@ consensus::do_start(std::optional<xshard_transfer_state> xst_state) {
             co_await ss::coroutine::switch_to(ss::default_scheduling_group());
             co_await _stm_manager->start();
         }
+        _log->stm_hookset()->start();
 
         vlog(
           _ctxlog.info,
@@ -2266,7 +2264,18 @@ consensus::do_append_entries(append_entries_request&& r) {
             co_return reply;
         }
 
-        co_return co_await do_append_entries(std::move(r));
+        // Here we intentionally choose not to recurse with a mutated
+        // request (r) because of the risk of polluting prev_log_delta.
+        // If we are to recurse, we have to populate prev_log_delta with
+        // the local state of the log which could, in theory, diverge from
+        // the leader log. Instead we choose to return success, let the leader
+        // reconstruct new request from its state. This is an extra round trip
+        // but far easier to reason about in terms of correctness.
+        reply.last_dirty_log_index = adjusted_prev_log_index;
+        reply.last_flushed_log_index = std::min(
+          adjusted_prev_log_index, _flushed_offset);
+        reply.result = reply_result::success;
+        co_return reply;
     }
 
     // success. copy entries for each subsystem
@@ -2476,7 +2485,7 @@ consensus::read_snapshot_metadata() {
     }
     co_await snapshot_reader->close();
     if (eptr) {
-        std::rethrow_exception(eptr);
+        co_await ss::coroutine::return_exception_ptr(std::move(eptr));
     }
     co_return metadata;
 }
@@ -3309,16 +3318,15 @@ void consensus::trigger_leadership_notification() {
     _leadership_changed.broadcast();
 }
 
-std::ostream& operator<<(std::ostream& o, const consensus& c) {
-    fmt::print(
-      o,
+fmt::iterator consensus::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{log:{}, group_id:{}, term: {}, commit_index: {}, voted_for:{}}}",
-      c._log,
-      c._group,
-      c._term,
-      c._commit_index,
-      c._voted_for);
-    return o;
+      _log,
+      _group,
+      _term,
+      _commit_index,
+      _voted_for);
 }
 
 const group_configuration& consensus::config() const {
@@ -3932,6 +3940,14 @@ void consensus::update_heartbeat_status(vnode id, bool success) {
     }
 }
 
+void consensus::reset_heartbeat_failures(model::node_id node) {
+    for (auto& [vn, fstate] : _fstates) {
+        if (vn.id() == node) {
+            fstate.heartbeats_failed = 0;
+        }
+    }
+}
+
 bool consensus::should_reconnect_follower(
   const follower_index_metadata& f_meta) {
     if (_heartbeat_disconnect_failures == 0) {
@@ -4075,8 +4091,8 @@ reply_result consensus::lightweight_heartbeat(
     /**
      * If leader has changed force full heartbeat
      */
-    if (unlikely(
-          !_leader_id.has_value() || (_leader_id->id() != source_node))) {
+    if (
+      unlikely(!_leader_id.has_value() || (_leader_id->id() != source_node))) {
         vlog(
           _ctxlog.trace,
           "requesting full heartbeat from {}, leadership changed",
@@ -4097,8 +4113,9 @@ reply_result consensus::lightweight_heartbeat(
         return reply_result::failure;
     }
 
-    if (unlikely(
-          _follower_recovery_state && _follower_recovery_state->is_active())) {
+    if (
+      unlikely(
+        _follower_recovery_state && _follower_recovery_state->is_active())) {
         // If for some reason the leader is sending us lightweight heartbeats
         // after we allowed recovery, notify it by forcing a full heartbeat.
         return reply_result::failure;
@@ -4317,9 +4334,9 @@ consensus::do_snapshot_and_truncate_log(model::offset truncation_point) {
     co_await _consumable_offset_monitor.wait(
       truncation_point, model::no_timeout, _as);
     co_await refresh_commit_index();
-    co_await _log->stm_manager()->ensure_snapshot_exists(truncation_point);
+    co_await _log->stm_hookset()->ensure_snapshot_exists(truncation_point);
     const auto max_removable_local_log_offset
-      = _log->stm_manager()->max_removable_local_log_offset();
+      = _log->stm_hookset()->max_removable_local_log_offset();
     if (truncation_point > max_removable_local_log_offset) {
         truncation_point = max_removable_local_log_offset;
         if (truncation_point <= _last_snapshot_index) {

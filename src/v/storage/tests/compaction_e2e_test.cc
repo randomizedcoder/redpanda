@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0
 
 #include "absl/container/btree_map.h"
-#include "base/vlog.h"
 #include "cluster/feature_manager.h"
 #include "cluster/feature_update_action.h"
 #include "cluster/tests/tx_compaction_utils.h"
@@ -17,7 +16,6 @@
 #include "features/feature_table.h"
 #include "gtest/gtest.h"
 #include "kafka/server/tests/produce_consume_utils.h"
-#include "model/batch_compression.h"
 #include "model/namespace.h"
 #include "model/record_batch_reader.h"
 #include "model/record_batch_types.h"
@@ -32,6 +30,7 @@
 #include "storage/tests/manual_mixin.h"
 #include "storage/types.h"
 #include "test_utils/async.h"
+#include "test_utils/container_ostream.h" // IWYU pragma: keep
 #include "test_utils/scoped_config.h"
 #include "test_utils/test.h"
 #include "utils/adjustable_semaphore.h"
@@ -2060,8 +2059,7 @@ TEST_F(
         // Reset close semaphore.
         auto& resources = disk_log->resources();
         storage::testing_details::storage_resources_accessor::
-          inflight_close_flush_sem(resources)
-          = adjustable_semaphore(1);
+          inflight_close_flush_sem(resources) = adjustable_semaphore(1);
     }
 
     restart(should_wipe::no);

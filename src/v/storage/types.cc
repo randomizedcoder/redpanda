@@ -14,15 +14,15 @@
 #include "storage/compacted_index.h"
 #include "storage/logger.h"
 #include "storage/ntp_config.h"
-#include "storage/offset_translator_state.h"
-#include "utils/human.h"
 
 #include <fmt/core.h>
-#include <fmt/ostream.h>
 
 namespace storage {
 
-model::offset stm_manager::max_removable_local_log_offset() {
+model::offset stm_hookset::max_removable_local_log_offset() {
+    if (!has_started()) {
+        return model::offset::min();
+    }
     model::offset result = model::offset::max();
     for (const auto& stm : _stms) {
         auto mco = stm->max_removable_local_log_offset();
@@ -36,14 +36,27 @@ model::offset stm_manager::max_removable_local_log_offset() {
     return result;
 }
 
-model::offset stm_manager::tx_snapshot_offset() const {
+model::offset stm_hookset::tx_snapshot_offset() const {
+    if (!has_started()) {
+        vlog(
+          stlog.debug,
+          "attempt to get tx_snapshot_offset before stm_hookset is started");
+        return model::offset::min();
+    }
     if (_tx_stm) {
         return _tx_stm->last_locally_snapshotted_offset();
     }
     return model::offset::max();
 }
 
-std::optional<kafka::offset> stm_manager::lowest_pinned_data_offset() const {
+std::optional<kafka::offset> stm_hookset::lowest_pinned_data_offset() const {
+    if (!has_started()) {
+        vlog(
+          stlog.debug,
+          "attempt to get lowest_pinned_data_offset before stm_hookset is "
+          "started");
+        return kafka::offset::min();
+    }
     std::optional<kafka::offset> result;
     for (const auto& stm : _stms) {
         auto pinned = stm->lowest_pinned_data_offset();
@@ -54,24 +67,25 @@ std::optional<kafka::offset> stm_manager::lowest_pinned_data_offset() const {
     return result;
 }
 
-model::offset stm_manager::max_tombstone_remove_offset() const {
+model::offset stm_hookset::max_tombstone_remove_offset() const {
     return _max_tombstone_remove_offset;
 }
 
-void stm_manager::set_max_tombstone_remove_offset(model::offset o) {
+void stm_hookset::set_max_tombstone_remove_offset(model::offset o) {
     _max_tombstone_remove_offset = o;
 }
 
-model::offset stm_manager::max_tx_end_remove_offset() const {
+model::offset stm_hookset::max_tx_end_remove_offset() const {
     return _max_tx_end_remove_offset;
 }
 
-void stm_manager::set_max_tx_end_remove_offset(model::offset o) {
+void stm_hookset::set_max_tx_end_remove_offset(model::offset o) {
     _max_tx_end_remove_offset = o;
 }
 
-bool stm_manager::is_batch_in_idempotent_window(
+bool stm_hookset::is_batch_in_idempotent_window(
   const model::record_batch_header& hdr) const {
+    check_status("is_batch_in_idempotent_window");
     if (!_tx_stm) {
         return false;
     }
@@ -99,41 +113,37 @@ fmt::iterator local_log_reader_config::format_to(fmt::iterator it) const {
       client_address);
 }
 
-std::ostream& operator<<(std::ostream& o, const append_result& a) {
+fmt::iterator append_result::format_to(fmt::iterator it) const {
     auto append_dur = std::chrono::duration_cast<std::chrono::milliseconds>(
-      log_clock::now() - a.append_time);
-    fmt::print(
-      o,
+      log_clock::now() - append_time);
+    return fmt::format_to(
+      it,
       "{{time_since_append: {}, base_offset: {}, last_offset: {}, last_term: "
       "{}, "
       "byte_size: {}}}",
       append_dur,
-      a.base_offset,
-      a.last_offset,
-      a.last_term,
-      a.byte_size);
-    return o;
+      base_offset,
+      last_offset,
+      last_term,
+      byte_size);
 }
-std::ostream& operator<<(std::ostream& o, const timequery_result& r) {
-    return o << "{term:" << r.term << ", offset:" << r.offset
-             << ", time:" << r.time << "}";
+fmt::iterator timequery_result::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it, "{{term:{}, offset:{}, time:{}}}", term, offset, time);
 }
-std::ostream& operator<<(std::ostream& o, const timequery_config& a) {
-    o << "{min_offset: " << a.min_offset << ", max_offset: " << a.max_offset
-      << ", time:" << a.time << ", type_filter:";
-    if (a.type_filter) {
-        o << *a.type_filter;
-    } else {
-        o << "nullopt";
-    }
-    o << "}";
-    return o;
+fmt::iterator timequery_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{min_offset: {}, max_offset: {}, time:{}, type_filter:{}}}",
+      min_offset,
+      max_offset,
+      time,
+      type_filter);
 }
 
-std::ostream&
-operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
-    fmt::print(
-      o,
+fmt::iterator ntp_config::default_overrides::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{compaction_strategy: {}, cleanup_policy_bitflags: {}, segment_size: "
       "{}, retention_bytes: {}, retention_time_ms: {}, recovery_enabled: {}, "
       "retention_local_target_bytes: {}, retention_local_target_ms: {}, "
@@ -144,108 +154,97 @@ operator<<(std::ostream& o, const ntp_config::default_overrides& v) {
       "delete_retention_ms: {}, min_cleanable_dirty_ratio: {}, "
       "min_compaction_lag_ms: {}, max_compaction_lag_ms: {}, storage_mode: {} "
       "}}",
-      v.compaction_strategy,
-      v.cleanup_policy_bitflags,
-      v.segment_size,
-      v.retention_bytes,
-      v.retention_time,
-      v.recovery_enabled,
-      v.retention_local_target_bytes,
-      v.retention_local_target_ms,
-      v.remote_delete,
-      v.segment_ms,
-      v.initial_retention_local_target_bytes,
-      v.initial_retention_local_target_ms,
-      v.write_caching,
-      v.flush_ms,
-      v.flush_bytes,
-      v.iceberg_mode,
-      v.remote_allow_gaps,
-      v.delete_retention_ms,
-      v.min_cleanable_dirty_ratio,
-      v.min_compaction_lag_ms,
-      v.max_compaction_lag_ms,
-      v.storage_mode);
-
-    o << "}";
-
-    return o;
+      compaction_strategy,
+      cleanup_policy_bitflags,
+      segment_size,
+      retention_bytes,
+      retention_time,
+      recovery_enabled,
+      retention_local_target_bytes,
+      retention_local_target_ms,
+      remote_delete,
+      segment_ms,
+      initial_retention_local_target_bytes,
+      initial_retention_local_target_ms,
+      write_caching,
+      flush_ms,
+      flush_bytes,
+      iceberg_mode,
+      remote_allow_gaps,
+      delete_retention_ms,
+      min_cleanable_dirty_ratio,
+      min_compaction_lag_ms,
+      max_compaction_lag_ms,
+      storage_mode);
 }
 
-std::ostream& operator<<(std::ostream& o, const ntp_config& v) {
-    if (v.has_overrides()) {
-        fmt::print(
-          o,
+fmt::iterator ntp_config::format_to(fmt::iterator it) const {
+    if (has_overrides()) {
+        return fmt::format_to(
+          it,
           "{{ntp: {}, base_dir: {}, overrides: {}, revision: {}, "
           "topic_revision: {}, remote_revision: {}}}",
-          v.ntp(),
-          v.base_directory(),
-          v.get_overrides(),
-          v.get_revision(),
-          v.get_topic_revision(),
-          v.get_remote_revision());
+          ntp(),
+          base_directory(),
+          get_overrides(),
+          get_revision(),
+          get_topic_revision(),
+          get_remote_revision());
     } else {
-        fmt::print(
-          o,
+        return fmt::format_to(
+          it,
           "{{ntp: {}, base_dir: {}, overrides: nullptr, revision: {}, "
           "topic_revision: {}, remote_revision: {}}}",
-          v.ntp(),
-          v.base_directory(),
-          v.get_revision(),
-          v.get_topic_revision(),
-          v.get_remote_revision());
+          ntp(),
+          base_directory(),
+          get_revision(),
+          get_topic_revision(),
+          get_remote_revision());
     }
-    return o;
 }
 
-std::ostream& operator<<(std::ostream& o, const truncate_config& cfg) {
-    fmt::print(o, "{{base_offset:{}}}", cfg.base_offset);
-    return o;
+fmt::iterator truncate_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "{{base_offset:{}}}", base_offset);
 }
-std::ostream& operator<<(std::ostream& o, const truncate_prefix_config& cfg) {
-    fmt::print(
-      o,
+fmt::iterator truncate_prefix_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{start_offset:{}, force_truncate_delta:{}}}",
-      cfg.start_offset,
-      cfg.force_truncate_delta);
-    return o;
+      start_offset,
+      force_truncate_delta);
 }
 
-std::ostream& operator<<(std::ostream& o, const offset_stats& s) {
-    fmt::print(
-      o,
+fmt::iterator offset_stats::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{start_offset:{}, committed_offset:{}, "
       "committed_offset_term:{}, dirty_offset:{}, dirty_offset_term:{}}}",
-      s.start_offset,
-      s.committed_offset,
-      s.committed_offset_term,
-      s.dirty_offset,
-      s.dirty_offset_term);
-    return o;
+      start_offset,
+      committed_offset,
+      committed_offset_term,
+      dirty_offset,
+      dirty_offset_term);
 }
 
-std::ostream& operator<<(std::ostream& os, const gc_config& cfg) {
-    fmt::print(
-      os,
+fmt::iterator gc_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{eviction_time:{}, max_bytes:{}}}",
-      cfg.eviction_time,
-      cfg.max_bytes.value_or(-1));
-    return os;
+      eviction_time,
+      max_bytes.value_or(-1));
 }
 
-std::ostream& operator<<(std::ostream& os, const housekeeping_config& cfg) {
-    fmt::print(os, "{{compact:{}, gc:{}}}", cfg.compact, cfg.gc);
-    return os;
+fmt::iterator housekeeping_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "{{compact:{}, gc:{}}}", compact, gc);
 }
 
-std::ostream& operator<<(std::ostream& o, const compaction_result& r) {
-    fmt::print(
-      o,
+fmt::iterator compaction_result::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{executed_compaction: {}, size_before: {}, size_after: {}}}",
-      r.executed_compaction,
-      r.size_before,
-      r.size_after);
-    return o;
+      executed_compaction,
+      size_before,
+      size_after);
 }
 
 std::ostream&

@@ -21,9 +21,8 @@ apply_abs_oauth_credentials::apply_abs_oauth_credentials(
 std::error_code apply_abs_oauth_credentials::add_auth(
   http::client::request_header& header) const {
     auto token = _oauth_token();
-    // x-ms-version requests a specific version for the abs api, the hardcoded
-    // value is the one we test
-    header.set("x-ms-version", azure_storage_api_version);
+    // x-ms-version is set by abs_request_creator::add_auth, not here,
+    // because batch sub-requests must omit it before signing.
     auto iso_ts = _timesource.format_http_datetime();
     header.set("x-ms-date", {iso_ts.data(), iso_ts.size()});
     header.insert(
@@ -41,9 +40,8 @@ void apply_abs_oauth_credentials::reset_creds(credentials creds) {
     *this = apply_abs_oauth_credentials{std::get<abs_oauth_credentials>(creds)};
 }
 
-std::ostream& apply_abs_oauth_credentials::print(std::ostream& os) const {
-    fmt::print(os, "apply_abs_oauth_credentials");
-    return os;
+fmt::iterator apply_abs_oauth_credentials::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "apply_abs_oauth_credentials");
 }
 
 } // namespace cloud_roles

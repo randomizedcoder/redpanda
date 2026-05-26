@@ -253,7 +253,7 @@ ss::future<std::vector<self_test_result>> cloudcheck::run_benchmarks() {
 
 iobuf cloudcheck::make_random_payload(size_t size) const {
     iobuf payload;
-    constexpr size_t chunk_size = 128_KiB;
+    constexpr size_t chunk_size = 64_KiB;
     for (size_t amt = 0; amt < size; amt += chunk_size) {
         size_t remaining = size - amt;
         const auto random_data = random_generators::gen_alphanum_string(
@@ -291,12 +291,12 @@ ss::future<cloudcheck::verify_upload_result> cloudcheck::verify_upload(
   cloud_storage_clients::bucket_name bucket,
   cloud_storage_clients::object_key key,
   const iobuf& payload) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "Put", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
+        co_return {result};
     }
 
     try {
@@ -322,13 +322,13 @@ ss::future<cloudcheck::verify_upload_result> cloudcheck::verify_upload(
         result.error = e.what();
     }
 
-    co_return result;
+    co_return {result};
 }
 
 ss::future<cloudcheck::verify_list_result> cloudcheck::verify_list(
   cloud_storage_clients::bucket_name bucket,
   std::optional<cloud_storage_clients::object_key> prefix) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "List", .test_type = "cloud"};
 
     if (_cancelled) {
@@ -359,18 +359,18 @@ ss::future<cloudcheck::verify_list_result> cloudcheck::verify_list(
 ss::future<cloudcheck::verify_head_result> cloudcheck::verify_head(
   cloud_storage_clients::bucket_name bucket,
   std::optional<cloud_storage_clients::object_key> key) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "Head", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
+        co_return {result};
     }
 
     if (!key) {
         result.warning = "Could not download from cloud storage (no file was "
                          "found in the bucket).";
-        co_return result;
+        co_return {result};
     }
 
     try {
@@ -398,13 +398,13 @@ ss::future<cloudcheck::verify_head_result> cloudcheck::verify_head(
         result.error = e.what();
     }
 
-    co_return result;
+    co_return {result};
 }
 
 ss::future<cloudcheck::verify_download_result> cloudcheck::verify_download(
   cloud_storage_clients::bucket_name bucket,
   std::optional<cloud_storage_clients::object_key> key) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "Get", .test_type = "cloud"};
 
     if (_cancelled) {
@@ -454,12 +454,12 @@ ss::future<cloudcheck::verify_download_result> cloudcheck::verify_download(
 ss::future<cloudcheck::verify_delete_result> cloudcheck::verify_delete(
   cloud_storage_clients::bucket_name bucket,
   cloud_storage_clients::object_key key) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "Delete", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
+        co_return {result};
     }
 
     try {
@@ -482,17 +482,17 @@ ss::future<cloudcheck::verify_delete_result> cloudcheck::verify_delete(
         result.error = e.what();
     }
 
-    co_return result;
+    co_return {result};
 }
 
 ss::future<cloudcheck::verify_deletes_result> cloudcheck::verify_deletes(
   cloud_storage_clients::bucket_name bucket, size_t num_objects) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "Plural Delete", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
+        co_return {result};
     }
 
     std::vector<cloud_storage_clients::object_key> keys(num_objects);
@@ -525,19 +525,19 @@ ss::future<cloudcheck::verify_deletes_result> cloudcheck::verify_deletes(
         result.error = e.what();
     }
 
-    co_return result;
+    co_return {result};
 }
 
 ss::future<cloudcheck::verify_multipart_upload_result>
 cloudcheck::verify_multipart_upload(
   cloud_storage_clients::bucket_name bucket,
   cloud_storage_clients::object_key key) {
-    auto result = self_test_result{
+    self_test_result result{
       .name = _opts.name, .info = "Multipart Put", .test_type = "cloud"};
 
     if (_cancelled) {
         result.warning = "Run was manually cancelled.";
-        co_return result;
+        co_return {result};
     }
 
     try {
@@ -550,24 +550,34 @@ cloudcheck::verify_multipart_upload(
 
         if (!upload_result) {
             result.error = "Failed to initiate multipart upload.";
-            co_return result;
+            co_return {result};
         }
 
         auto upload = std::move(upload_result.value());
 
-        // Upload the same 5 MiB chunk 3 times to exercise multipart path
-        auto chunk = make_random_payload(part_size);
-        for (int i = 0; i < 3; ++i) {
-            co_await upload->put(chunk.share());
+        std::exception_ptr eptr;
+        try {
+            // Upload the same 5 MiB chunk 3 times to exercise multipart path
+            auto chunk = make_random_payload(part_size);
+            for (int i = 0; i < 3; ++i) {
+                co_await upload->put(chunk.share());
+            }
+
+            co_await upload->complete();
+        } catch (...) {
+            eptr = std::current_exception();
         }
 
-        co_await upload->complete();
+        if (eptr) {
+            co_await upload->abort();
+            std::rethrow_exception(eptr);
+        }
 
     } catch (const std::exception& e) {
         result.error = e.what();
     }
 
-    co_return result;
+    co_return {result};
 }
 
 } // namespace cluster::self_test

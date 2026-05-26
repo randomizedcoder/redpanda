@@ -33,6 +33,7 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
+        "@fmt",
     ],
 )
 
@@ -73,6 +74,10 @@ redpanda_cc_library(
         "types.h",
     ],
     implementation_deps = [
+        "//src/v/cluster:cluster_link_rpc_types",
+        "//src/v/cluster:feature_backend",
+        "//src/v/cluster:plugin_backend",
+        "//src/v/cluster:types",
         "//src/v/cluster_link/utils:topic_properties_utils",
     ],
     visibility = ["//src/v/cluster_link:__subpackages__"],
@@ -83,6 +88,13 @@ redpanda_cc_library(
         ":utils",
         "//src/v/base",
         "//src/v/cluster",
+        "//src/v/cluster:client_quota_backend",
+        "//src/v/cluster:cluster_link_table",
+        "//src/v/cluster:cluster_recovery_table",
+        "//src/v/cluster:commands",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:members_table",
         "//src/v/cluster_link/model",
         "//src/v/cluster_link/replication:deps",
         "//src/v/cluster_link/replication:link_replication_mgr",
@@ -130,6 +142,7 @@ redpanda_cc_library(
     visibility = ["//src/v/cluster_link:__subpackages__"],
     deps = [
         ":impl",
+        "//src/v/cluster:fwd",
         "//src/v/kafka/client:cluster",
     ],
 )
@@ -158,6 +171,7 @@ redpanda_cc_library(
     visibility = ["//src/v/cluster_link:__subpackages__"],
     deps = [
         ":impl",
+        "//src/v/cluster:fwd",
         "//src/v/kafka/client:cluster",
     ],
 )
@@ -172,12 +186,14 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/server:security",
         "//src/v/security",
     ],
     visibility = ["//src/v/cluster_link:__subpackages__"],
     deps = [
         ":impl",
+        "//src/v/cluster:fwd",
         "//src/v/cluster_link/model",
         "//src/v/kafka/client:cluster",
         "//src/v/kafka/protocol",
@@ -199,8 +215,14 @@ redpanda_cc_library(
         ":logger",
         ":security_migrator",
         ":source_topic_syncer",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:members_table",
+        "//src/v/cluster:plugin_backend",
+        "//src/v/cluster:topic_metrics_watcher",
         "//src/v/cluster_link/model",
         "//src/v/config",
+        "//src/v/kafka/data:make_exact_offset_replicator",
         "//src/v/kafka/data:partition_proxy",
         "//src/v/ssx:future_util",
     ],
@@ -211,6 +233,11 @@ redpanda_cc_library(
         ":shadow_link_rpc_gen",
         "//src/v/base",
         "//src/v/cluster",
+        "//src/v/cluster:cluster_link_types",
+        "//src/v/cluster:cluster_recovery_table",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
         "//src/v/cluster/utils:partition_change_notifier_api",
         "//src/v/cluster_link/replication:deps",
         "//src/v/cluster_link/replication:mux_remote_consumer",
@@ -218,7 +245,6 @@ redpanda_cc_library(
         "//src/v/kafka/client/direct_consumer",
         "//src/v/kafka/data/rpc",
         "//src/v/kafka/server",
-        "//src/v/kafka/server:write_at_offset_stm",
         "//src/v/model",
         "//src/v/raft",
         "//src/v/rpc",
@@ -240,7 +266,7 @@ redpanda_cc_library(
     deps = [
         ":cluster_link",
         ":shadow_link_rpc_gen",
-        "//src/v/cluster",
+        "//src/v/cluster:fwd",
         "@seastar",
     ],
 )

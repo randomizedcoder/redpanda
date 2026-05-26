@@ -12,6 +12,7 @@
 #include "base/likely.h"
 #include "base/vassert.h"
 #include "base/vlog.h"
+#include "bytes/iobuf.h"
 #include "net/connection.h"
 #include "rpc/logger.h"
 #include "rpc/parse_utils.h"
@@ -19,18 +20,13 @@
 #include "rpc/types.h"
 #include "ssx/future-util.h"
 
-#include <seastar/core/coroutine.hh>
-#include <seastar/core/reactor.hh>
-#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
-#include <seastar/net/socket_defs.hh>
 
 #include <fmt/core.h>
 
 #include <chrono>
 #include <memory>
-#include <type_traits>
 
 namespace rpc {
 struct client_context_impl final : streaming_context {
@@ -246,18 +242,14 @@ transport::do_send(sequence_t seq, netbuf b, rpc::client_opts opts) {
                     timing.memory_reserved_at = clock_type::now();
                 }
                 return std::move(b).as_scattered().then(
-                  [u = std::move(units)](
-                    ss::scattered_message<char> scattered_message) mutable {
-                      return std::make_tuple(
-                        std::move(u), std::move(scattered_message));
+                  [u = std::move(units)](scattered_buffer bufs) mutable {
+                      return std::make_tuple(std::move(u), std::move(bufs));
                   });
             })
             .then_unpack(
               [this, f = std::move(f), seq, corr](
-                ssx::semaphore_units units,
-                ss::scattered_message<char> scattered_message) mutable {
-                  auto e = std::make_unique<entry>(
-                    std::move(scattered_message), corr);
+                ssx::semaphore_units units, scattered_buffer bufs) mutable {
+                  auto e = std::make_unique<entry>(std::move(bufs), corr);
                   _requests_queue.emplace(seq, std::move(e));
 
                   // By this point the request may already have timed out but
@@ -324,7 +316,7 @@ ss::future<> transport::do_dispatch_send() {
       [this] {
           auto it = _requests_queue.begin();
           _last_seq = it->first;
-          auto v = std::move(it->second->scattered_message);
+          auto v = std::move(it->second->bufs);
           auto corr = it->second->correlation_id;
           _requests_queue.erase(it);
 
@@ -344,7 +336,7 @@ ss::future<> transport::do_dispatch_send() {
           // is the intent of holding on to the units up until this
           // point.
           auto units = std::move(resp_entry->resource_units);
-          auto msg_size = v.size();
+          auto msg_size = iobuf::scattered_size(v);
 
           auto f = out().write(std::move(v));
           resp_entry->timing.dispatched_at = clock_type::now();
@@ -457,7 +449,8 @@ void transport::setup_metrics(
       "rpc_client",
       labels,
       aggregate_labels,
-      _probe->defs(labels, aggregate_labels));
+      _probe->defs(
+        labels, aggregate_labels, [this] { return _correlations.size(); }));
 }
 
 timing_info* transport::get_timing(uint32_t correlation) {
@@ -475,19 +468,19 @@ transport::~transport() {
       *this);
 }
 
-std::ostream& operator<<(std::ostream& o, const transport& t) {
-    fmt::print(
-      o,
+fmt::iterator transport::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "(server:{}, _correlations:{}, _correlation_idx:{})",
-      t.server_address(),
-      t._correlations.size(),
-      t._correlation_idx);
-    return o;
+      server_address(),
+      _correlations.size(),
+      _correlation_idx);
 }
 
 std::vector<ss::metrics::metric_definition> client_probe::defs(
   const std::vector<ss::metrics::label_instance>& labels,
-  const std::vector<ss::metrics::label>& aggregate_labels) {
+  const std::vector<ss::metrics::label>& aggregate_labels,
+  std::function<size_t()> pending_count) {
     namespace sm = ss::metrics;
     std::vector<sm::metric_definition> ret;
 
@@ -502,7 +495,7 @@ std::vector<ss::metrics::metric_definition> client_probe::defs(
     ret.emplace_back(
       sm::make_gauge(
         "requests_pending",
-        [this] { return _requests_pending; },
+        [pending_count = std::move(pending_count)] { return pending_count(); },
         sm::description("Number of requests pending"),
         labels)
         .aggregate(aggregate_labels));
@@ -583,22 +576,29 @@ std::vector<ss::metrics::metric_definition> client_probe::defs(
     return ret;
 }
 
-std::ostream& operator<<(std::ostream& o, const client_probe& p) {
-    o << "{"
-      << " requests_sent: " << p._requests
-      << ", requests_pending: " << p._requests_pending
-      << ", requests_completed: " << p._requests_completed
-      << ", request_errors: " << p._request_errors
-      << ", request_timeouts: " << p._request_timeouts
-      << ", in_bytes: " << p._in_bytes << ", out_bytes: " << p._out_bytes
-      << ", connects: " << p._connects << ", connections: " << p._connections
-      << ", connection_errors: " << p._connection_errors
-      << ", read_dispatch_errors: " << p._read_dispatch_errors
-      << ", corrupted_headers: " << p._corrupted_headers
-      << ", server_correlation_errors: " << p._server_correlation_errors
-      << ", client_correlation_errors: " << p._client_correlation_errors
-      << ", requests_blocked_memory: " << p._requests_blocked_memory << " }";
-    return o;
+fmt::iterator client_probe::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{ requests_sent: {}, requests_completed: {}, "
+      "request_errors: {}, request_timeouts: {}, in_bytes: {}, out_bytes: {}, "
+      "connects: {}, connections: {}, connection_errors: {}, "
+      "read_dispatch_errors: {}, corrupted_headers: {}, "
+      "server_correlation_errors: {}, client_correlation_errors: {}, "
+      "requests_blocked_memory: {} }}",
+      _requests,
+      _requests_completed,
+      _request_errors,
+      _request_timeouts,
+      _in_bytes,
+      _out_bytes,
+      _connects,
+      _connections,
+      _connection_errors,
+      _read_dispatch_errors,
+      _corrupted_headers,
+      _server_correlation_errors,
+      _client_correlation_errors,
+      _requests_blocked_memory);
 }
 
 } // namespace rpc

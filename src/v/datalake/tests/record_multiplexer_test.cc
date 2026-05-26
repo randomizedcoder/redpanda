@@ -12,7 +12,6 @@
 #include "datalake/record_multiplexer.h"
 #include "datalake/record_schema_resolver.h"
 #include "datalake/record_translator.h"
-#include "datalake/table_definition.h"
 #include "datalake/table_id_provider.h"
 #include "datalake/tests/catalog_and_registry_fixture.h"
 #include "datalake/tests/record_generator.h"
@@ -21,6 +20,7 @@
 #include "datalake/translation/translation_probe.h"
 #include "features/feature_table.h"
 #include "gmock/gmock.h"
+#include "iceberg/field_name_comparison.h"
 #include "iceberg/filesystem_catalog.h"
 #include "model/fundamental.h"
 #include "model/record_batch_reader.h"
@@ -30,7 +30,6 @@
 #include "random/generators.h"
 #include "storage/record_batch_builder.h"
 
-#include <avro/Compiler.hh>
 #include <gtest/gtest.h>
 
 using namespace datalake;
@@ -135,6 +134,7 @@ public:
           translator,
           t_creator,
           model::iceberg_invalid_record_action::dlq_table,
+          iceberg::field_name_comparison::verbatim,
           location_provider(
             scoped_remote->remote.local().provider(), bucket_name),
           *get_or_create_probe(ntp),
@@ -602,6 +602,7 @@ TEST_F(RecordMultiplexerTest, TestRecordTimestamp) {
       kv_translator,
       table_creator,
       model::iceberg_invalid_record_action::dlq_table,
+      iceberg::field_name_comparison::verbatim,
       location_provider(scoped_remote->remote.local().provider(), bucket_name),
       *get_or_create_probe(ntp),
       &features);

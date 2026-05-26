@@ -16,17 +16,10 @@
 #include "cloud_storage/logger.h"
 #include "hashing/xx.h"
 #include "re2/re2.h"
-#include "serde/rw/rw.h"
 #include "serde/rw/scalar.h"
-#include "serde/rw/vector.h"
 
-#include <seastar/core/file-types.hh>
-#include <seastar/core/file.hh>
-#include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/coroutine/as_future.hh>
 
-#include <exception>
 #include <ranges>
 
 namespace ranges = std::ranges;
@@ -112,8 +105,9 @@ inventory_consumer::process_paths(chunked_vector<ss::sstring> paths) {
 }
 
 void inventory_consumer::process_path(ss::sstring path) {
-    if (auto maybe_ntp = ntp_from_path(path);
-        maybe_ntp.has_value() && _ntps.contains(maybe_ntp.value())) {
+    if (
+      auto maybe_ntp = ntp_from_path(path);
+      maybe_ntp.has_value() && _ntps.contains(maybe_ntp.value())) {
         const auto& ntp = maybe_ntp.value();
         auto hash = xxhash_64(path.data(), path.size());
 

@@ -59,9 +59,10 @@ void run_basic_field_assign_bench(const struct_type& source) {
     while (!source_stack.empty() && !dest_stack.empty()) {
         auto* dst = dest_stack.back();
         auto* src = source_stack.back();
-        if (auto compatibility = check_types(src->type, dst->type);
-            dst->name != src->name || dst->required != src->required
-            || compatibility.has_error()) {
+        if (
+          auto compatibility = check_types(src->type, dst->type);
+          dst->name != src->name || dst->required != src->required
+          || compatibility.has_error()) {
             errc = schema_evolution_errc::type_mismatch;
             break;
         }
@@ -81,7 +82,8 @@ void run_describe_transform_bench(const struct_type& source) {
     auto dest = source.copy();
 
     perf_tests::start_measuring_time();
-    auto res = annotate_schema_transform(source, dest, partition_spec{});
+    auto res = annotate_schema_transform(
+      source, dest, partition_spec{}, field_name_comparison::verbatim);
     perf_tests::stop_measuring_time();
 
     vassert(!res.has_error(), "Expected success");
@@ -89,7 +91,8 @@ void run_describe_transform_bench(const struct_type& source) {
 
 void run_apply_transform_bench(const struct_type& source) {
     auto dest = source.copy();
-    auto xform = annotate_schema_transform(source, dest, partition_spec{});
+    auto xform = annotate_schema_transform(
+      source, dest, partition_spec{}, field_name_comparison::verbatim);
     vassert(!xform.has_error(), "Expected success");
 
     perf_tests::start_measuring_time();

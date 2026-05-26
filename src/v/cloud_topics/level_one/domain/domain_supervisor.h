@@ -13,6 +13,7 @@
 #include "model/fundamental.h"
 
 #include <seastar/core/future.hh>
+#include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/optimized_optional.hh>
 
@@ -24,6 +25,7 @@ class partition;
 } // namespace cluster
 
 namespace cloud_io {
+class cache;
 class remote;
 } // namespace cloud_io
 
@@ -40,9 +42,10 @@ public:
     explicit domain_supervisor(
       cluster::controller*,
       io*,
-      std::filesystem::path staging_dir,
+      cloud_io::cache*,
       cloud_io::remote*,
-      cloud_storage_clients::bucket_name bucket);
+      cloud_storage_clients::bucket_name bucket,
+      ss::scheduling_group sg);
     domain_supervisor(const domain_supervisor&) = delete;
     domain_supervisor(domain_supervisor&&) = delete;
     domain_supervisor& operator=(const domain_supervisor&) = delete;

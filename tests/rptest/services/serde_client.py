@@ -51,6 +51,8 @@ class SerdeClient(BackgroundThreadService):
         subject_name_strategy: Optional[str] = None,
         payload_class: Optional[str] = None,
         compression_type: Optional[TopicSpec.CompressionTypes] = None,
+        context_name_strategy: Optional[str] = None,
+        context_name: Optional[str] = None,
     ):
         if num_nodes is None and nodes is None:
             num_nodes = 1
@@ -92,6 +94,13 @@ class SerdeClient(BackgroundThreadService):
             assert self._serde_client_type == SerdeClientType.Python
             self._cmd_args += f" --compression-type {compression_type}"
 
+        if context_name_strategy is not None:
+            assert self._serde_client_type == SerdeClientType.Java
+            self._cmd_args += f" --context-name-strategy {context_name_strategy}"
+        if context_name is not None:
+            assert self._serde_client_type == SerdeClientType.Java
+            self._cmd_args += f" --context-name {context_name}"
+
         if self._serde_client_type == SerdeClientType.Golang:
             self._cmd_args += " --debug"
 
@@ -128,3 +137,12 @@ class SerdeClient(BackgroundThreadService):
     def reset(self):
         self.worker_errors.clear()
         self.errors = ""
+
+    def clean_node(self, node, **kwargs):
+        """
+        There is no state to clean on the node, so this is a no-op. The override
+        exists to avoid warning message from ducktape about not having a
+        clean_node method, and to make it clear that there is no state to
+        clean for this service.
+        """
+        pass

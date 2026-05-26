@@ -35,8 +35,8 @@ redpanda_cc_library(
         "coordinator.h",
     ],
     implementation_deps = [
+        ":catalog_config",
         ":iceberg_snapshot_remover",
-        "//src/v/base",
         "//src/v/datalake:catalog_schema_manager",
         "//src/v/datalake:logger",
         "//src/v/datalake:partition_spec_parser",
@@ -45,6 +45,7 @@ redpanda_cc_library(
         "//src/v/datalake:schema_identifier",
         "//src/v/datalake:table_id_provider",
         "//src/v/datalake:types",
+        "//src/v/iceberg:field_name_comparison",
         "//src/v/ssx:future_util",
         "//src/v/ssx:sleep_abortable",
         "//src/v/storage:record_batch_builder",
@@ -55,7 +56,9 @@ redpanda_cc_library(
         ":snapshot_remover",
         ":state_update",
         ":stm",
-        "//src/v/cluster",
+        "//src/v/base",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:topic_table",
         "//src/v/config",
         "//src/v/container:chunked_hash_map",
         "//src/v/container:chunked_vector",
@@ -100,15 +103,38 @@ redpanda_cc_library(
         "//src/v/cloud_io:remote",
         "//src/v/cloud_roles",
         "//src/v/cluster",
+        "//src/v/cluster:fwd",
         "//src/v/cluster:notification",
+        "//src/v/cluster:ntp_callbacks",
+        "//src/v/cluster:partition_properties_stm",
+        "//src/v/cluster:scheduling_allocation",
         "//src/v/datalake:credential_manager",
         "//src/v/iceberg:catalog",
         "//src/v/iceberg:manifest_io",
         "//src/v/model",
         "//src/v/net",
         "//src/v/net:tls",
+        "//src/v/pandaproxy/schema_registry:fwd",
         "//src/v/raft",
         "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "catalog_config",
+    srcs = [
+        "catalog_config.cc",
+    ],
+    hdrs = [
+        "catalog_config.h",
+    ],
+    implementation_deps = [
+        "//src/v/config",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/iceberg:field_name_comparison",
+        "//src/v/model",
     ],
 )
 
@@ -124,6 +150,7 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/config",
         "//src/v/datalake:logger",
+        "//src/v/datalake:validators",
         "//src/v/iceberg:catalog",
         "//src/v/iceberg:filesystem_catalog",
         "//src/v/iceberg:rest_catalog",
@@ -147,9 +174,6 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "data_file",
-    srcs = [
-        "data_file.cc",
-    ],
     hdrs = [
         "data_file.h",
     ],
@@ -193,7 +217,6 @@ redpanda_cc_library(
     implementation_deps = [
         ":commit_offset_metadata",
         ":state",
-        "//src/v/base",
         "//src/v/config",
         "//src/v/datalake:logger",
         "//src/v/datalake:table_id_provider",
@@ -257,13 +280,11 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "partition_state_override",
-    srcs = [
-        "partition_state_override.cc",
-    ],
     hdrs = [
         "partition_state_override.h",
     ],
     deps = [
+        "//src/v/base",
         "//src/v/model",
         "//src/v/serde",
         "@fmt",
@@ -281,6 +302,7 @@ redpanda_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":translated_offset_range",
+        "//src/v/base",
         "//src/v/container:chunked_hash_map",
         "//src/v/iceberg:manifest_entry",
         "//src/v/model",
@@ -290,9 +312,6 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "model",
-    srcs = [
-        "types.cc",
-    ],
     hdrs = [
         "types.h",
     ],
@@ -300,6 +319,7 @@ redpanda_cc_library(
     deps = [
         ":partition_state_override",
         ":translated_offset_range",
+        "//src/v/base",
         "//src/v/datalake:schema_identifier",
         "//src/v/datalake:types",
         "//src/v/datalake/coordinator:state",
@@ -366,9 +386,6 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "translated_offset_range",
-    srcs = [
-        "translated_offset_range.cc",
-    ],
     hdrs = [
         "translated_offset_range.h",
     ],
@@ -407,6 +424,10 @@ redpanda_cc_library(
         ":translated_offset_range",
         "//src/v/base",
         "//src/v/cluster",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:members_table",
+        "//src/v/cluster:partition_leaders_table",
+        "//src/v/cluster:shard_table",
         "//src/v/container:chunked_vector",
         "//src/v/datalake:logger",
         "//src/v/datalake:schema_identifier",

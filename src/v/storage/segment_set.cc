@@ -18,14 +18,11 @@
 #include "storage/logger.h"
 #include "storage/segment.h"
 #include "utils/directory_walker.h"
-#include "utils/filtered_lower_bound.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/thread.hh>
-
-#include <fmt/format.h>
 
 #include <algorithm>
 #include <exception>
@@ -454,8 +451,9 @@ static ss::future<segment_set> do_recover(
         [copy = std::move(copy)](const std::exception_ptr& ex) mutable {
             return ss::do_with(
               std::move(copy), [ex](segment_set::underlying_t& segments) {
-                  return ss::parallel_for_each(
+                  return ss::max_concurrent_for_each(
                            segments,
+                           128,
                            [](segment_set::type& segment) {
                                if (segment && !segment->is_closed()) {
                                    return segment->close();
@@ -472,7 +470,7 @@ static ss::future<segment_set> do_recover(
 /**
  * \brief Open all segments in a directory.
  *
- * Returns an exceptional future if any error occured opening a
+ * Returns an exceptional future if any error occurred opening a
  * segment. Otherwise all open segment readers are returned.
  */
 static ss::future<segment_set::underlying_t> open_segments(

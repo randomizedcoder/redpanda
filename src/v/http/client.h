@@ -32,6 +32,7 @@
 #include <boost/beast/http/field.hpp>
 #include <boost/beast/http/string_body.hpp>
 #include <boost/beast/http/verb.hpp>
+#include <fmt/ostream.h>
 
 #include <chrono>
 #include <exception>
@@ -82,8 +83,7 @@ public:
     virtual ss::future<downloaded_response> request_and_collect_response(
       boost::beast::http::request_header<>&& request,
       std::optional<iobuf> payload = std::nullopt,
-      ss::lowres_clock::duration timeout = default_connect_timeout)
-      = 0;
+      ss::lowres_clock::duration timeout = default_connect_timeout) = 0;
 
     virtual ss::future<> shutdown_and_stop() = 0;
 
@@ -312,7 +312,7 @@ private:
     /// Receive bytes from the remote endpoint
     ss::future<ss::temporary_buffer<char>> receive();
     /// Send bytes to the remote endpoint
-    ss::future<> send(ss::scattered_message<char> msg);
+    ss::future<> send(scattered_buffer bufs);
 
     /// Throw exception if _as is aborted
     void check() const;
@@ -340,8 +340,8 @@ client::request_header redacted_header(client::request_header original);
 
 template<class BufferSeq>
 inline ss::future<> client::forward(client* client, BufferSeq&& seq) {
-    auto scattered = iobuf_as_scattered(std::forward<BufferSeq>(seq));
-    return client->send(std::move(scattered));
+    auto bufs = std::forward<BufferSeq>(seq).as_scattered();
+    return client->send(std::move(bufs));
 }
 
 /// Helper to close an http client after a function has been called on it.
@@ -388,37 +388,20 @@ struct fmt::formatter<http::client::request_header> {
     }
 
     template<typename FormatContext>
-    auto format(const http::client::request_header& h, FormatContext& ctx)
+    auto format(const http::client::request_header& h, FormatContext& ctx) const
       -> decltype(ctx.out()) {
         auto redacted = http::redacted_header(h);
-        std::stringstream s;
-        s << redacted;
-        return fmt::format_to(ctx.out(), "{}", s.str());
+        return fmt::format_to(ctx.out(), "{}", fmt_streamed(redacted));
     }
 };
 
 template<>
 struct fmt::formatter<http::client::response_header> {
-    char presentation = 'u'; // 'u' for unchanged, 'l' for one line
-    constexpr auto parse(format_parse_context& ctx) {
-        auto it = ctx.begin();
-        auto end = ctx.end();
-        if (it != end && (*it == 'l' || *it == 'u')) presentation = *it++;
-        if (it != end && *it != '}') throw format_error("invalid format");
-        return it;
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
     }
 
-    auto format(http::client::response_header& h, auto& ctx) const {
-        if (presentation == 'u') {
-            std::stringstream s;
-            s << h;
-            return fmt::format_to(ctx.out(), "{}", s.str());
-        }
-        // format one line
-        auto out = ctx.out();
-        for (auto& f : h) {
-            out = fmt::format_to(out, "[{}: {}];", f.name_string(), f.value());
-        }
-        return out;
+    auto format(const http::client::response_header& h, auto& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", fmt_streamed(h));
     }
 };

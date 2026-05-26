@@ -10,7 +10,9 @@
 #pragma once
 
 #include "base/format_to.h"
+#include "base/outcome.h"
 #include "cloud_topics/frontend/errc.h"
+#include "cloud_topics/level_one/metastore/metastore.h"
 #include "cloud_topics/level_zero/stm/ctp_stm_api.h"
 #include "cloud_topics/log_reader_config.h"
 #include "cloud_topics/types.h"
@@ -32,6 +34,10 @@
 namespace cluster {
 class partition;
 }
+
+namespace kafka {
+class write_at_offset_stm;
+} // namespace kafka
 
 namespace cloud_topics {
 class data_plane_api;
@@ -128,6 +134,17 @@ public:
     raft::replicate_stages replicate(
       model::batch_identity, model::record_batch, raft::replicate_options);
 
+    /// Upload batches to object storage, generate placeholders, then
+    /// replicate the placeholders through the provided write_at_offset_stm.
+    /// Used by cluster linking's exact_offset_replicator implementation.
+    ss::future<result<raft::replicate_result>> replicate_at_offset(
+      chunked_vector<model::record_batch>,
+      chunked_vector<kafka::offset> expected_base_offsets,
+      std::optional<kafka::offset> prev_log_offset,
+      model::timeout_clock::duration timeout,
+      std::optional<std::reference_wrapper<ss::abort_source>> as,
+      ss::shared_ptr<kafka::write_at_offset_stm> stm);
+
     ss::future<storage::translating_reader>
     make_reader(cloud_topic_log_reader_config cfg);
 
@@ -151,6 +168,7 @@ public:
 
     ss::future<std::error_code> linearizable_barrier();
 
+    ss::future<std::optional<l1::metastore::size_response>> l1_size();
     ss::future<size_t> size_bytes();
 
     /// Get the current cluster epoch
@@ -220,7 +238,7 @@ private:
     std::unique_ptr<model::record_batch_reader::impl>
     make_l0_reader(const cloud_topic_log_reader_config& cfg) const;
 
-    std::unique_ptr<model::record_batch_reader::impl> make_l1_reader(
+    model::record_batch_reader make_l1_reader(
       const cloud_topic_log_reader_config& cfg,
       model::topic_id_partition tidp) const;
 

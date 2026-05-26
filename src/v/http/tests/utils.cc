@@ -43,18 +43,17 @@ ss::future<std::unique_ptr<ss::http::reply>> flexible_function_handler::handle(
   std::unique_ptr<ss::http::reply> rep) {
     return _f_handle(std::move(req), std::move(rep))
       .then([this](std::unique_ptr<ss::http::reply> rep) {
-          if (_content_type_overrides.contains(
-                rep->get_header("Content-Type"))) {
-              rep->done();
+          if (
+            _content_type_overrides.contains(rep->get_header("Content-Type"))) {
+              // content type already set via override; nothing to do
           } else if (_content_type == "xml") {
               // Because `application/xml` is not implemented as a mapping
               // in `http/mime_types.cc`, in order to construct a reply with
               // the `Content-Type` header set to `application/xml`, we
               // need to hard code a path here.
               rep->set_content_type("application/xml");
-              rep->done();
           } else {
-              rep->done(_content_type);
+              rep->set_content_type(_content_type);
           }
           return ss::make_ready_future<std::unique_ptr<ss::http::reply>>(
             std::move(rep));

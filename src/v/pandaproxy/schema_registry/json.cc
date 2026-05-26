@@ -21,31 +21,28 @@
 #include "pandaproxy/schema_registry/compatibility.h"
 #include "pandaproxy/schema_registry/error.h"
 #include "pandaproxy/schema_registry/errors.h"
-#include "pandaproxy/schema_registry/sharded_store.h"
+#include "pandaproxy/schema_registry/schema_getter.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "re2/re2.h"
 #include "utils/to_string.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/coroutine/as_future.hh>
-#include <seastar/coroutine/exception.hh>
-#include <seastar/util/defer.hh>
 #include <seastar/util/variant_utils.hh>
 
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/max_cardinality_matching.hpp>
 #include <boost/math/special_functions/ulp.hpp>
-#include <boost/outcome/std_result.hpp>
-#include <boost/outcome/success_failure.hpp>
 #include <fmt/core.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 #include <jsoncons/basic_json.hpp>
 #include <jsoncons/json.hpp>
-#include <jsoncons_ext/jsonschema/evaluation_options.hpp>
 #include <jsoncons_ext/jsonschema/json_schema_factory.hpp>
 #include <jsoncons_ext/jsonschema/jsonschema.hpp>
+
+template<typename Json>
+struct fmt::formatter<jsoncons::json_printable<Json>>
+  : fmt::ostream_formatter {};
 #include <rapidjson/error/en.h>
 
 #include <exception>
@@ -241,15 +238,14 @@ bool operator==(
     return lhs.raw() == rhs.raw();
 }
 
-std::ostream& operator<<(std::ostream& os, const json_schema_definition& def) {
-    fmt::print(
-      os,
+fmt::iterator json_schema_definition::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "type: {}, definition: {}, references: {}, metadata: {}",
-      to_string_view(def.type()),
-      def().to_json(),
-      def.refs(),
-      def.meta());
-    return os;
+      to_string_view(type()),
+      (*this)().to_json(),
+      refs(),
+      meta());
 }
 
 schema_definition::raw_string json_schema_definition::raw() const {
@@ -281,10 +277,11 @@ std::string_view as_string_view(const json::Value& v) {
     return {v.GetString(), v.GetStringLength()};
 }
 
-ss::future<> check_references(sharded_store& store, subject_schema schema) {
+ss::future<> check_references(schema_getter& store, subject_schema schema) {
     for (const auto& ref : schema.def().refs()) {
         auto resolved_sub = ref.sub.resolve(schema.sub().ctx);
-        co_await store.get_id(resolved_sub, ref.version)
+        co_await store
+          .get_subject_schema(resolved_sub, ref.version, include_deleted::yes)
           .discard_result()
           .handle_exception_type([&](const exception& e) {
               if (failed_subject_schema_lookup(e.code())) {
@@ -486,8 +483,8 @@ result<document_context> parse_json(iobuf buf) {
     if (schema.is_object()) {
         // "true/false" are valid schemas so here we need to check that the
         // schema is an actual object
-        if (auto it = schema.find("$schema");
-            it != schema.object_range().end()) {
+        if (
+          auto it = schema.find("$schema"); it != schema.object_range().end()) {
             if (it->value().is_string()) {
                 maybe_dialect = from_uri(it->value().as_string_view());
             }
@@ -798,8 +795,9 @@ merge_references(std::span<json::Value::ConstObject> references_objects) {
 // parsing it
 json::Pointer to_json_pointer(std::string_view sv) {
     auto candidate = json::Pointer{sv.data(), sv.size()};
-    if (auto ec = candidate.GetParseErrorCode();
-        ec != rapidjson::kPointerParseErrorNone) {
+    if (
+      auto ec = candidate.GetParseErrorCode();
+      ec != rapidjson::kPointerParseErrorNone) {
         throw_invalid_schema(
           "invalid fragment '{}' error {} at {}",
           sv,
@@ -868,8 +866,9 @@ resolve_reference(schema_context& ctx, const json::Value& candidate) {
 
         // step 3: check if the referenced object has a $ref field, and if so
         // resolve it
-        if (auto next_ref_it = referenced_obj.FindMember("$ref");
-            next_ref_it != referenced_obj.MemberEnd()) {
+        if (
+          auto next_ref_it = referenced_obj.FindMember("$ref");
+          next_ref_it != referenced_obj.MemberEnd()) {
             std::tie(id_uri, fragment_p) = get_uri_fragment(
               next_ref_it->value.GetString());
         } else {
@@ -1133,8 +1132,9 @@ json_compatibility_result is_additional_superset(
                 return json_compatibility_result{};
             }
             // likely false, but need to check
-            if (is_superset(ctx, get_false_schema(), *newer, ignored_path)
-                  .has_error()) {
+            if (
+              is_superset(ctx, get_false_schema(), *newer, ignored_path)
+                .has_error()) {
                 return json_compatibility_result::of<json_incompatibility>(
                   std::move(additional_path), removed_errt);
             }
@@ -1147,8 +1147,9 @@ json_compatibility_result is_additional_superset(
                 return json_compatibility_result{};
             }
             // convert newer to {} and check against that
-            if (is_superset(ctx, *older, get_true_schema(), ignored_path)
-                  .has_error()) {
+            if (
+              is_superset(ctx, *older, get_true_schema(), ignored_path)
+                .has_error()) {
                 return json_compatibility_result::of<json_incompatibility>(
                   std::move(additional_path), narrowed_errt);
             }
@@ -1597,8 +1598,9 @@ json_compatibility_result is_object_properties_superset(
         };
 
         // it is either an evolution of a schema in older["properties"]
-        if (auto older_it = older_properties.FindMember(prop);
-            older_it != older_properties.MemberEnd()) {
+        if (
+          auto older_it = older_properties.FindMember(prop);
+          older_it != older_properties.MemberEnd()) {
             // prop exists in both
             res.merge(is_superset(ctx, older_it->value, schema, prop_path()));
             // check next property
@@ -1668,41 +1670,39 @@ json_compatibility_result is_object_required_superset(
   const json::Value& newer,
   const std::filesystem::path& p) {
     json_compatibility_result res;
-    // to pass the check, a required property from newer has to be present in
-    // older, or if new it needs to have a default value.
-    // note that:
-    // 1. we check only required properties that are in both newer["properties"]
-    // and older["properties"]
-    // 2. there is no explicit check that older has an open content model
-    //    there might be a property name outside of (1) that could be rejected
-    //    by update, if update["additionalProperties"] is false
+    // older is a superset of newer iff every required property in older is
+    // also required in newer, with one exception: if older provides a
+    // "default" for the property, the consumer can fill it in when a writer
+    // (newer) omits it, so it doesn't have to be in newer.required.
+    //
+    // Note: this does not check for new required properties added on the
+    // newer side when older is closed (additionalProperties: false). That
+    // case is covered separately by
+    // required_property_added_to_unopen_content_model (TODO).
 
     auto older_req = get_array_or_empty(older, "required");
     auto newer_req = get_array_or_empty(newer, "required");
     auto older_props = get_object_or_empty(older, "properties");
-    auto newer_props = get_object_or_empty(newer, "properties");
-
-    // TODO O(n^2) lookup that can be a set_intersection.
-    auto older_req_in_both_properties
-      = older_req | std::views::filter([&](const json::Value& o) {
-            return newer_props.HasMember(o) && older_props.HasMember(o);
-        });
 
     // for each element:
     // in older.required? | in newer.required? | result
     //       yes          |        yes         |  yes
     //       yes          |         no         |  if it has "default" in older
     //       no           |        yes         |  yes
-    std::ranges::for_each(
-      older_req_in_both_properties, [&](const json::Value& o) {
-          if (
-            std::ranges::find(newer_req, o) == newer_req.End()
-            && !older_props.FindMember(o)->value.HasMember("default")) {
-              res.emplace<json_incompatibility>(
-                p / "required" / as_string_view(o),
-                json_incompatibility_type::required_attribute_added);
-          }
-      });
+
+    // TODO O(n^2) lookup that can be optimized using a flat_hash_set of
+    // newer_req.
+    std::ranges::for_each(older_req, [&](const json::Value& o) {
+        auto it = older_props.FindMember(o);
+        bool has_default = it != older_props.MemberEnd()
+                           && it->value.HasMember("default");
+        if (
+          std::ranges::find(newer_req, o) == newer_req.End() && !has_default) {
+            res.emplace<json_incompatibility>(
+              p / "required" / as_string_view(o),
+              json_incompatibility_type::required_attribute_added);
+        }
+    });
     return res;
 }
 
@@ -2326,9 +2326,10 @@ void process_work_item(
         // we are visiting a bundled schema.
 
         // run validation since we are not a guaranteed to be in proper schema
-        if (auto validation = validate_json_schema(
-              maybe_new_dialect.value(), *item.obj);
-            validation.has_error()) {
+        if (
+          auto validation = validate_json_schema(
+            maybe_new_dialect.value(), *item.obj);
+          validation.has_error()) {
             // stop exploring this branch, the schema is invalid
             throw as_exception(invalid_schema(
               fmt::format(
@@ -2347,8 +2348,9 @@ void process_work_item(
           std::pair{json::Pointer{item.obj_ptr.to_string()}, item.dialect});
     }
 
-    if (auto ref_it = item.obj->find("$ref");
-        ref_it != item.obj->object_range().end()) {
+    if (
+      auto ref_it = item.obj->find("$ref");
+      ref_it != item.obj->object_range().end()) {
         // ensure refs are absolute uris
         ref_it->value() = jsoncons::uri{ref_it->value().as_string()}
                             .resolve(item.base_uri)
@@ -2450,7 +2452,7 @@ make_json_schema_definition(schema_getter&, subject_schema schema) {
 }
 
 ss::future<subject_schema> make_canonical_json_schema(
-  sharded_store& store, subject_schema unparsed_schema, normalize norm) {
+  schema_getter& store, subject_schema unparsed_schema, normalize norm) {
     auto [sub, unparsed] = std::move(unparsed_schema).destructure();
     auto [def, type, refs, meta] = std::move(unparsed).destructure();
 

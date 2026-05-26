@@ -11,7 +11,6 @@
 
 #include "debug_bundle_service.h"
 
-#include "bytes/iostream.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
 #include "container/chunked_vector.h"
@@ -25,7 +24,6 @@
 #include "utils/external_process.h"
 #include "utils/file_io.h"
 
-#include <seastar/core/fstream.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
@@ -599,6 +597,14 @@ result<std::vector<ss::sstring>> service::build_rpk_arguments(
                 ssx::sformat("{}={}", username_variable, creds.username));
               rv.emplace_back(
                 ssx::sformat("{}={}", password_variable, creds.password));
+              rv.emplace_back(
+                ssx::sformat(
+                  "{}={}", sasl_mechanism_variable, creds.mechanism));
+          },
+          [&rv](const bearer_creds& creds) mutable {
+              // rpk accepts -Xpass=token:<TOKEN> for OAUTHBEARER
+              rv.emplace_back(
+                ssx::sformat("{}=token:{}", password_variable, creds.token));
               rv.emplace_back(
                 ssx::sformat(
                   "{}={}", sasl_mechanism_variable, creds.mechanism));

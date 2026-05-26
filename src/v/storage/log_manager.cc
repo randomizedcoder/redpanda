@@ -26,7 +26,6 @@
 #include "storage/batch_cache.h"
 #include "storage/compacted_index_writer.h"
 #include "storage/disk_log_impl.h"
-#include "storage/file_sanitizer.h"
 #include "storage/fs_utils.h"
 #include "storage/kvstore.h"
 #include "storage/log.h"
@@ -34,8 +33,6 @@
 #include "storage/logger.h"
 #include "storage/segment.h"
 #include "storage/segment_appender.h"
-#include "storage/segment_index.h"
-#include "storage/segment_reader.h"
 #include "storage/segment_set.h"
 #include "storage/segment_utils.h"
 #include "storage/storage_resources.h"
@@ -44,34 +41,25 @@
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/file.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/map_reduce.hh>
-#include <seastar/core/print.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include <seastar/coroutine/parallel_for_each.hh>
-#include <seastar/coroutine/switch_to.hh>
-#include <seastar/util/defer.hh>
 #include <seastar/util/file.hh>
 #include <seastar/util/later.hh>
-
-#include <boost/algorithm/string/predicate.hpp>
-#include <fmt/format.h>
 
 #include <chrono>
 #include <exception>
 #include <filesystem>
 #include <functional>
 #include <optional>
-#include <ranges>
 
 using namespace std::chrono_literals;
 
@@ -190,9 +178,9 @@ ss::future<> log_manager::clean_close(ss::shared_ptr<storage::log> log) {
 
 ss::future<> log_manager::start() {
     _probe->setup_metrics();
-    if (unlikely(
-          config::shard_local_cfg()
-            .log_disable_housekeeping_for_tests.value())) {
+    if (
+      unlikely(
+        config::shard_local_cfg().log_disable_housekeeping_for_tests.value())) {
         co_return;
     }
 
@@ -216,8 +204,8 @@ ss::future<> log_manager::stop() {
     _gc_sem.broken();
 
     co_await _gate.close();
-    co_await ss::coroutine::parallel_for_each(
-      _logs, [this](logs_type::value_type& entry) -> ss::future<> {
+    co_await ss::max_concurrent_for_each(
+      _logs, 128, [this](logs_type::value_type& entry) -> ss::future<> {
           auto close_fut = entry.second->housekeeping_gate.close();
           return clean_close(entry.second->handle)
             .then(
@@ -765,7 +753,7 @@ ss::future<> log_manager::do_housekeeping(
     // the removal of the parent object. this makes awaiting housekeeping
     // safe against removal of segments from _logs_list
     auto& log = meta.handle;
-    auto pinned_kafka_offset = log->stm_manager()->lowest_pinned_data_offset();
+    auto pinned_kafka_offset = log->stm_hookset()->lowest_pinned_data_offset();
     std::optional<model::offset> max_unpinned_offset;
     if (pinned_kafka_offset) {
         auto local_log_start = log->offsets().start_offset;
@@ -781,12 +769,12 @@ ss::future<> log_manager::do_housekeeping(
     }
 
     model::offset max_compactible_offset
-      = log->stm_manager()->max_removable_local_log_offset();
+      = log->stm_hookset()->max_removable_local_log_offset();
     model::offset max_tombstone_remove_offset
-      = log->stm_manager()->max_tombstone_remove_offset();
+      = log->stm_hookset()->max_tombstone_remove_offset();
     model::offset max_tx_end_remove_offset
-      = log->stm_manager()->max_tx_end_remove_offset();
-    model::offset tx_snapshot_offset = log->stm_manager()->tx_snapshot_offset();
+      = log->stm_hookset()->max_tx_end_remove_offset();
+    model::offset tx_snapshot_offset = log->stm_hookset()->tx_snapshot_offset();
     // We clamp the offset up to which we can remove transactional control
     // batches to the last snapshot taken by the transactional stm. This
     // ensures that we do not remove control batches that may be needed to
@@ -869,9 +857,10 @@ ss::future<ss::lw_shared_ptr<segment>> log_manager::make_log_segment(
 
 std::optional<batch_cache_index>
 log_manager::create_cache(with_cache ntp_cache_enabled) {
-    if (unlikely(
-          _config.cache == with_cache::no
-          || ntp_cache_enabled == with_cache::no)) {
+    if (
+      unlikely(
+        _config.cache == with_cache::no
+        || ntp_cache_enabled == with_cache::no)) {
         return std::nullopt;
     }
 
@@ -911,8 +900,9 @@ ss::future<ss::shared_ptr<log>> log_manager::do_manage(
   raft::group_id group,
   std::vector<model::record_batch_type> translator_batch_types) {
     if (_config.base_dir.empty()) {
-        throw std::runtime_error(
-          "log_manager:: cannot have empty config.base_dir");
+        co_await ss::coroutine::return_exception(
+          std::runtime_error(
+            "log_manager:: cannot have empty config.base_dir"));
     }
 
     vassert(
@@ -1193,22 +1183,22 @@ int64_t log_manager::compaction_backlog() const {
       });
 }
 
-std::ostream& operator<<(std::ostream& o, const log_config& c) {
-    o << "{base_dir:" << c.base_dir
-      << ", max_segment.size:" << c.max_segment_size()
-      << ", file_sanitize_config:" << c.file_config << ", retention_bytes:";
-    if (c.retention_bytes()) {
-        o << *(c.retention_bytes());
-    } else {
-        o << "nullopt";
-    }
-    return o
-           << ", compaction_interval_ms:" << c.compaction_interval().count()
-           << ", log_retention_ms:"
-           << c.log_retention().value_or(std::chrono::milliseconds(-1)).count()
-           << ", with_cache:" << c.cache << ", reclaim_opts:" << c.reclaim_opts
-           << "}";
+fmt::iterator log_config::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{base_dir:{}, max_segment.size:{}, file_sanitize_config:{}, "
+      "retention_bytes:{}, compaction_interval_ms:{}, log_retention_ms:{}, "
+      "with_cache:{}, reclaim_opts:{}}}",
+      base_dir,
+      max_segment_size(),
+      file_config,
+      retention_bytes(),
+      compaction_interval().count(),
+      log_retention().value_or(std::chrono::milliseconds(-1)).count(),
+      cache,
+      reclaim_opts);
 }
+
 std::ostream& operator<<(std::ostream& o, const log_manager& m) {
     return o << "{config:" << m._config << ", logs.size:" << m._logs.size()
              << ", cache:" << m._batch_cache << "}";

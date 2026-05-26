@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "base/format_to.h"
 #include "container/chunked_vector.h"
 #include "iceberg/datatypes.h"
 #include "iceberg/transform.h"
@@ -26,10 +27,10 @@ struct partition_field {
     ss::sstring name;
     transform transform;
 
-    friend bool operator==(const partition_field&, const partition_field&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
 
-    friend std::ostream& operator<<(std::ostream&, const partition_field&);
+    friend bool
+    operator==(const partition_field&, const partition_field&) = default;
 };
 
 struct partition_spec {
@@ -47,10 +48,10 @@ struct partition_spec {
 
     const partition_field* get_field(nested_field::id_t source_id) const;
 
-    friend bool operator==(const partition_spec&, const partition_spec&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
 
-    friend std::ostream& operator<<(std::ostream&, const partition_spec&);
+    friend bool
+    operator==(const partition_spec&, const partition_spec&) = default;
 
     partition_spec copy() const {
         return {

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cloud_storage/remote_label.h"
 #include "cluster/remote_topic_properties.h"
 #include "model/compression.h"
@@ -16,6 +17,7 @@
 #include "model/metadata.h"
 #include "model/timestamp.h"
 #include "pandaproxy/schema_registry/subject_name_strategy.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "reflection/adl.h"
 #include "serde/rw/chrono.h"
 #include "serde/rw/envelope.h"
@@ -33,7 +35,7 @@ namespace cluster {
  */
 struct topic_properties
   : serde::
-      envelope<topic_properties, serde::version<13>, serde::compat_version<0>> {
+      envelope<topic_properties, serde::version<14>, serde::compat_version<0>> {
     topic_properties() noexcept = default;
     topic_properties(
       std::optional<model::compression> compression,
@@ -175,6 +177,16 @@ struct topic_properties
 
     tristate<std::chrono::milliseconds> segment_ms{std::nullopt};
 
+    // Schema Registry context — the namespace within which schema ids and
+    // subjects resolve for this topic. Contexts are a Schema Registry
+    // namespacing mechanism: schema ids are unique within a context but not
+    // across them. Consumed by the in-broker Iceberg translator (today) and
+    // intended to also cover record_{key,value}_schema_id_validation below
+    // in the future, since a given schema id on a given record can only
+    // resolve to one schema. std::nullopt means the SR default context (".");
+    // has_overrides/describe treat nullopt as unset.
+    std::optional<pandaproxy::schema_registry::context> schema_registry_context;
+
     std::optional<bool> record_key_schema_id_validation;
     std::optional<bool> record_key_schema_id_validation_compat;
     std::optional<pandaproxy::schema_registry::subject_name_strategy>
@@ -235,6 +247,13 @@ struct topic_properties
     model::redpanda_storage_mode storage_mode{
       storage::ntp_config::default_storage_mode};
 
+    bool is_local_topic() const;
+
+    bool is_cloud_topic() const {
+        return storage_mode == model::redpanda_storage_mode::cloud
+               || storage_mode == model::redpanda_storage_mode::tiered_cloud;
+    }
+
     bool is_compacted() const;
     bool has_overrides() const;
     // Returns true if this topic is a tiered topic that requires
@@ -259,7 +278,7 @@ struct topic_properties
 
     storage::ntp_config::default_overrides get_ntp_cfg_overrides() const;
 
-    friend std::ostream& operator<<(std::ostream&, const topic_properties&);
+    fmt::iterator format_to(fmt::iterator it) const;
     auto serde_fields() {
         return std::tie(
           compression,
@@ -309,11 +328,12 @@ struct topic_properties
           max_compaction_lag_ms,
           message_timestamp_before_max_ms,
           message_timestamp_after_max_ms,
-          storage_mode);
+          storage_mode,
+          schema_registry_context);
     }
 
-    friend bool operator==(const topic_properties&, const topic_properties&)
-      = default;
+    friend bool
+    operator==(const topic_properties&, const topic_properties&) = default;
 
 private:
     // This was deprecated in favour of redpanda.storage.mode, but is kept here

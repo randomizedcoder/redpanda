@@ -10,11 +10,15 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cloud_roles/auth_refresh_bg_op.h"
 #include "cloud_storage_clients/client_probe.h"
 #include "cloud_storage_clients/types.h"
 #include "model/metadata.h"
 #include "net/types.h"
+
+#include <type_traits>
+#include <variant>
 
 namespace cloud_storage_clients {
 
@@ -51,7 +55,8 @@ struct common_configuration {
     /// @{
     net::unresolved_address server_addr;
 
-    std::optional<ss::tls::credentials_builder> tls_credentials_builder;
+    bool disable_tls = false;
+    std::optional<ca_trust_file> tls_truststore_path;
 
     /// Optional server name indication (SNI) for TLS connection
     std::optional<ss::sstring> tls_sni_hostname;
@@ -105,7 +110,7 @@ struct s3_configuration : common_configuration {
 
     ss::shared_ptr<client_probe> make_probe() const;
 
-    friend std::ostream& operator<<(std::ostream& o, const s3_configuration& c);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct abs_configuration : common_configuration {
@@ -124,8 +129,7 @@ struct abs_configuration : common_configuration {
 
     ss::shared_ptr<client_probe> make_probe() const;
 
-    friend std::ostream&
-    operator<<(std::ostream& o, const abs_configuration& c);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 template<typename T>
@@ -140,12 +144,48 @@ using client_configuration
 
 std::ostream& operator<<(std::ostream&, const client_configuration&);
 
+} // namespace cloud_storage_clients
+
+template<>
+struct fmt::formatter<cloud_storage_clients::client_configuration> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    auto format(
+      const cloud_storage_clients::client_configuration& c,
+      fmt::format_context& ctx) const {
+        return std::visit(
+          [&ctx](const auto& cfg) {
+              using T = std::decay_t<decltype(cfg)>;
+              if constexpr (
+                std::is_same_v<T, cloud_storage_clients::s3_configuration>) {
+                  return fmt::format_to(
+                    ctx.out(), "{{s3_configuration: {}}}", cfg);
+              } else {
+                  return fmt::format_to(
+                    ctx.out(), "{{abs_configuration: {}}}", cfg);
+              }
+          },
+          c);
+    }
+};
+
+namespace cloud_storage_clients {
+
 struct abs_self_configuration_result {
     bool is_hns_enabled;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "{{is_hns_enabled: {}}}", is_hns_enabled);
+    }
 };
 
 struct s3_self_configuration_result {
     s3_url_style url_style;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "{{s3_url_style: {}}}", url_style);
+    }
 };
 
 using client_self_configuration_output
@@ -154,10 +194,38 @@ using client_self_configuration_output
 void apply_self_configuration_result(
   client_configuration&, const client_self_configuration_output&);
 
-std::ostream& operator<<(std::ostream&, const abs_self_configuration_result&);
-std::ostream& operator<<(std::ostream&, const s3_self_configuration_result&);
 std::ostream&
 operator<<(std::ostream&, const client_self_configuration_output&);
+
+} // namespace cloud_storage_clients
+
+template<>
+struct fmt::formatter<cloud_storage_clients::client_self_configuration_output> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    auto format(
+      const cloud_storage_clients::client_self_configuration_output& r,
+      fmt::format_context& ctx) const {
+        return std::visit(
+          [&ctx](const auto& cfg) {
+              using T = std::decay_t<decltype(cfg)>;
+              if constexpr (
+                std::is_same_v<
+                  T,
+                  cloud_storage_clients::s3_self_configuration_result>) {
+                  return fmt::format_to(
+                    ctx.out(), "{{s3_self_configuration_result: {}}}", cfg);
+              } else {
+                  return fmt::format_to(
+                    ctx.out(), "{{abs_self_configuration_result: {}}}", cfg);
+              }
+          },
+          r);
+    }
+};
+
+namespace cloud_storage_clients {
 
 // In the case of S3-compatible providers, all that is needed to infer the
 // backend is the access point/uri.
@@ -171,7 +239,8 @@ model::cloud_storage_backend infer_backend_from_configuration(
 cloud_roles::auth_refresh_bg_op::credentials_source_config
 build_refresh_credentials_source(
   const client_configuration& config,
-  model::cloud_credentials_source cloud_credentials_source);
+  model::cloud_credentials_source cloud_credentials_source,
+  std::optional<ss::sstring> host_override = std::nullopt);
 
 ss::future<ss::shared_ptr<ss::tls::certificate_credentials>>
 build_tls_credentials(const client_configuration& config);

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "base/outcome.h"
 #include "base/seastarx.h"
 #include "bytes/iobuf.h"
@@ -58,8 +59,7 @@ public:
      * be consumed, it may be called more than once with the same header.
      */
     virtual consume_result
-    accept_batch_start(const model::record_batch_header&) const
-      = 0;
+    accept_batch_start(const model::record_batch_header&) const = 0;
 
     /**
      * unconditionally consumes batch start
@@ -67,8 +67,7 @@ public:
     virtual void consume_batch_start(
       model::record_batch_header,
       size_t physical_base_offset,
-      size_t size_on_disk)
-      = 0;
+      size_t size_on_disk) = 0;
 
     /**
      * unconditionally skip batch
@@ -76,19 +75,12 @@ public:
     virtual void skip_batch_start(
       model::record_batch_header,
       size_t physical_base_offset,
-      size_t size_on_disk)
-      = 0;
+      size_t size_on_disk) = 0;
 
     virtual void consume_records(iobuf&&) = 0;
     virtual ss::future<stop_parser> consume_batch_end() = 0;
 
-    virtual void print(std::ostream&) const = 0;
-
-private:
-    friend std::ostream& operator<<(std::ostream& os, const batch_consumer& c) {
-        c.print(os);
-        return os;
-    }
+    virtual fmt::iterator format_to(fmt::iterator it) const = 0;
 };
 
 class continuous_batch_parser {
@@ -103,8 +95,8 @@ public:
     continuous_batch_parser(const continuous_batch_parser&) = delete;
     continuous_batch_parser& operator=(const continuous_batch_parser&) = delete;
     continuous_batch_parser(continuous_batch_parser&&) noexcept = default;
-    continuous_batch_parser& operator=(continuous_batch_parser&&) noexcept
-      = default;
+    continuous_batch_parser&
+    operator=(continuous_batch_parser&&) noexcept = default;
     ~continuous_batch_parser() noexcept = default;
 
     // continues to parse until stop_parser is reached or end of stream

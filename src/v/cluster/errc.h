@@ -10,6 +10,10 @@
  */
 
 #pragma once
+#include "base/compiler_utils.h"
+#include "base/format_to.h"
+
+#include <string_view>
 #include <system_error>
 
 namespace cluster {
@@ -102,7 +106,7 @@ enum class errc : int16_t {
     feature_sanctioned,
 };
 
-std::ostream& operator<<(std::ostream& o, errc err);
+fmt::iterator format_to(errc err, fmt::iterator);
 
 struct errc_category final : public std::error_category {
     const char* name() const noexcept final { return "cluster::errc"; }
@@ -294,6 +298,12 @@ struct errc_category final : public std::error_category {
             return "A topic with the given id already exists";
         case errc::feature_sanctioned:
             return "Unable to use requested feature - license is invalid";
+            REDPANDA_BEGIN_IGNORE_DEPRECATIONS
+            // unused in the codebase but still in the enum, include it here
+            // since clang wants switches to be exhaustive
+        case errc::inconsistent_stm_update:
+            return "inconsistent_stm_update";
+            REDPANDA_END_IGNORE_DEPRECATIONS
         }
         return "cluster::errc::unknown";
     }

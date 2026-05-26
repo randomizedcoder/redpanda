@@ -10,6 +10,7 @@
 
 #include "cluster/partition_balancer_planner.h"
 
+#include "base/format_to.h"
 #include "base/vlog.h"
 #include "cluster/cluster_utils.h"
 #include "cluster/health_monitor_types.h"
@@ -22,6 +23,7 @@
 #include "cluster/scheduling/constraints.h"
 #include "cluster/scheduling/partition_allocator.h"
 #include "cluster/scheduling/types.h"
+#include "cluster/topic_table.h"
 #include "cluster/types.h"
 #include "container/chunked_hash_map.h"
 #include "model/fundamental.h"
@@ -30,7 +32,6 @@
 #include "random/generators.h"
 #include "rpc/types.h"
 #include "ssx/sformat.h"
-#include "utils/to_string.h"
 
 #include <seastar/core/sstring.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -248,14 +249,12 @@ private:
             return 0;
         }
 
-        friend std::ostream&
-        operator<<(std::ostream& o, const partition_sizes& ps) {
-            fmt::print(
-              o,
+        fmt::iterator format_to(fmt::iterator it) const {
+            return fmt::format_to(
+              it,
               "{{current: {}, non_reclaimable: {}}}",
-              ps.current,
-              ps.non_reclaimable);
-            return o;
+              current,
+              non_reclaimable);
         }
     };
 
@@ -283,6 +282,10 @@ private:
     bool _counts_rebalancing_finished = false;
     ss::abort_source& _as;
 };
+
+} // namespace cluster
+
+namespace cluster {
 
 std::pair<uint64_t, uint64_t> partition_balancer_planner::get_node_bytes_info(
   const node::local_state& node_state) {

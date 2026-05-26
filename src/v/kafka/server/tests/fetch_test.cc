@@ -8,9 +8,9 @@
 // by the Apache License, Version 2.0
 
 #include "base/units.h"
+#include "cluster/log_eviction_stm.h"
 #include "cluster/tests/cluster_test_fixture.h"
 #include "container/chunked_vector.h"
-#include "kafka/protocol/batch_consumer.h"
 #include "kafka/protocol/types.h"
 #include "kafka/server/handlers/fetch.h"
 #include "model/fundamental.h"
@@ -23,7 +23,6 @@
 #include <seastar/core/smp.hh>
 
 #include <boost/test/tools/old/interface.hpp>
-#include <fmt/ostream.h>
 
 #include <chrono>
 #include <limits>
@@ -437,7 +436,7 @@ FIXTURE_TEST(fetch_empty, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
     add_topic(model::topic_namespace_view(ntp)).get();
 
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     kafka::fetch_request no_topics;
     no_topics.data.max_bytes = std::numeric_limits<int32_t>::max();
@@ -476,7 +475,7 @@ FIXTURE_TEST(fetch_leader_epoch, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
     add_topic(model::topic_namespace_view(ntp)).get();
 
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     const auto shard = app.shard_table.local().shard_for(ntp);
     app.partition_manager
@@ -684,7 +683,7 @@ FIXTURE_TEST(fetch_multi_partitions_debounce, redpanda_thread_fixture) {
 
     for (int i = 0; i < 6; ++i) {
         auto ntp = make_default_ntp(topic, model::partition_id(i));
-        wait_for_partition_offset(ntp, model::offset(0)).get();
+        wait_for_lso(ntp, model::offset(0)).get();
     }
 
     kafka::fetch_request req;
@@ -764,7 +763,7 @@ FIXTURE_TEST(fetch_leader_ack, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
 
     add_topic(model::topic_namespace_view(ntp)).get();
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     kafka::fetch_request req;
     req.data.max_bytes = std::numeric_limits<int32_t>::max();
@@ -826,7 +825,7 @@ FIXTURE_TEST(fetch_one_debounce, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
 
     add_topic(model::topic_namespace_view(ntp)).get();
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     kafka::fetch_request req;
     req.data.max_bytes = std::numeric_limits<int32_t>::max();
@@ -893,11 +892,11 @@ FIXTURE_TEST(fetch_multi_topics, redpanda_thread_fixture) {
     // topic 1
     for (int i = 0; i < 6; ++i) {
         ntps.push_back(make_default_ntp(topic_1, model::partition_id(i)));
-        wait_for_partition_offset(ntps.back(), model::offset(0)).get();
+        wait_for_lso(ntps.back(), model::offset(0)).get();
     }
     // topic 2
     ntps.push_back(make_default_ntp(topic_2, model::partition_id(0)));
-    wait_for_partition_offset(ntps.back(), model::offset(0)).get();
+    wait_for_lso(ntps.back(), model::offset(0)).get();
 
     // request
     kafka::fetch_request req;
@@ -982,7 +981,7 @@ FIXTURE_TEST(fetch_request_max_bytes, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
 
     add_topic(model::topic_namespace_view(ntp)).get();
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
     // append some data
     auto shard = app.shard_table.local().shard_for(ntp);
     app.partition_manager
@@ -1050,7 +1049,7 @@ FIXTURE_TEST(fetch_offset_out_of_range, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
 
     add_topic(model::topic_namespace_view(ntp)).get();
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
     // append some data
     auto shard = app.shard_table.local().shard_for(ntp);
     app.partition_manager
@@ -1142,7 +1141,7 @@ FIXTURE_TEST(fetch_response_bytes_eq_units, redpanda_thread_fixture) {
     wait_for_controller_leadership().get();
     add_topic(model::topic_namespace_view(ntp)).get();
 
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     // append some data
     auto shard = app.shard_table.local().shard_for(ntp);
@@ -1162,7 +1161,7 @@ FIXTURE_TEST(fetch_response_bytes_eq_units, redpanda_thread_fixture) {
               });
         })
       .get();
-    wait_for_partition_offset(ntp, model::offset(20)).get();
+    wait_for_lso(ntp, model::offset(20)).get();
 
     auto conn_context = make_connection_context();
     conn_context->start().get();
@@ -1221,7 +1220,7 @@ FIXTURE_TEST(
 
     wait_for_controller_leadership().get();
     add_topic(model::topic_namespace_view(ntp)).get();
-    wait_for_partition_offset(ntp, model::offset(0)).get();
+    wait_for_lso(ntp, model::offset(0)).get();
 
     // Produce some data
     auto shard = app.shard_table.local().shard_for(ntp);
@@ -1318,4 +1317,131 @@ FIXTURE_TEST(
     auto new_log_start = resp2.data.responses[0].partitions[0].log_start_offset;
     BOOST_REQUIRE_GT(new_log_start, initial_log_start);
     BOOST_REQUIRE_EQUAL(new_log_start, model::offset(5));
+}
+
+// Regression test: when one partition's log_eviction_stm has its gate closed
+// (e.g. during shutdown/partition move), the multi-partition fetch should
+// still succeed for the remaining healthy partitions rather than failing the
+// entire request.
+FIXTURE_TEST(
+  fetch_multi_partition_with_mixed_failures, redpanda_thread_fixture) {
+    model::topic topic("foo");
+    constexpr int num_partitions = 4;
+    // The partition whose STM we will stop.
+    constexpr int stopped_partition_idx = 1;
+
+    wait_for_controller_leadership().get();
+    add_topic(model::topic_namespace(model::ns("kafka"), topic), num_partitions)
+      .get();
+
+    for (int i = 0; i < num_partitions; ++i) {
+        auto ntp = make_default_ntp(topic, model::partition_id(i));
+        wait_for_lso(ntp, model::offset(0)).get();
+    }
+
+    // Write data to all partitions.
+    for (int i = 0; i < num_partitions; ++i) {
+        auto ntp = make_default_ntp(topic, model::partition_id(i));
+        auto shard = app.shard_table.local().shard_for(ntp);
+        app.partition_manager
+          .invoke_on(
+            *shard,
+            [ntp](cluster::partition_manager& mgr) {
+                return model::test::make_random_batches(model::offset(0), 5)
+                  .then([ntp, &mgr](auto batches) {
+                      auto partition = mgr.get(ntp);
+                      return partition->raft()->replicate(
+                        chunked_vector<model::record_batch>(
+                          std::from_range,
+                          std::move(batches) | std::views::as_rvalue),
+                        raft::replicate_options(
+                          raft::consistency_level::quorum_ack));
+                  });
+            })
+          .discard_result()
+          .get();
+    }
+
+    // Close the log_eviction_stm's gate on one partition to simulate a
+    // shutdown race. sync_kafka_start_offset_override will encounter a
+    // gate_closed_exception on this partition.
+    auto stopped_ntp = make_default_ntp(
+      topic, model::partition_id(stopped_partition_idx));
+    auto stopped_shard = app.shard_table.local().shard_for(stopped_ntp);
+    app.partition_manager
+      .invoke_on(
+        *stopped_shard,
+        [stopped_ntp](cluster::partition_manager& mgr) {
+            auto partition = mgr.get(stopped_ntp);
+            auto stm = partition->raft()
+                         ->stm_manager()
+                         ->get<cluster::log_eviction_stm>();
+            using accessor = cluster::testing::log_eviction_stm_accessor;
+            accessor::request_abort(*stm);
+            accessor::break_has_pending_truncation(*stm);
+            return accessor::close_gate(*stm);
+        })
+      .get();
+
+    // Build a fetch request spanning all partitions.
+    kafka::fetch_request req;
+    req.data.max_bytes = std::numeric_limits<int32_t>::max();
+    req.data.min_bytes = 1;
+    req.data.max_wait_ms = std::chrono::milliseconds(0);
+    req.data.session_id = kafka::invalid_fetch_session_id;
+    req.data.topics.emplace_back(
+      kafka::fetch_topic{
+        .topic = topic,
+        .partitions = {},
+      });
+    for (int i = 0; i < num_partitions; ++i) {
+        kafka::fetch_request::partition p;
+        p.partition = model::partition_id(i);
+        p.fetch_offset = model::offset(0);
+        p.partition_max_bytes = std::numeric_limits<int32_t>::max();
+        req.data.topics[0].partitions.push_back(p);
+    }
+
+    auto client = make_kafka_client().get();
+    client.connect().get();
+    auto resp = client.dispatch(std::move(req), kafka::api_version(4)).get();
+    client.stop().then([&client] { client.shutdown(); }).get();
+
+    // The fetch must return responses for all partitions.
+    BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+    BOOST_REQUIRE_EQUAL(
+      resp.data.responses[0].partitions.size(), num_partitions);
+
+    for (int i = 0; i < num_partitions; ++i) {
+        const auto& partition_resp = resp.data.responses[0].partitions[i];
+        BOOST_REQUIRE_EQUAL(
+          partition_resp.partition_index, model::partition_id(i));
+
+        if (i == stopped_partition_idx) {
+            // The stopped partition should return an error, not crash the
+            // fetch.
+            BOOST_REQUIRE(partition_resp.error_code != kafka::error_code::none);
+        } else {
+            // Healthy partitions must return data successfully.
+            BOOST_REQUIRE_EQUAL(
+              partition_resp.error_code, kafka::error_code::none);
+            BOOST_REQUIRE(partition_resp.records);
+            BOOST_REQUIRE_GT(partition_resp.records->size_bytes(), 0);
+        }
+    }
+
+    // Reset the STM state so the fixture can shut down cleanly.
+    app.partition_manager
+      .invoke_on(
+        *stopped_shard,
+        [stopped_ntp](cluster::partition_manager& mgr) {
+            auto partition = mgr.get(stopped_ntp);
+            auto stm = partition->raft()
+                         ->stm_manager()
+                         ->get<cluster::log_eviction_stm>();
+            using accessor = cluster::testing::log_eviction_stm_accessor;
+            accessor::reset_gate(*stm);
+            accessor::reset_abort_source(*stm);
+        })
+      .get();
 }

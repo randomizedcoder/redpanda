@@ -11,7 +11,7 @@
 #include "cluster/config_frontend.h"
 #include "cluster/types.h"
 #include "config/configuration.h"
-#include "config/node_config.h"
+#include "features/feature_table.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/incremental_alter_configs.h"
 #include "kafka/protocol/schemata/incremental_alter_configs_request.h"
@@ -24,14 +24,12 @@
 #include "kafka/server/response.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "storage/ntp_config.h"
 #include "strings/string_switch.h"
 
-#include <seastar/core/do_with.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/util/log.hh>
-
-#include <fmt/ostream.h>
 
 #include <string_view>
 
@@ -433,6 +431,30 @@ create_topic_properties_update(
                   iceberg_target_lag_ms_validator);
                 continue;
             }
+            if (cfg.name == topic_property_schema_registry_context) {
+                if (
+                  topic_cfg
+                  && topic_cfg->properties.iceberg_mode
+                       != model::iceberg_mode::disabled) {
+                    return make_error_alter_config_resource_response<
+                      resp_resource_t>(
+                      resource,
+                      error_code::invalid_config,
+                      "Cannot change redpanda.schema.registry.context while "
+                      "Iceberg translation is enabled; set "
+                      "redpanda.iceberg.mode=disabled first");
+                }
+                parse_and_set_property(
+                  tp_ns,
+                  update.properties.schema_registry_context,
+                  cfg.value,
+                  op,
+                  schema_registry_context_validator{},
+                  [](const ss::sstring& s) {
+                      return pandaproxy::schema_registry::context{s};
+                  });
+                continue;
+            }
 
             if (cfg.name == topic_property_min_cleanable_dirty_ratio) {
                 parse_and_set_tristate(
@@ -482,11 +504,27 @@ create_topic_properties_update(
             }
 
             if (cfg.name == topic_property_redpanda_storage_mode) {
+                auto validator = [current_storage_mode,
+                                  &feature_table = ctx.feature_table().local()](
+                                   const ss::sstring& raw,
+                                   const model::redpanda_storage_mode& value)
+                  -> std::optional<ss::sstring> {
+                    auto transition_err = storage_mode_validator{
+                      current_storage_mode}(raw, value);
+                    if (transition_err) {
+                        return transition_err;
+                    }
+                    if (
+                      value == model::redpanda_storage_mode::tiered_cloud
+                      && !feature_table.is_active(
+                        features::feature::tiered_cloud_topics)) {
+                        return "tiered_cloud storage mode requires the "
+                               "tiered_cloud_topics feature to be enabled";
+                    }
+                    return std::nullopt;
+                };
                 parse_and_set_optional(
-                  update.properties.storage_mode,
-                  cfg.value,
-                  op,
-                  storage_mode_validator{current_storage_mode});
+                  update.properties.storage_mode, cfg.value, op, validator);
                 continue;
             }
         } catch (const validation_error& e) {

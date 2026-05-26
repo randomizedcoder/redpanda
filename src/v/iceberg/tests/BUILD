@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_binary")
 load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 redpanda_test_cc_library(
@@ -34,6 +35,7 @@ redpanda_test_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//src/v/base",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:values",
         "//src/v/random:generators",
@@ -538,6 +540,40 @@ redpanda_cc_gtest(
         "//src/v/iceberg:values_avro",
         "//src/v/random:generators",
         "//src/v/test_utils:gtest",
+        "@avro",
+        "@googletest//:gtest",
+    ],
+)
+
+py_binary(
+    name = "avro_decimal_interop_gen",
+    srcs = ["avro_decimal_interop_gen.py"],
+    main = "avro_decimal_interop_gen.py",
+    deps = ["@python_deps//avro"],
+)
+
+genrule(
+    name = "decimal_cases_avro",
+    outs = ["decimal_cases.avro"],
+    cmd = "$(execpath :avro_decimal_interop_gen) $@",
+    toolchains = ["@rules_python//python:current_py_toolchain"],
+    tools = [":avro_decimal_interop_gen"],
+)
+
+redpanda_cc_gtest(
+    name = "avro_decimal_interop_test",
+    timeout = "short",
+    srcs = [
+        "avro_decimal_interop_test.cc",
+    ],
+    data = [":decimal_cases.avro"],
+    deps = [
+        "//src/v/bytes",
+        "//src/v/iceberg:avro_decimal",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:runfiles",
+        "@abseil-cpp//absl/numeric:int128",
+        "@avro",
         "@googletest//:gtest",
     ],
 )
@@ -704,6 +740,7 @@ redpanda_cc_gtest(
         "//src/v/iceberg:compatibility_utils",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:field_collecting_visitor",
+        "//src/v/iceberg:field_name_comparison",
         "//src/v/iceberg:partition",
         "//src/v/random:generators",
         "//src/v/test_utils:gtest",
@@ -712,6 +749,20 @@ redpanda_cc_gtest(
         "@fmt",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "unicode_test",
+    timeout = "short",
+    srcs = [
+        "unicode_test.cc",
+    ],
+    deps = [
+        "//src/v/iceberg:field_name_comparison",
+        "//src/v/iceberg:unicode",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
     ],
 )
 

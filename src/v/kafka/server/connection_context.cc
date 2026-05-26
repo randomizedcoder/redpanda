@@ -15,13 +15,10 @@
 #include "base/vlog.h"
 #include "bytes/iobuf.h"
 #include "bytes/iostream.h"
-#include "bytes/scattered_message.h"
-#include "cluster/types.h"
 #include "config/configuration.h"
 #include "config/node_config.h"
 #include "container/chunked_hash_map.h"
 #include "kafka/protocol/sasl_authenticate.h"
-#include "kafka/server/datalake_throttle_manager.h"
 #include "kafka/server/handlers/fetch.h"
 #include "kafka/server/handlers/handler_interface.h"
 #include "kafka/server/handlers/produce.h"
@@ -36,14 +33,11 @@
 #include "model/fundamental.h"
 #include "net/exceptions.h"
 #include "security/authorizer.h"
-#include "security/exceptions.h"
 #include "security/gssapi_authenticator.h"
 #include "security/oidc_authenticator.h"
 #include "security/plain_authenticator.h"
 #include "security/scram_authenticator.h"
-#include "utils/windowed_sum_tracker.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/scattered_message.hh>
 #include <seastar/core/semaphore.hh>
@@ -51,7 +45,6 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
-#include <seastar/core/with_timeout.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/switch_to.hh>
 
@@ -464,10 +457,11 @@ ss::future<> connection_context::process_one_request() {
      * 2. during auth phase
      * 3. handshake was v0
      */
-    if (unlikely(
-          sasl()
-          && sasl()->state() == security::sasl_server::sasl_state::authenticate
-          && sasl()->handshake_v0())) {
+    if (
+      unlikely(
+        sasl()
+        && sasl()->state() == security::sasl_server::sasl_state::authenticate
+        && sasl()->handshake_v0())) {
         try {
             co_return co_await handle_auth_v0(*sz);
         } catch (...) {
@@ -479,7 +473,7 @@ ss::future<> connection_context::process_one_request() {
         }
     }
 
-    auto h = co_await parse_header(conn->input());
+    auto h = co_await parse_header(conn->input(), sz.value());
     _server.probe().add_bytes_received(sz.value());
     if (!h) {
         vlog(klog.debug, "could not parse header from client: {}", conn->addr);
@@ -496,9 +490,10 @@ ss::future<> connection_context::process_one_request() {
      * enabled for this physical connection.
      */
     if (_server.enable_mpx_extensions()) {
-        if (unlikely(
-              is_first_request()
-              && h->client_id == multi_proxy_initial_client_id)) {
+        if (
+          unlikely(
+            is_first_request()
+            && h->client_id == multi_proxy_initial_client_id)) {
             vlog(
               klog.debug, "enabling virtualized connections on {}", conn->addr);
             _is_virtualized_connection = true;
@@ -613,7 +608,7 @@ ss::future<> connection_context::handle_auth_v0(const size_t size) {
     iobuf data;
     protocol::encoder writer(data);
     writer.write(response.data.auth_bytes);
-    auto msg = iobuf_as_scattered(std::move(data));
+    auto msg = std::move(data).as_scattered();
     co_await conn->write(std::move(msg));
 }
 
@@ -1180,12 +1175,13 @@ connection_context::client_protocol_state::do_process_responses(
     }
 
     auto msg = response_as_scattered(std::move(resp_and_res.response));
+    auto response_size = iobuf::scattered_size(msg);
     if (resp_and_res.resources->request_data.request_key == fetch_api::key) {
         const auto principal = connection_ctx->get_principal();
         co_await connection_ctx->_server.quota_mgr().record_fetch_tp(
           principal.name_view(),
           resp_and_res.resources->request_data.client_id,
-          msg.size(),
+          response_size,
           quota_manager::clock::now());
     }
     // Respose sizes only take effect on throttling at the next
@@ -1196,10 +1192,9 @@ connection_context::client_protocol_state::do_process_responses(
     // serialized long ago already. With the current approach,
     // egress token bucket level will always be an extra burst into
     // the negative while under pressure.
-    auto response_size = msg.size();
     auto request_key = resp_and_res.resources->request_data.request_key;
-    if (connection_ctx->_kafka_throughput_controlled_api_keys().at(
-          request_key)) {
+    if (
+      connection_ctx->_kafka_throughput_controlled_api_keys().at(request_key)) {
         // see the comment in dispatch_method_once()
         if (likely(connection_ctx->_snc_quota_context)) {
             connection_ctx->_server.snc_quota_mgr().record_response(
@@ -1231,13 +1226,12 @@ ss::future<> connection_context::client_protocol_state::maybe_process_responses(
     });
 }
 
-std::ostream& operator<<(std::ostream& o, const virtual_connection_id& id) {
-    fmt::print(
-      o,
+fmt::iterator virtual_connection_id::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{virtual_cluster_id: {}, connection_id: {}}}",
-      id.virtual_cluster_id,
-      id.connection_id);
-    return o;
+      virtual_cluster_id,
+      connection_id);
 }
 
 void last_value::update(std::optional<std::string_view> new_value) {

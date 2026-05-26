@@ -11,20 +11,12 @@
 #include "cloud_topics/level_zero/reader/materialized_extent_reader.h"
 
 #include "cloud_io/basic_cache_service_api.h"
-#include "cloud_io/io_result.h"
-#include "cloud_io/remote.h"
 #include "cloud_topics/errc.h"
 #include "cloud_topics/level_zero/reader/materialized_extent.h"
 #include "cloud_topics/logger.h"
 #include "model/fundamental.h"
-#include "model/record_batch_reader.h"
 
-#include <seastar/core/file.hh>
-#include <seastar/core/fstream.hh>
-#include <seastar/core/io_priority_class.hh>
-#include <seastar/core/iostream.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/coroutine/as_future.hh>
 
 using namespace std::chrono_literals;
 
@@ -37,6 +29,7 @@ ss::future<result<chunked_vector<materialized_extent>>> materialize_sorted_run(
   cloud_storage_clients::bucket_name bucket,
   cloud_io::remote_api<>* api,
   cloud_io::basic_cache_service_api<>* cache,
+  allow_materialization_failure allow_mat_failure,
   retry_chain_node* rtc,
   micro_probe* probe) {
     absl::node_hash_map<object_id, iobuf> hydrated;
@@ -54,6 +47,19 @@ ss::future<result<chunked_vector<materialized_extent>>> materialize_sorted_run(
             auto res = co_await materialize(
               &back, bucket, api, cache, rtc, probe);
             if (!res.has_value()) {
+                if (
+                  bool(allow_mat_failure)
+                  && res.error() == errc::download_not_found) {
+                    vlog(
+                      cd_log.warn,
+                      "Skipping extent {} (offsets {}~{}) due to missing "
+                      "object",
+                      back.meta.id,
+                      back.meta.base_offset,
+                      back.meta.last_offset);
+                    extents.pop_back();
+                    continue;
+                }
                 co_return res.error();
             }
             // If reading from cache (res.value() == true), only the
@@ -78,11 +84,12 @@ ss::future<materialize_result> materialize_placeholders(
   chunked_vector<extent_meta> query,
   cloud_io::remote_api<ss::lowres_clock>& api,
   cloud_io::basic_cache_service_api<ss::lowres_clock>& cache,
+  allow_materialization_failure allow_mat_failure,
   retry_chain_node& rtc,
   retry_chain_logger& logger) {
     micro_probe probe;
     auto extents = co_await materialize_sorted_run(
-      std::move(query), bucket, &api, &cache, &rtc, &probe);
+      std::move(query), bucket, &api, &cache, allow_mat_failure, &rtc, &probe);
     if (!extents.has_value()) {
         vlog(
           logger.warn,

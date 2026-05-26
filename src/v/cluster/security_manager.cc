@@ -10,20 +10,15 @@
  */
 #include "cluster/security_manager.h"
 
-#include "cluster/cluster_utils.h"
 #include "cluster/commands.h"
 #include "cluster/controller_snapshot.h"
-#include "model/metadata.h"
-#include "raft/fundamental.h"
 #include "security/authorizer.h"
 #include "security/credential_store.h"
 #include "security/role_store.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
-#include <iterator>
 #include <system_error>
 #include <vector>
 
@@ -174,11 +169,11 @@ ss::future<std::error_code> security_manager::dispatch_updates_to_cores(
     using ret_t = std::vector<std::error_code>;
     return ss::do_with(
       ret_t{}, [cmd = std::move(cmd), &service](ret_t& ret) mutable {
-          ret.reserve(ss::smp::count);
+          ret.reserve(ss::this_smp_shard_count());
           return ss::parallel_for_each(
-                   boost::irange(0, (int)ss::smp::count),
-                   [&ret, cmd = std::move(cmd), &service](int shard) mutable {
-                       return do_apply(shard, cmd, service)
+                   boost::irange(0, (int)ss::this_smp_shard_count()),
+                   [&ret, &cmd, &service](int shard) {
+                       return do_apply(shard, copy_cmd(cmd), service)
                          .then([&ret](std::error_code r) { ret.push_back(r); });
                    })
             .then([&ret] { return std::move(ret); })

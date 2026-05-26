@@ -14,7 +14,6 @@
 #include "cloud_storage/async_manifest_view.h"
 #include "cloud_storage/logger.h"
 #include "cloud_storage/materialized_resources.h"
-#include "cloud_storage/offset_translation_layer.h"
 #include "cloud_storage/partition_manifest.h"
 #include "cloud_storage/partition_manifest_downloader.h"
 #include "cloud_storage/remote_path_provider.h"
@@ -28,24 +27,17 @@
 #include "ssx/future-util.h"
 #include "ssx/watchdog.h"
 #include "storage/log_reader.h"
-#include "storage/parser_errc.h"
 #include "storage/types.h"
 #include "utils/retry_chain_node.h"
-#include "utils/stream_utils.h"
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/circular_buffer.hh>
-#include <seastar/core/condition-variable.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <seastar/core/queue.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/temporary_buffer.hh>
+#include <seastar/coroutine/exception.hh>
 
 #include <boost/range/adaptor/reversed.hpp>
 
-#include <chrono>
 #include <exception>
 #include <iterator>
 #include <stdexcept>
@@ -318,17 +310,13 @@ public:
         }
     }
     partition_record_batch_reader_impl(
-      partition_record_batch_reader_impl&& o) noexcept
-      = delete;
+      partition_record_batch_reader_impl&& o) noexcept = delete;
     partition_record_batch_reader_impl&
-    operator=(partition_record_batch_reader_impl&& o) noexcept
-      = delete;
+    operator=(partition_record_batch_reader_impl&& o) noexcept = delete;
     partition_record_batch_reader_impl(
-      const partition_record_batch_reader_impl& o)
-      = delete;
+      const partition_record_batch_reader_impl& o) = delete;
     partition_record_batch_reader_impl&
-    operator=(const partition_record_batch_reader_impl& o)
-      = delete;
+    operator=(const partition_record_batch_reader_impl& o) = delete;
 
     bool is_end_of_stream() const override { return _seg_reader == nullptr; }
 
@@ -523,7 +511,8 @@ public:
             co_await set_end_of_stream();
         }
         if (unknown_exception_ptr) {
-            std::rethrow_exception(unknown_exception_ptr);
+            co_await ss::coroutine::return_exception_ptr(
+              std::move(unknown_exception_ptr));
         }
 
         vlog(
@@ -534,8 +523,9 @@ public:
         co_return storage_t{};
     }
 
-    void print(std::ostream& o) override {
-        o << "cloud_storage_partition_record_batch_reader";
+    fmt::iterator format_to(fmt::iterator it) const override {
+        return fmt::format_to(
+          it, "cloud_storage_partition_record_batch_reader");
     }
 
 private:
@@ -543,6 +533,23 @@ private:
     void dispose_current_reader() {
         if (_seg_reader) {
             _partition->return_segment_reader(std::move(_seg_reader));
+        }
+    }
+
+    /// Set the current segment reader and trigger prefetch for upcoming small
+    /// segments
+    void set_current_reader(
+      std::unique_ptr<remote_segment_batch_reader> reader,
+      model::offset next_offset,
+      const partition_manifest& manifest) {
+        _seg_reader = std::move(reader);
+        _next_segment_base_offset = next_offset;
+
+        if (_seg_reader) {
+            _partition->maybe_prefetch_small_segments(
+              manifest,
+              _next_segment_base_offset,
+              _seg_reader->get_segment_size());
         }
     }
 
@@ -670,8 +677,7 @@ private:
           std::move(segment_unit),
           std::move(segment_reader_unit));
         if (reader) {
-            _seg_reader = std::move(reader);
-            _next_segment_base_offset = next_offset;
+            set_current_reader(std::move(reader), next_offset, manifest);
             return;
         }
         vlog(
@@ -840,8 +846,10 @@ private:
                     std::move(segment_unit),
                     std::move(segment_reader_unit),
                     _next_segment_base_offset);
-                _next_segment_base_offset = new_next_offset;
-                _seg_reader = std::move(new_reader);
+                set_current_reader(
+                  std::move(new_reader),
+                  new_next_offset,
+                  maybe_manifest.value());
             }
             if (maybe_manifest.has_value() && _seg_reader != nullptr) {
                 vassert(
@@ -1037,10 +1045,10 @@ ss::future<std::optional<kafka::offset>>
 remote_partition::get_term_last_offset(model::term_id term) const {
     const auto res = co_await _manifest_view->get_term_last_offset(term);
     if (res.has_error()) {
-        throw std::system_error(res.error());
-    } else {
-        co_return res.value();
+        co_await ss::coroutine::return_exception(
+          std::system_error(res.error()));
     }
+    co_return res.value();
 }
 
 ss::future<std::vector<model::tx_range>>
@@ -1089,15 +1097,17 @@ remote_partition::aborted_transactions(offset_range offsets) {
         auto cur_res = co_await _manifest_view->get_cursor(offsets.begin);
         if (cur_res.has_failure()) {
             if (cur_res.error() == error_outcome::shutting_down) {
-                throw std::runtime_error("Async manifest view shutting down");
+                co_await ss::coroutine::return_exception(
+                  std::runtime_error("Async manifest view shutting down"));
             }
 
             vlog(
               _ctxlog.error,
               "Failed to traverse archive part of the log: {}",
               cur_res.error());
-            throw std::runtime_error(fmt_with_ctx(
-              fmt::format, "Failed to get the cursor {}", cur_res.error()));
+            co_await ss::coroutine::return_exception(
+              std::runtime_error(fmt_with_ctx(
+                fmt::format, "Failed to get the cursor {}", cur_res.error())));
         }
         auto cursor = std::move(cur_res.value());
         co_await for_each_manifest(
@@ -1202,9 +1212,10 @@ ss::future<> remote_partition::stop() {
 void remote_partition::return_segment_reader(
   std::unique_ptr<remote_segment_batch_reader> reader) {
     auto offset = reader->base_rp_offset();
-    if (auto it = _segments.find(offset);
-        it != _segments.end()
-        && reader->reads_from_segment(*it->second->segment)) {
+    if (
+      auto it = _segments.find(offset);
+      it != _segments.end()
+      && reader->reads_from_segment(*it->second->segment)) {
         // The segment may already be replaced by compacted segment at this
         // point. In this case it's possible that the remote_segment instance
         // which 'it' points to belongs to the new segment.
@@ -1552,6 +1563,92 @@ void remote_partition::offload_segment(model::offset o) {
 
 materialized_resources& remote_partition::materialized() {
     return _api.materialized();
+}
+
+void remote_partition::maybe_prefetch_small_segments(
+  const partition_manifest& manifest,
+  model::offset next_segment_base_offset,
+  size_t current_segment_size) {
+    auto max_segments
+      = config::shard_local_cfg().cloud_storage_prefetch_segments_max();
+    if (max_segments == 0) {
+        return;
+    }
+    if (next_segment_base_offset == model::offset{}) {
+        // In this case the reader is likely at the last segment in the
+        // manifest. So there is nothing to prefetch at the moment.
+        return;
+    }
+
+    auto chunk_size
+      = config::shard_local_cfg().cloud_storage_cache_chunk_size();
+    if (current_segment_size > chunk_size) {
+        return;
+    }
+
+    auto prefetch_bytes_left = std::max(
+      chunk_size * config::shard_local_cfg().cloud_storage_chunk_prefetch(),
+      chunk_size);
+    size_t segments_prefetched = 0;
+
+    auto it = manifest.segment_containing(next_segment_base_offset);
+    while (it != manifest.end() && prefetch_bytes_left > 0
+           && segments_prefetched < max_segments) {
+        if (it->size_bytes > chunk_size) {
+            // Prefetching for segments larger than a chunk is handled in the
+            // chunks_api.
+            break;
+        }
+        if (it->size_bytes > prefetch_bytes_left) {
+            break;
+        }
+
+        ssx::spawn_with_gate(
+          _gate, [this, m = *it]() { return do_prefetch_small_segment(m); });
+
+        prefetch_bytes_left -= it->size_bytes;
+        ++segments_prefetched;
+        ++it;
+    }
+
+    vlog(
+      _ctxlog.trace,
+      "Prefetched {} small segments ahead of offset {}",
+      segments_prefetched,
+      next_segment_base_offset);
+}
+
+ss::future<> remote_partition::do_prefetch_small_segment(segment_meta meta) {
+    try {
+        if (_segments.contains(meta.base_offset)) {
+            // Assume that this is a duplicate pre-fetch and avoid adding
+            // waiters to the hydration queues.
+            co_return;
+        }
+
+        auto segment_units = materialized().try_get_segment_units();
+        if (!segment_units) {
+            co_return;
+        }
+
+        auto path = _manifest_view->stm_manifest().generate_segment_path(
+          meta, _manifest_view->path_provider());
+        auto iter = get_or_materialize_segment(
+          path, meta, std::move(*segment_units));
+
+        auto segment = iter->second->segment;
+        co_await segment->hydrate();
+        co_await segment->prefetch_first_chunk();
+    } catch (...) {
+        auto eptr = std::current_exception();
+        if (!ssx::is_shutdown_exception(eptr)) {
+            vlog(
+              _ctxlog.warn,
+              "Small segment prefetch failed for {}: {}",
+              meta.base_offset,
+              eptr);
+        }
+    }
 }
 
 cache_usage_target remote_partition::get_cache_usage_target() const {

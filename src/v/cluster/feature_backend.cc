@@ -9,14 +9,12 @@
  * by the Apache License, Version 2.0
  */
 
-#include "feature_backend.h"
+#include "cluster/feature_backend.h"
 
 #include "cluster/controller_snapshot.h"
 #include "cluster/logger.h"
-#include "config/node_config.h"
 #include "features/feature_table.h"
 #include "features/feature_table_snapshot.h"
-#include "seastar/core/coroutine.hh"
 #include "storage/api.h"
 
 namespace cluster {

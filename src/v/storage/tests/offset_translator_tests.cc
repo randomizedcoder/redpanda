@@ -560,6 +560,7 @@ TEST_F(base_fixture, fuzz_operations_test) {
                      .log_mgr()
                      .manage(storage::ntp_config(ntp, _test_dir))
                      .get();
+        log->stm_hookset()->start();
         fuzz_checker checker(log, [this] { return make_offset_translator(); });
         checker.start().get();
 
@@ -594,6 +595,7 @@ TEST_F(base_fixture, fuzz_operations_test) {
         checker.restart().get();
         checker.validate();
         checker.stop().get();
+        log->stm_hookset()->stop();
     }
 }
 
@@ -635,7 +637,7 @@ TEST_F(base_fixture, test_moving_persistent_state) {
     validate_translation(local_ot, model::offset(11), model::offset(5));
 
     // use last available shard
-    auto target_shard = ss::smp::count - 1;
+    auto target_shard = ss::this_smp_shard_count() - 1;
     // move state to target shard
     storage::offset_translator::copy_persistent_state(
       raft::group_id(0), _api.local().kvs(), target_shard, _api)

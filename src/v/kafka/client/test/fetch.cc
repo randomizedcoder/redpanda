@@ -11,22 +11,14 @@
 
 #include "kafka/protocol/fetch.h"
 
-#include "cluster/partition_leaders_table.h"
 #include "kafka/client/client.h"
-#include "kafka/client/configuration.h"
 #include "kafka/client/test/fixture.h"
-#include "kafka/client/test/utils.h"
 #include "kafka/protocol/errors.h"
-#include "kafka/protocol/metadata.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "redpanda/tests/fixture.h"
 #include "test_utils/boost_fixture.h"
-#include "utils/unresolved_address.h"
 
 #include <boost/test/tools/old/interface.hpp>
-
-#include <chrono>
 
 FIXTURE_TEST(fetch, kafka_client_fixture) {
     using namespace std::chrono_literals;
@@ -60,7 +52,7 @@ FIXTURE_TEST(fetch, kafka_client_fixture) {
     auto ntp = model::ntp(tp_ns.ns, tp_ns.tp, model::partition_id{0});
 
     info("Waiting for topic data");
-    wait_for_partition_offset(ntp, model::offset{1}).get();
+    wait_for_lso(ntp, model::offset{1}).get();
 
     {
         info("Fetching from nonempty known topic");

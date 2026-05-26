@@ -199,6 +199,8 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> tx_timeout_delay_ms;
     property<std::chrono::milliseconds> fetch_reads_debounce_timeout;
     property<std::chrono::milliseconds> kafka_fetch_request_timeout_ms;
+    development_feature_property<bool>
+      enable_listoffsets_historical_leader_epoch;
     enum_property<model::fetch_read_strategy> fetch_read_strategy;
     bounded_property<size_t> fetch_max_read_concurrency;
     bounded_property<double, numeric_bounds> fetch_pid_p_coeff;
@@ -220,6 +222,7 @@ struct configuration final : public config_store {
     property<bool> use_fetch_scheduler_group;
     property<bool> use_produce_scheduler_group;
     property<bool> use_kafka_handler_scheduler_group;
+    property<bool> kafka_handler_latency_all;
     property<std::chrono::seconds> kafka_tcp_keepalive_idle_timeout_seconds;
     property<std::chrono::seconds> kafka_tcp_keepalive_probe_interval_seconds;
     property<uint32_t> kafka_tcp_keepalive_probes;
@@ -369,6 +372,7 @@ struct configuration final : public config_store {
     property<std::vector<ss::sstring>> audit_excluded_principals;
     enum_property<audit_failure_policy> audit_failure_policy;
     property<bool> audit_use_rpc;
+    property<bool> schema_registry_use_rpc;
 
     // Archival storage
     enterprise<property<bool>> cloud_storage_enabled;
@@ -438,6 +442,7 @@ struct configuration final : public config_store {
     property<bool> enable_cluster_metadata_upload_loop;
     property<std::optional<ss::sstring>> cloud_storage_cluster_name;
     property<size_t> cloud_storage_max_segments_pending_deletion_per_partition;
+    bounded_property<size_t> cloud_storage_gc_max_segments_per_run;
     property<bool> cloud_storage_enable_compacted_topic_reupload;
     property<size_t> cloud_storage_recovery_temporary_retention_bytes_default;
     // validation of topic manifest during recovery
@@ -501,7 +506,7 @@ struct configuration final : public config_store {
     property<std::chrono::milliseconds> retention_local_trim_interval;
     property<double> retention_local_trim_overage_coeff;
     property<bool> space_management_enable;
-    property<bool> space_management_enable_override;
+    deprecated_property space_management_enable_override;
     bounded_property<double, numeric_bounds> disk_reservation_percent;
     bounded_property<uint16_t> space_management_max_log_concurrency;
     bounded_property<uint16_t> space_management_max_segment_concurrency;
@@ -533,6 +538,7 @@ struct configuration final : public config_store {
     enum_property<model::cloud_storage_chunk_eviction_strategy>
       cloud_storage_chunk_eviction_strategy;
     property<uint16_t> cloud_storage_chunk_prefetch;
+    property<uint16_t> cloud_storage_prefetch_segments_max;
     bounded_property<uint32_t> cloud_storage_cache_num_buckets;
     bounded_property<std::optional<double>, numeric_bounds>
       cloud_storage_cache_trim_threshold_percent_size;
@@ -618,6 +624,7 @@ struct configuration final : public config_store {
     property<ss::sstring> metrics_reporter_url;
 
     property<bool> features_auto_enable;
+    enterprise<property<bool>> features_auto_finalization;
 
     // enables rack aware replica assignment
     property<bool> enable_rack_awareness;
@@ -683,6 +690,7 @@ struct configuration final : public config_store {
 
     // oidc authentication
     property<ss::sstring> oidc_discovery_url;
+    property<std::optional<ss::sstring>> oidc_http_proxy_url;
     property<ss::sstring> oidc_token_audience;
     property<std::chrono::seconds> oidc_clock_skew_tolerance;
     property<ss::sstring> oidc_principal_mapping;
@@ -740,6 +748,7 @@ struct configuration final : public config_store {
     enum_property<std::optional<model::cloud_credentials_source>>
       iceberg_rest_catalog_aws_credentials_source;
     property<std::optional<ss::sstring>> iceberg_rest_catalog_gcp_user_project;
+    property<std::optional<ss::sstring>> iceberg_rest_catalog_credentials_host;
     property<double> iceberg_backlog_controller_p_coeff;
     property<double> iceberg_backlog_controller_i_coeff;
     bounded_property<uint32_t> iceberg_target_backlog_size;
@@ -749,6 +758,8 @@ struct configuration final : public config_store {
     property<ss::sstring> iceberg_default_partition_spec;
     enum_property<model::iceberg_invalid_record_action>
       iceberg_invalid_record_action;
+    enum_property<model::iceberg_schema_case_insensitive>
+      iceberg_schema_case_insensitive;
     bounded_property<std::chrono::milliseconds> iceberg_target_lag_ms;
     property<bool> iceberg_disable_snapshot_tagging;
     property<bool> iceberg_disable_automatic_snapshot_expiry;
@@ -772,6 +783,7 @@ struct configuration final : public config_store {
     bounded_property<size_t> datalake_scheduler_disk_reservation_block_size;
     property<bool> consumer_offsets_topic_batch_cache_enabled;
     enterprise<property<bool>> enable_shadow_linking;
+    bounded_property<uint32_t> shadow_link_failover_batch_size;
     property<std::chrono::milliseconds> internal_rpc_request_timeout_ms;
 
     configuration();
@@ -779,7 +791,7 @@ struct configuration final : public config_store {
     error_map_t load(const YAML::Node& root_node);
 
 public:
-    enterprise<property<bool>> cloud_topics_enabled;
+    deprecated_property cloud_topics_enabled;
     property<size_t> cloud_topics_produce_batching_size_threshold;
     property<std::chrono::milliseconds> cloud_topics_produce_upload_interval;
     property<size_t> cloud_topics_produce_cardinality_threshold;
@@ -794,6 +806,7 @@ public:
     property<size_t> cloud_topics_reconciliation_max_object_size;
     bounded_property<size_t> cloud_topics_upload_part_size;
     bounded_property<size_t> cloud_topics_reconciliation_parallelism;
+    property<bool> cloud_topics_allow_materialization_failure;
     property<size_t> cloud_topics_compaction_max_object_size;
     property<size_t> cloud_topics_l1_indexing_interval;
     property<std::chrono::milliseconds> cloud_topics_compaction_interval_ms;
@@ -805,16 +818,38 @@ public:
       cloud_topics_epoch_service_epoch_increment_interval;
     property<std::chrono::milliseconds>
       cloud_topics_epoch_service_local_epoch_cache_duration;
+    property<std::chrono::milliseconds>
+      cloud_topics_epoch_service_max_same_epoch_duration;
 
     property<std::chrono::milliseconds>
       cloud_topics_short_term_gc_minimum_object_age;
     property<std::chrono::milliseconds> cloud_topics_short_term_gc_interval;
     property<std::chrono::milliseconds>
       cloud_topics_short_term_gc_backoff_interval;
+    property<std::chrono::milliseconds> cloud_topics_gc_health_check_interval;
+
+    property<std::chrono::milliseconds>
+      cloud_topics_metastore_replication_timeout_ms;
+    property<std::chrono::milliseconds>
+      cloud_topics_metastore_lsm_apply_timeout_ms;
 
     property<bool> cloud_topics_parallel_fetch_enabled;
 
     property<bool> cloud_topics_fetch_debounce_enabled;
+
+    property<std::chrono::milliseconds> cloud_topics_preregistered_object_ttl;
+
+    property<std::chrono::milliseconds>
+      cloud_topics_long_term_file_deletion_delay;
+    bounded_property<int32_t> cloud_topics_num_metastore_partitions;
+
+    bounded_property<size_t> cloud_topics_produce_write_inflight_limit;
+    bounded_property<size_t> cloud_topics_produce_no_pid_concurrency;
+
+    property<std::chrono::milliseconds>
+      cloud_topics_l1_reader_cache_eviction_timeout_ms;
+    bounded_property<size_t> cloud_topics_l1_reader_cache_max_size;
+    property<bool> code_hugepages_enabled;
 
     development_feature_property<int> development_feature_property_testing_only;
 

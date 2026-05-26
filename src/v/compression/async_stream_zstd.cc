@@ -12,18 +12,15 @@
 #include "base/likely.h"
 #include "base/units.h"
 #include "base/vassert.h"
-#include "base/vlog.h"
-#include "bytes/bytes.h"
-#include "bytes/details/io_allocation_size.h"
 #include "bytes/ioarray.h"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 
 #include <fmt/format.h>
 #include <sys/uio.h>
 
-#include <array>
 #include <zstd.h>
 #include <zstd_errors.h>
 
@@ -219,8 +216,8 @@ ss::future<iobuf> async_stream_zstd::compress(iobuf i_buf) {
 
 ss::future<iobuf> async_stream_zstd::uncompress(iobuf i_buf) {
     if (unlikely(i_buf.empty())) {
-        throw std::runtime_error(
-          "Asked to stream_zstd::uncompress empty buffer");
+        co_await ss::coroutine::return_exception(
+          std::runtime_error("Asked to stream_zstd::uncompress empty buffer"));
     }
 
     ss::abort_source as;
@@ -254,7 +251,8 @@ ss::future<iobuf> async_stream_zstd::uncompress(iobuf i_buf) {
     }
 
     if (last_zstd_ret != 0) {
-        throw std::runtime_error("Input truncated before reading epilog");
+        co_await ss::coroutine::return_exception(
+          std::runtime_error("Input truncated before reading epilog"));
     }
 
     co_return ret_buf;
@@ -262,8 +260,8 @@ ss::future<iobuf> async_stream_zstd::uncompress(iobuf i_buf) {
 
 ss::future<ioarray> async_stream_zstd::uncompress(ioarray i_arr) {
     if (unlikely(i_arr.empty())) {
-        throw std::runtime_error(
-          "Asked to stream_zstd::uncompress empty array");
+        co_await ss::coroutine::return_exception(
+          std::runtime_error("Asked to stream_zstd::uncompress empty array"));
     }
 
     ss::abort_source as;
@@ -317,7 +315,8 @@ ss::future<ioarray> async_stream_zstd::uncompress(ioarray i_arr) {
     }
 
     if (last_zstd_ret != 0) {
-        throw std::runtime_error("Input truncated before reading epilog");
+        co_await ss::coroutine::return_exception(
+          std::runtime_error("Input truncated before reading epilog"));
     }
 
     auto out = ioarray::from_sized_buffers(obufs);

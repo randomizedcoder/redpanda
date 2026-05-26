@@ -17,8 +17,6 @@
 #include "kafka/data/rpc/serde.h"
 #include "model/fundamental.h"
 #include "model/ktp.h"
-#include "model/metadata.h"
-#include "model/transform.h"
 
 #include <seastar/util/noncopyable_function.hh>
 
@@ -49,9 +47,8 @@ public:
      */
     std::optional<model::node_id> get_leader_node(const model::ntp& ntp) const;
 
-    virtual std::optional<model::node_id>
-      get_leader_node(model::topic_namespace_view, model::partition_id) const
-      = 0;
+    virtual std::optional<model::node_id> get_leader_node(
+      model::topic_namespace_view, model::partition_id) const = 0;
 };
 
 /**
@@ -105,8 +102,7 @@ public:
       model::topic_namespace_view,
       int32_t partition_count,
       cluster::topic_properties,
-      std::optional<int16_t> replication_factor = std::nullopt)
-      = 0;
+      std::optional<int16_t> replication_factor = std::nullopt) = 0;
 
     /**
      * Create new partitions on a topic
@@ -116,8 +112,7 @@ public:
     virtual ss::future<cluster::errc> create_partitions(
       model::topic_namespace_view,
       int32_t new_partition_count,
-      model::timeout_clock::time_point)
-      = 0;
+      model::timeout_clock::time_point) = 0;
 
     /**
      * Update a topic.
@@ -179,15 +174,13 @@ public:
       const model::ktp& ktp,
       ss::noncopyable_function<ss::future<result<model::offset, cluster::errc>>(
         kafka::partition_proxy*)>,
-      require_leader req_leader = require_leader::yes)
-      = 0;
+      require_leader req_leader = require_leader::yes) = 0;
     virtual ss::future<result<model::offset, cluster::errc>> invoke_on_shard(
       ss::shard_id,
       const model::ntp&,
       ss::noncopyable_function<ss::future<result<model::offset, cluster::errc>>(
         kafka::partition_proxy*)>,
-      require_leader req_leader = require_leader::yes)
-      = 0;
+      require_leader req_leader = require_leader::yes) = 0;
 
     virtual ss::future<result<partition_offsets, cluster::errc>>
     get_offsets_from_shard(
@@ -195,8 +188,7 @@ public:
       const model::ktp& ktp,
       ss::noncopyable_function<ss::future<
         result<partition_offsets, cluster::errc>>(kafka::partition_proxy*)>,
-      require_leader req_leader = require_leader::yes)
-      = 0;
+      require_leader req_leader = require_leader::yes) = 0;
 
     virtual ss::future<
       result<chunked_vector<model::record_batch>, cluster::errc>>
@@ -204,8 +196,7 @@ public:
       ss::shard_id shard_id,
       const model::ktp& ktp,
       consume_fn,
-      require_leader req_leader = require_leader::yes)
-      = 0;
+      require_leader req_leader = require_leader::yes) = 0;
 };
 
 class partition_manager_proxy {

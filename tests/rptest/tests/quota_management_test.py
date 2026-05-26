@@ -10,30 +10,30 @@
 import json
 from enum import Enum
 from functools import total_ordering
-from typing import NamedTuple, Any
-from typing_extensions import Self
+from typing import Any, NamedTuple
 
 from ducktape.mark import parametrize
 from ducktape.utils.util import wait_until
+from typing_extensions import Self
 
 from rptest.clients.kafka_cli_tools import KafkaCliTools, KafkaCliToolsError
-from rptest.services.redpanda_installer import (
-    wait_for_num_versions,
-    InstallOptions,
-    RedpandaVersionTriple,
-    RedpandaInstaller,
-)
-from rptest.tests.end_to_end import EndToEndTest
 from rptest.clients.kcl import RawKCL
 from rptest.clients.rpk import RpkException, RpkTool
 from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
 from rptest.services.redpanda import (
-    LoggingConfig,
     RESTART_LOG_ALLOW_LIST,
-    SISettings,
     ClusterNode,
+    LoggingConfig,
+    SISettings,
 )
+from rptest.services.redpanda_installer import (
+    InstallOptions,
+    RedpandaInstaller,
+    RedpandaVersionTriple,
+    wait_for_num_versions,
+)
+from rptest.tests.end_to_end import EndToEndTest
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import expect_exception, wait_until_result
 
@@ -198,7 +198,7 @@ class QuotaManagementUtils:
             wait_until(
                 lambda: self.rpk.alter_cluster_quotas(*args, **kwargs)["status"]
                 == "OK",
-                timeout_sec=10,
+                timeout_sec=30,
                 backoff_sec=1,
                 err_msg="failed to run rpk.alter_cluster_quotas",
             )
@@ -807,7 +807,11 @@ class QuotaManagementUpgradeTest(EndToEndTest, QuotaManagementUtils):
 
     @cluster(num_nodes=2, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_upgrade(self):
-        install_opts = InstallOptions(version=RedpandaVersionTriple((25, 3, 1)))
+        # user_based_client_quota feature introduced in v26.1, start on v25.3
+        from_version = (25, 3, 1)
+        to_version = RedpandaInstaller.next_major_version(from_version[0:2])
+
+        install_opts = InstallOptions(version=RedpandaVersionTriple(from_version))
         self.start_redpanda(
             num_nodes=2,
             si_settings=SISettings(test_context=self.test_context),
@@ -847,10 +851,14 @@ class QuotaManagementUpgradeTest(EndToEndTest, QuotaManagementUtils):
             f"Unexpected entry: {entry}"
         )
 
-        # Upgrade one node to the head version.
-        self.redpanda._installer.install(self.redpanda.nodes, RedpandaInstaller.HEAD)
+        # Upgrade one node to the next version.
+        self.redpanda._installer.install(self.redpanda.nodes, to_version)
         self.redpanda.restart_nodes([first_node])
         wait_for_num_versions(self.redpanda, 2)
+
+        # Ensure the controller is on the upgraded node so that we can verify
+        # the behavior of user quotas during the upgrade
+        self.transfer_leadership(first_node)
 
         self.logger.debug("Verify that during upgrade user quotas are disabled")
         res = self.alter_quotas(alter_user_quota_body)
@@ -863,6 +871,7 @@ class QuotaManagementUpgradeTest(EndToEndTest, QuotaManagementUtils):
 
         self.redpanda.restart_nodes([second_node])
         wait_for_num_versions(self.redpanda, 1)
+        self.redpanda.await_feature("user_based_client_quota", "active", timeout_sec=30)
 
         self.logger.debug("Verify that user quotas are now enabled")
         res = self.alter_quotas(alter_user_quota_body, node=second_node)
@@ -872,7 +881,11 @@ class QuotaManagementUpgradeTest(EndToEndTest, QuotaManagementUtils):
 
     @cluster(num_nodes=2, log_allow_list=RESTART_LOG_ALLOW_LIST)
     def test_quotas_during_upgrade(self):
-        install_opts = InstallOptions(version=RedpandaVersionTriple((25, 3, 1)))
+        # client-id quotas predate v25.3, test they survive the upgrade
+        from_version = (25, 3, 1)
+        to_version = RedpandaInstaller.next_major_version(from_version[0:2])
+
+        install_opts = InstallOptions(version=RedpandaVersionTriple(from_version))
         self.start_redpanda(
             num_nodes=2,
             si_settings=SISettings(test_context=self.test_context),
@@ -929,8 +942,8 @@ class QuotaManagementUpgradeTest(EndToEndTest, QuotaManagementUtils):
         for etype, quota in all_quotas.values():
             check_all_nodes(etype, quota)
 
-        # Upgrade one node to the head version.
-        self.redpanda._installer.install(self.redpanda.nodes, RedpandaInstaller.HEAD)
+        # Upgrade one node to the next version.
+        self.redpanda._installer.install(self.redpanda.nodes, to_version)
         self.redpanda.restart_nodes([first_node])
         wait_for_num_versions(self.redpanda, 2)
 

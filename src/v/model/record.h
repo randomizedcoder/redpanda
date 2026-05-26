@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "base/vassert.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
@@ -36,7 +37,6 @@
 #include <bitset>
 #include <compare>
 #include <cstdint>
-#include <iosfwd>
 #include <limits>
 #include <numeric>
 #include <variant>
@@ -73,7 +73,7 @@ public:
         return !(*this == other);
     }
 
-    friend std::ostream& operator<<(std::ostream&, const record_attributes&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
 private:
     std::bitset<8> _attributes;
@@ -126,7 +126,7 @@ public:
                && _key == rhs._key && _value == rhs._value;
     }
 
-    friend std::ostream& operator<<(std::ostream&, const record_header&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
 private:
     // If negative, the key is nil.
@@ -335,7 +335,7 @@ public:
 
     bool operator!=(const record& other) const { return !(*this == other); }
 
-    friend std::ostream& operator<<(std::ostream&, const record&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
 private:
     int32_t _size_bytes{0};
@@ -456,8 +456,7 @@ public:
         serde::write(out, static_cast<uint64_t>(el._attributes.to_ullong()));
     }
 
-    friend std::ostream&
-    operator<<(std::ostream&, const record_batch_attributes&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
 private:
     uint16_t maskable_value() const {
@@ -520,8 +519,7 @@ struct record_batch_header
 
         friend bool operator==(
           const record_batch_header::context&,
-          const record_batch_header::context&)
-          = default;
+          const record_batch_header::context&) = default;
     };
 
     /// \brief every thing below this field gets CRC, except `context`
@@ -602,7 +600,7 @@ struct record_batch_header
     /// \brief resets the size, header crc and payload crc
     void reset_size_checksum_metadata(const iobuf& records);
 
-    friend std::ostream& operator<<(std::ostream&, const record_batch_header&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 using tx_seq = named_type<int64_t, struct tm_tx_seq>;
@@ -645,7 +643,7 @@ struct producer_identity
         return H::combine(std::move(h), pid.id, pid.epoch);
     }
 
-    friend std::ostream& operator<<(std::ostream&, const producer_identity&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     auto serde_fields() { return std::tie(id, epoch); }
 };
@@ -669,7 +667,8 @@ struct tx_range
     auto serde_fields() { return std::tie(pid, first, last); }
 
     auto operator<=>(const tx_range&) const = default;
-    friend std::ostream& operator<<(std::ostream&, const tx_range&);
+
+    fmt::iterator format_to(fmt::iterator it) const;
 
     template<typename H>
     friend H AbslHashValue(H h, const tx_range& range) {
@@ -715,7 +714,7 @@ struct batch_identity {
 
     bool is_idempotent() const { return pid.id > no_producer_id; }
 
-    friend std::ostream& operator<<(std::ostream&, const batch_identity&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 // A simple iterator for model::record_batch. Note that this iterator makes a
@@ -890,7 +889,7 @@ public:
         return !(*this == other);
     }
 
-    friend std::ostream& operator<<(std::ostream&, const record_batch&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     record_batch share() {
         return record_batch(
@@ -925,8 +924,8 @@ public:
     void for_each_record(Func f) const {
         auto it = record_batch_copy_iterator::create(*this);
         while (it.has_next()) {
-            if constexpr (std::is_void_v<
-                            std::invoke_result_t<Func, model::record>>) {
+            if constexpr (
+              std::is_void_v<std::invoke_result_t<Func, model::record>>) {
                 f(it.next());
             } else {
                 ss::stop_iteration s = f(it.next());
@@ -971,10 +970,10 @@ public:
     ss::future<> for_each_record_async(Func f) const {
         auto it = record_batch_copy_iterator::create(*this);
         while (it.has_next()) {
-            if constexpr (std::is_same_v<
-                            ss::futurize_t<
-                              std::invoke_result_t<Func, model::record>>,
-                            ss::future<ss::stop_iteration>>) {
+            if constexpr (
+              std::is_same_v<
+                ss::futurize_t<std::invoke_result_t<Func, model::record>>,
+                ss::future<ss::stop_iteration>>) {
                 ss::stop_iteration s = co_await ss::futurize_invoke(
                   f, it.next());
                 if (s == ss::stop_iteration::yes) {

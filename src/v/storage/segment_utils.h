@@ -45,7 +45,7 @@ namespace storage::internal {
 // whether self-compaction should be executed or not.
 ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
   ss::lw_shared_ptr<segment> s,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   const compaction::compaction_config& cfg,
   ss::rwlock::holder& read_holder,
   storage_resources& resources,
@@ -56,7 +56,7 @@ ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
 ///
 ss::future<compaction_result> self_compact_segment(
   ss::lw_shared_ptr<storage::segment>,
-  ss::lw_shared_ptr<storage::stm_manager>,
+  ss::lw_shared_ptr<storage::stm_hookset>,
   const compaction::compaction_config&,
   storage::probe&,
   storage::readers_cache&,
@@ -68,7 +68,7 @@ ss::future<compaction_result> self_compact_segment(
 /// locks on the segment.
 ss::future<> rebuild_compaction_index(
   ss::lw_shared_ptr<segment> s,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   compaction::compaction_config cfg,
   storage::probe& pb,
   storage_resources& resources,
@@ -111,7 +111,7 @@ make_concatenated_segment(
 ss::future<compaction_result> concatenate_and_rebuild_target_segment(
   ss::lw_shared_ptr<segment> target,
   chunked_vector<ss::lw_shared_ptr<segment>>& segments,
-  ss::lw_shared_ptr<storage::stm_manager> stm_manager,
+  ss::lw_shared_ptr<storage::stm_hookset> stm_hookset,
   compaction::compaction_config cfg,
   storage::probe& pb,
   storage::readers_cache& readers_cache,
@@ -220,7 +220,7 @@ model::record_batch_reader create_segment_full_reader(
 ss::future<storage::index_state> do_copy_segment_data(
   ss::lw_shared_ptr<storage::segment>,
   compaction::compaction_config,
-  ss::lw_shared_ptr<storage::stm_manager>,
+  ss::lw_shared_ptr<storage::stm_hookset>,
   storage::probe&,
   ss::rwlock::holder,
   storage_resources&);
@@ -334,8 +334,9 @@ inline bool can_discard(
   bool past_tombstone_delete_horizon,
   bool past_tx_delete_horizon,
   bool tx_batch_compaction_enabled) {
-    if (compaction::is_removable_control_batch(
-          ntp, b.header().type, tx_batch_compaction_enabled)) {
+    if (
+      compaction::is_removable_control_batch(
+        ntp, b.header().type, tx_batch_compaction_enabled)) {
         return true;
     }
 
@@ -409,13 +410,14 @@ ss::future<bool> should_keep(
     // Before considering `is_latest_key()`, remove
     // records/batches which are always considered removable as well as expired
     // tombstone records/control batches.
-    if (can_discard(
-          b,
-          r,
-          ntp,
-          past_tombstone_delete_horizon,
-          past_tx_delete_horizon,
-          tx_batch_compaction_enabled)) {
+    if (
+      can_discard(
+        b,
+        r,
+        ntp,
+        past_tombstone_delete_horizon,
+        past_tx_delete_horizon,
+        tx_batch_compaction_enabled)) {
         if (is_tombstone) {
             pb.add_removed_tombstone();
         }

@@ -67,6 +67,7 @@ inline auto default_synced_topic_properties = std::to_array<std::string_view>({
   kafka::topic_property_delete_retention_ms,
   kafka::topic_property_min_compaction_lag_ms,
   kafka::topic_property_max_compaction_lag_ms,
+  kafka::topic_property_redpanda_storage_mode,
 });
 
 /// List of topic properties that are not permitted to be synced
@@ -76,7 +77,6 @@ inline auto disallowed_topic_properties = std::to_array<std::string_view>({
   kafka::topic_property_remote_allow_gaps,
   kafka::topic_property_mpx_virtual_cluster_id,
   kafka::topic_property_leaders_preference,
-  kafka::topic_property_redpanda_storage_mode,
 });
 
 /**
@@ -151,10 +151,13 @@ static constexpr std::string_view to_string_view(mirror_topic_status s) {
     }
 }
 
+static inline fmt::iterator
+format_to(mirror_topic_status s, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(s));
+}
+
 bool is_valid_status_transition(
   mirror_topic_status current, mirror_topic_status target) noexcept;
-
-std::ostream& operator<<(std::ostream& os, mirror_topic_status s);
 
 enum class task_state : uint8_t {
     /// The task is currently active and processing
@@ -187,7 +190,9 @@ static constexpr std::string_view to_string_view(task_state st) {
     }
 }
 
-std::ostream& operator<<(std::ostream& os, task_state s);
+static inline fmt::iterator format_to(task_state st, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(st));
+}
 
 /**
  * @brief SCRAM credentials to use for authentication
@@ -204,8 +209,8 @@ struct scram_credentials
     /// This records the time point when the password was last updated
     ::model::timestamp password_last_updated;
 
-    friend bool operator==(const scram_credentials&, const scram_credentials&)
-      = default;
+    friend bool
+    operator==(const scram_credentials&, const scram_credentials&) = default;
     auto serde_fields() {
         return std::tie(username, password, mechanism, password_last_updated);
     }
@@ -316,8 +321,8 @@ struct connection_config
           default_fetch_partition_max_bytes);
     }
 
-    friend bool operator==(const connection_config&, const connection_config&)
-      = default;
+    friend bool
+    operator==(const connection_config&, const connection_config&) = default;
 
     auto serde_fields() {
         return std::tie(
@@ -374,9 +379,8 @@ struct mirror_topic_metadata
         return start_offset_ts.value_or(earliest_offset_ts);
     }
 
-    friend bool
-    operator==(const mirror_topic_metadata&, const mirror_topic_metadata&)
-      = default;
+    friend bool operator==(
+      const mirror_topic_metadata&, const mirror_topic_metadata&) = default;
 
     auto serde_fields() {
         return std::tie(
@@ -414,7 +418,10 @@ static constexpr std::string_view to_string_view(filter_pattern_type f) {
     return "unknown";
 }
 
-std::ostream& operator<<(std::ostream& os, filter_pattern_type f);
+static inline fmt::iterator
+format_to(filter_pattern_type f, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(f));
+}
 
 /// Whether or not the filter is an inclusive or exclusive filter
 enum class filter_type : uint8_t { include, exclude };
@@ -429,7 +436,9 @@ static constexpr std::string_view to_string_view(filter_type f) {
     return "unknown";
 }
 
-std::ostream& operator<<(std::ostream& os, filter_type f);
+static inline fmt::iterator format_to(filter_type f, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(f));
+}
 
 struct resource_name_filter_pattern
   : serde::envelope<
@@ -444,8 +453,8 @@ struct resource_name_filter_pattern
     ss::sstring pattern;
 
     friend bool operator==(
-      const resource_name_filter_pattern&, const resource_name_filter_pattern&)
-      = default;
+      const resource_name_filter_pattern&,
+      const resource_name_filter_pattern&) = default;
 
     auto serde_fields() { return std::tie(pattern_type, filter, pattern); }
 
@@ -489,8 +498,7 @@ struct topic_metadata_mirroring_config
 
     friend bool operator==(
       const topic_metadata_mirroring_config&,
-      const topic_metadata_mirroring_config&)
-      = default;
+      const topic_metadata_mirroring_config&) = default;
 
     auto serde_fields() {
         return std::tie(
@@ -520,8 +528,7 @@ struct schema_registry_sync_config
           serde::compat_version<0>> {
         friend bool operator==(
           const shadow_entire_schema_registry&,
-          const shadow_entire_schema_registry&)
-          = default;
+          const shadow_entire_schema_registry&) = default;
 
         auto serde_fields() { return std::tie(); }
 
@@ -537,8 +544,8 @@ struct schema_registry_sync_config
     auto serde_fields() { return std::tie(sync_schema_registry_topic_mode); }
 
     friend bool operator==(
-      const schema_registry_sync_config&, const schema_registry_sync_config&)
-      = default;
+      const schema_registry_sync_config&,
+      const schema_registry_sync_config&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 };
@@ -563,8 +570,7 @@ struct consumer_groups_mirroring_config
 
     friend bool operator==(
       const consumer_groups_mirroring_config&,
-      const consumer_groups_mirroring_config&)
-      = default;
+      const consumer_groups_mirroring_config&) = default;
 
     auto serde_fields() { return std::tie(is_enabled, task_interval, filters); }
 
@@ -607,6 +613,10 @@ static constexpr std::string_view to_string_view(acl_resource r) {
     return "unknown";
 }
 
+static inline fmt::iterator format_to(acl_resource r, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(r));
+}
+
 enum class acl_pattern : uint8_t { any, literal, prefixed, match };
 
 static constexpr std::string_view to_string_view(acl_pattern p) {
@@ -621,6 +631,10 @@ static constexpr std::string_view to_string_view(acl_pattern p) {
         return "match";
     }
     return "unknown";
+}
+
+static inline fmt::iterator format_to(acl_pattern p, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(p));
 }
 
 enum class acl_operation : uint8_t {
@@ -668,6 +682,10 @@ static constexpr std::string_view to_string_view(acl_operation op) {
     return "unknown";
 }
 
+static inline fmt::iterator format_to(acl_operation op, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(op));
+}
+
 enum class acl_permission_type : uint8_t { any, allow, deny };
 
 static constexpr std::string_view to_string_view(acl_permission_type p) {
@@ -682,6 +700,11 @@ static constexpr std::string_view to_string_view(acl_permission_type p) {
     return "unknown";
 }
 
+static inline fmt::iterator
+format_to(acl_permission_type p, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(p));
+}
+
 struct acl_resource_filter
   : serde::envelope<
       acl_resource_filter,
@@ -691,9 +714,8 @@ struct acl_resource_filter
     acl_pattern pattern_type;
     ss::sstring name;
 
-    friend bool
-    operator==(const acl_resource_filter&, const acl_resource_filter&)
-      = default;
+    friend bool operator==(
+      const acl_resource_filter&, const acl_resource_filter&) = default;
 
     auto serde_fields() { return std::tie(resource_type, pattern_type, name); }
 };
@@ -706,8 +728,8 @@ struct acl_access_filter
     acl_permission_type permission_type;
     ss::sstring host;
 
-    friend bool operator==(const acl_access_filter&, const acl_access_filter&)
-      = default;
+    friend bool
+    operator==(const acl_access_filter&, const acl_access_filter&) = default;
 
     auto serde_fields() {
         return std::tie(principal, operation, permission_type, host);
@@ -748,8 +770,7 @@ struct security_settings_sync_config
 
     friend bool operator==(
       const security_settings_sync_config&,
-      const security_settings_sync_config&)
-      = default;
+      const security_settings_sync_config&) = default;
 
     auto serde_fields() {
         return std::tie(is_enabled, task_interval, acl_filters);
@@ -776,8 +797,8 @@ struct link_configuration
     /// Configuration for syncing schema registry
     schema_registry_sync_config schema_registry_sync_cfg;
 
-    friend bool operator==(const link_configuration&, const link_configuration&)
-      = default;
+    friend bool
+    operator==(const link_configuration&, const link_configuration&) = default;
 
     auto serde_fields() {
         return std::tie(
@@ -811,8 +832,10 @@ static constexpr std::string_view to_string_view(link_status s) {
         return "paused";
     }
 }
-std::ostream& operator<<(std::ostream& os, const link_status& s);
 
+static inline fmt::iterator format_to(link_status s, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(s));
+}
 /**
  * Link state. The state is modified by the cluster link tasks and is
  * persisted to the cluster link table.
@@ -883,9 +906,8 @@ struct add_mirror_topic_cmd
     /// Initial state of the topic
     mirror_topic_metadata metadata;
 
-    friend bool
-    operator==(const add_mirror_topic_cmd&, const add_mirror_topic_cmd&)
-      = default;
+    friend bool operator==(
+      const add_mirror_topic_cmd&, const add_mirror_topic_cmd&) = default;
 
     auto serde_fields() { return std::tie(topic, metadata); }
 
@@ -912,10 +934,29 @@ struct update_mirror_topic_status_cmd
 
     friend bool operator==(
       const update_mirror_topic_status_cmd&,
-      const update_mirror_topic_status_cmd&)
-      = default;
+      const update_mirror_topic_status_cmd&) = default;
 
     auto serde_fields() { return std::tie(topic, status, force_update); }
+};
+
+/// \brief Batched command to update the state of multiple mirror topics
+///
+/// All topics in a batch share the same target status. Used by failover to
+/// update up to 1k topics in a single raft entry, avoiding per-topic deep
+/// copies of the link metadata.
+struct batch_update_mirror_topic_status_cmd
+  : serde::envelope<
+      batch_update_mirror_topic_status_cmd,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    mirror_topic_status status{mirror_topic_status::active};
+    chunked_vector<::model::topic> topics;
+
+    friend bool operator==(
+      const batch_update_mirror_topic_status_cmd&,
+      const batch_update_mirror_topic_status_cmd&) = default;
+
+    auto serde_fields() { return std::tie(status, topics); }
 };
 
 /// \brief Command used to update the properties of a mirror topic
@@ -935,8 +976,7 @@ struct update_mirror_topic_properties_cmd
 
     friend bool operator==(
       const update_mirror_topic_properties_cmd&,
-      const update_mirror_topic_properties_cmd&)
-      = default;
+      const update_mirror_topic_properties_cmd&) = default;
 
     auto serde_fields() {
         return std::tie(
@@ -958,9 +998,8 @@ struct delete_mirror_topic_cmd
     /// Name of the topic
     ::model::topic topic;
 
-    friend bool
-    operator==(const delete_mirror_topic_cmd&, const delete_mirror_topic_cmd&)
-      = default;
+    friend bool operator==(
+      const delete_mirror_topic_cmd&, const delete_mirror_topic_cmd&) = default;
 
     auto serde_fields() { return std::tie(topic); }
 
@@ -978,8 +1017,7 @@ struct update_cluster_link_configuration_cmd
 
     friend bool operator==(
       const update_cluster_link_configuration_cmd&,
-      const update_cluster_link_configuration_cmd&)
-      = default;
+      const update_cluster_link_configuration_cmd&) = default;
 
     auto serde_fields() { return std::tie(connection, link_config); }
 
@@ -1001,8 +1039,8 @@ struct task_status_report
       is_controller_locked_task_t::no};
     ::model::node_id node_id;
     ss::shard_id shard;
-    friend bool operator==(const task_status_report&, const task_status_report&)
-      = default;
+    friend bool
+    operator==(const task_status_report&, const task_status_report&) = default;
 
     auto serde_fields() {
         return std::tie(
@@ -1024,9 +1062,8 @@ struct link_task_status_report
     name_t link_name;
     chunked_hash_map<ss::sstring, task_status_report> task_status_reports;
 
-    friend bool
-    operator==(const link_task_status_report&, const link_task_status_report&)
-      = default;
+    friend bool operator==(
+      const link_task_status_report&, const link_task_status_report&) = default;
 
     auto serde_fields() { return std::tie(link_name, task_status_reports); }
 };
@@ -1041,8 +1078,7 @@ struct cluster_link_task_status_report
 
     friend bool operator==(
       const cluster_link_task_status_report&,
-      const cluster_link_task_status_report&)
-      = default;
+      const cluster_link_task_status_report&) = default;
 
     auto serde_fields() { return std::tie(link_reports); }
 };
@@ -1062,8 +1098,7 @@ struct aggregated_shadow_topic_report {
 
     friend bool operator==(
       const aggregated_shadow_topic_report&,
-      const aggregated_shadow_topic_report&)
-      = default;
+      const aggregated_shadow_topic_report&) = default;
 };
 using report_result_t = std::expected<aggregated_shadow_topic_report, errc>;
 
@@ -1075,9 +1110,8 @@ struct delete_shadow_link_cmd
     name_t link_name;
     bool force{false};
 
-    friend bool
-    operator==(const delete_shadow_link_cmd&, const delete_shadow_link_cmd&)
-      = default;
+    friend bool operator==(
+      const delete_shadow_link_cmd&, const delete_shadow_link_cmd&) = default;
 
     auto serde_fields() { return std::tie(link_name, force); }
 
@@ -1096,8 +1130,8 @@ struct shadow_topic_report_request
     ::model::topic topic_name;
 
     friend bool operator==(
-      const shadow_topic_report_request&, const shadow_topic_report_request&)
-      = default;
+      const shadow_topic_report_request&,
+      const shadow_topic_report_request&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 
@@ -1118,8 +1152,7 @@ struct shadow_topic_partition_leader_report
 
     friend bool operator==(
       const shadow_topic_partition_leader_report&,
-      const shadow_topic_partition_leader_report&)
-      = default;
+      const shadow_topic_partition_leader_report&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 
@@ -1150,8 +1183,8 @@ struct shadow_topic_report_response
     errc err_code;
 
     friend bool operator==(
-      const shadow_topic_report_response&, const shadow_topic_report_response&)
-      = default;
+      const shadow_topic_report_response&,
+      const shadow_topic_report_response&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 
@@ -1170,8 +1203,7 @@ struct shadow_link_status_report_request
 
     friend bool operator==(
       const shadow_link_status_report_request&,
-      const shadow_link_status_report_request&)
-      = default;
+      const shadow_link_status_report_request&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 
@@ -1191,8 +1223,7 @@ struct shadow_link_status_topic_response
 
     friend bool operator==(
       const shadow_link_status_topic_response&,
-      const shadow_link_status_topic_response&)
-      = default;
+      const shadow_link_status_topic_response&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 
@@ -1215,8 +1246,7 @@ struct shadow_link_status_report_response
 
     friend bool operator==(
       const shadow_link_status_report_response&,
-      const shadow_link_status_report_response&)
-      = default;
+      const shadow_link_status_report_response&) = default;
 
     fmt::iterator format_to(fmt::iterator) const;
 
@@ -1244,15 +1274,21 @@ using status_report_ret_t = std::expected<shadow_link_status_report, errc>;
 } // namespace cluster_link::model
 
 template<>
-struct fmt::formatter<cluster_link::model::mirror_topic_status>
-  : fmt::formatter<string_view> {
+struct fmt::formatter<cluster_link::model::mirror_topic_status> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
     auto format(cluster_link::model::mirror_topic_status s, format_context& ctx)
-      -> decltype(ctx.out());
+      const -> decltype(ctx.out()) {
+        return cluster_link::model::format_to(s, ctx.out());
+    }
 };
 
 template<>
-struct fmt::formatter<cluster_link::model::task_state>
-  : fmt::formatter<string_view> {
+struct fmt::formatter<cluster_link::model::task_state> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
     auto format(cluster_link::model::task_state, format_context& ctx) const
       -> decltype(ctx.out());
 };
@@ -1260,9 +1296,9 @@ struct fmt::formatter<cluster_link::model::task_state>
 template<>
 struct fmt::formatter<cluster_link::model::scram_credentials>
   : fmt::formatter<string_view> {
-    auto
-    format(const cluster_link::model::scram_credentials& m, format_context& ctx)
-      -> decltype(ctx.out());
+    auto format(
+      const cluster_link::model::scram_credentials& m,
+      format_context& ctx) const -> decltype(ctx.out());
 };
 
 template<>
@@ -1272,7 +1308,7 @@ struct fmt::formatter<
     auto format(
       const std::optional<
         cluster_link::model::connection_config::authn_variant>& m,
-      format_context& ctx) -> decltype(ctx.out());
+      format_context& ctx) const -> decltype(ctx.out());
 };
 
 template<>
@@ -1296,9 +1332,9 @@ struct fmt::formatter<cluster_link::model::tls_file_or_value>
 
         return it;
     }
-    auto
-    format(const cluster_link::model::tls_file_or_value& m, format_context& ctx)
-      -> decltype(ctx.out());
+    auto format(
+      const cluster_link::model::tls_file_or_value& m,
+      format_context& ctx) const -> decltype(ctx.out());
 
 private:
     bool _is_sensitive{false};
@@ -1325,7 +1361,7 @@ struct fmt::formatter<std::optional<cluster_link::model::tls_file_or_value>>
     }
     auto format(
       const std::optional<cluster_link::model::tls_file_or_value>& m,
-      format_context& ctx) -> decltype(ctx.out());
+      format_context& ctx) const -> decltype(ctx.out());
 
 private:
     bool _is_sensitive{false};
@@ -1334,15 +1370,16 @@ private:
 template<>
 struct fmt::formatter<cluster_link::model::connection_config>
   : fmt::formatter<string_view> {
-    auto
-    format(const cluster_link::model::connection_config& m, format_context& ctx)
-      -> decltype(ctx.out());
+    auto format(
+      const cluster_link::model::connection_config& m,
+      format_context& ctx) const -> decltype(ctx.out());
 };
 
 template<>
 struct fmt::formatter<std::optional<model::topic_id>>
   : fmt::formatter<string_view> {
-    auto format(const std::optional<model::topic_id>& m, format_context& ctx)
+    auto
+    format(const std::optional<model::topic_id>& m, format_context& ctx) const
       -> decltype(ctx.out());
 };
 
@@ -1355,15 +1392,19 @@ struct fmt::formatter<cluster_link::model::mirror_topic_metadata>
 };
 
 template<>
-struct fmt::formatter<cluster_link::model::filter_pattern_type>
-  : fmt::formatter<string_view> {
+struct fmt::formatter<cluster_link::model::filter_pattern_type> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
     auto format(cluster_link::model::filter_pattern_type s, format_context& ctx)
       const -> decltype(ctx.out());
 };
 
 template<>
-struct fmt::formatter<cluster_link::model::filter_type>
-  : fmt::formatter<string_view> {
+struct fmt::formatter<cluster_link::model::filter_type> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
     auto format(cluster_link::model::filter_type s, format_context& ctx) const
       -> decltype(ctx.out());
 };
@@ -1413,7 +1454,8 @@ struct fmt::formatter<cluster_link::model::link_state>
 template<>
 struct fmt::formatter<cluster_link::model::metadata>
   : fmt::formatter<string_view> {
-    auto format(const cluster_link::model::metadata& m, format_context& ctx)
+    auto
+    format(const cluster_link::model::metadata& m, format_context& ctx) const
       -> decltype(ctx.out());
 };
 
@@ -1421,8 +1463,8 @@ template<>
 struct fmt::formatter<cluster_link::model::add_mirror_topic_cmd>
   : fmt::formatter<string_view> {
     auto format(
-      const cluster_link::model::add_mirror_topic_cmd& m, format_context& ctx)
-      -> decltype(ctx.out());
+      const cluster_link::model::add_mirror_topic_cmd& m,
+      format_context& ctx) const -> decltype(ctx.out());
 };
 
 template<>
@@ -1430,7 +1472,7 @@ struct fmt::formatter<cluster_link::model::update_mirror_topic_status_cmd>
   : fmt::formatter<string_view> {
     auto format(
       const cluster_link::model::update_mirror_topic_status_cmd& m,
-      format_context& ctx) -> decltype(ctx.out());
+      format_context& ctx) const -> decltype(ctx.out());
 };
 
 template<>
@@ -1438,7 +1480,7 @@ struct fmt::formatter<cluster_link::model::update_mirror_topic_properties_cmd>
   : fmt::formatter<string_view> {
     auto format(
       const cluster_link::model::update_mirror_topic_properties_cmd& m,
-      format_context& ctx) -> decltype(ctx.out());
+      format_context& ctx) const -> decltype(ctx.out());
 };
 
 template<>

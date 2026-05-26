@@ -146,7 +146,7 @@ auto to_admin_type(
   const cluster::data_migrations::migration_metadata& meta) {
     typename StateAdmin<Migration>::type ret;
     ret.id = meta.id;
-    ret.state = fmt::to_string(meta.state);
+    ret.state = fmt::format("{}", meta.state);
     ret.migration = to_admin_type(migration);
     ret.created_timestamp = meta.created_timestamp.value();
     if (meta.completed_timestamp != model::timestamp::missing()) {
@@ -544,8 +544,9 @@ cluster::data_migrations::entities_status
 parse_migrated_entities_status(json::Value& json) {
     cluster::data_migrations::entities_status ret;
 
-    if (auto it = json.FindMember(consumer_groups_data_key);
-        it != json.MemberEnd()) {
+    if (
+      auto it = json.FindMember(consumer_groups_data_key);
+      it != json.MemberEnd()) {
         auto consumer_groups_array = it->value.GetArray();
         ret.groups.reserve(consumer_groups_array.Size());
         for (auto& group : consumer_groups_array) {

@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "base/format_to.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/record.h"
@@ -117,9 +118,10 @@ struct time_based_retention_cfg {
             return *broker_ts;
         }
         // don't use broker time or no broker time available. fallback
-        if (unlikely(
-              use_escape_hatch_for_timestamps_in_the_future
-              && alternative_retention_ts.has_value())) {
+        if (
+          unlikely(
+            use_escape_hatch_for_timestamps_in_the_future
+            && alternative_retention_ts.has_value())) {
             return *alternative_retention_ts;
         }
         // If storage_ignore_timestamps_in_future_sec is disabled, then
@@ -368,7 +370,8 @@ private:
     friend class log_replayer_fixture;
     friend class segment_index_observer;
 
-    friend std::ostream& operator<<(std::ostream&, const segment_index&);
+public:
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 using segment_index_ptr = std::unique_ptr<segment_index>;

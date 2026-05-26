@@ -55,7 +55,10 @@ ctp_stm_state::get_previous_applied_epoch() const noexcept {
 }
 
 std::optional<cluster_epoch>
-ctp_stm_state::get_previous_seen_epoch() const noexcept {
+ctp_stm_state::get_previous_seen_epoch(model::term_id term) const noexcept {
+    if (term > _seen_window_term) {
+        return std::nullopt;
+    }
     return _previous_seen_epoch;
 }
 
@@ -137,7 +140,10 @@ ctp_stm_state::get_max_applied_epoch() const noexcept {
 }
 
 std::optional<cluster_epoch>
-ctp_stm_state::get_max_seen_epoch() const noexcept {
+ctp_stm_state::get_max_seen_epoch(model::term_id term) const noexcept {
+    if (term > _seen_window_term) {
+        return std::nullopt;
+    }
     return _max_seen_epoch;
 }
 
@@ -172,6 +178,16 @@ void ctp_stm_state::set_start_offset(kafka::offset new_offset) noexcept {
 
 kafka::offset ctp_stm_state::start_offset() const noexcept {
     return _start_offset;
+}
+
+void ctp_stm_state::set_allowed_local_start_offset(
+  std::optional<kafka::offset> offset) noexcept {
+    _allowed_local_start_offset = offset;
+}
+
+std::optional<kafka::offset>
+ctp_stm_state::get_allowed_local_start_offset() const noexcept {
+    return _allowed_local_start_offset;
 }
 
 fmt::iterator ctp_stm_state::format_to(fmt::iterator it) const {

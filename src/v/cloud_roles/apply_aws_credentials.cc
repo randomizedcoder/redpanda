@@ -60,7 +60,11 @@ static std::string_view sha_for_verb(boost::beast::http::verb verb) {
 }
 
 apply_aws_credentials::apply_aws_credentials(aws_credentials credentials)
-  : _signature{credentials.service, credentials.region, credentials.access_key_id, credentials.secret_access_key}
+  : _signature{
+      credentials.service,
+      credentials.region,
+      credentials.access_key_id,
+      credentials.secret_access_key}
   , _session_token{credentials.session_token} {}
 
 std::error_code
@@ -103,9 +107,8 @@ void apply_aws_credentials::reset_creds(credentials creds) {
     _session_token = aws_creds.session_token;
 }
 
-std::ostream& apply_aws_credentials::print(std::ostream& os) const {
-    fmt::print(os, "apply_aws_credentials");
-    return os;
+fmt::iterator apply_aws_credentials::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "apply_aws_credentials");
 }
 
 } // namespace cloud_roles

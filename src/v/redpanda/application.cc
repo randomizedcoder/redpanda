@@ -45,6 +45,7 @@
 #include "security/audit/audit_log_manager.h"
 #include "storage/api.h"
 #include "storage/directories.h"
+#include "syschecks/hugepages.h"
 #include "syschecks/syschecks.h"
 #include "utils/file_io.h"
 #include "utils/human.h"
@@ -334,7 +335,11 @@ int application::run(int ac, char** av) {
                     vlog(_log.info, "Shutdown complete.");
                 });
                 // must initialize configuration before services
-                hydrate_config(cfg);
+                auto node_cfg_yaml = hydrate_node_config(cfg);
+                // Cluster config validation uses OpenSSL (e.g. TLS cipher
+                // checks), so crypto must be initialized first.
+                wire_up_and_start_crypto_services();
+                hydrate_cluster_config(node_cfg_yaml);
                 init_crashtracker(app_signal);
                 initialize();
                 check_environment();
@@ -642,7 +647,7 @@ ss::app_template::config application::setup_app_config() {
     return app_cfg;
 }
 
-void application::hydrate_config(const po::variables_map& cfg) {
+YAML::Node application::hydrate_node_config(const po::variables_map& cfg) {
     auto raw_cfg_path = cfg["redpanda-cfg"].as<std::string>();
     // Expand ~/redpanda.yaml to the full path
     if (raw_cfg_path.starts_with("~")) {
@@ -677,18 +682,6 @@ void application::hydrate_config(const po::variables_map& cfg) {
 
         throw;
     }
-
-    auto config_printer = [this](std::string_view service, const auto& cfg) {
-        std::vector<ss::sstring> items;
-        cfg.for_each([&items, &service](const auto& item) {
-            items.push_back(
-              ssx::sformat("{}.{}\t- {}", service, item, item.desc()));
-        });
-        std::sort(items.begin(), items.end());
-        for (const auto& item : items) {
-            vlog(_log.info, "{}", item);
-        }
-    };
 
     ss::smp::invoke_on_all([&config, cfg_path] {
         config::node().load(cfg_path, config);
@@ -728,6 +721,22 @@ void application::hydrate_config(const po::variables_map& cfg) {
                 .as<std::vector<config::node_id_override>>());
         }).get();
     }
+
+    return config;
+}
+
+void application::hydrate_cluster_config(const YAML::Node& config) {
+    auto config_printer = [this](std::string_view service, const auto& cfg) {
+        std::vector<ss::sstring> items;
+        cfg.for_each([&items, &service](const auto& item) {
+            items.push_back(
+              ssx::sformat("{}.{}\t- {}", service, item, item.desc()));
+        });
+        std::sort(items.begin(), items.end());
+        for (const auto& item : items) {
+            vlog(_log.info, "{}", item);
+        }
+    };
 
     // This includes loading from local bootstrap file or legacy
     // config file on first-start or upgrade cases.
@@ -792,6 +801,18 @@ void application::check_environment() {
     syschecks::systemd_message("checking environment (CPU, Mem)").get();
     syschecks::cpu();
     syschecks::memory(config::node().developer_mode());
+    if (config::shard_local_cfg().code_hugepages_enabled()) {
+        syschecks::promote_code_to_hugepages();
+    }
+    _code_hugepages_binding.emplace(
+      config::shard_local_cfg().code_hugepages_enabled.bind());
+    _code_hugepages_binding->watch([this] {
+        if ((*_code_hugepages_binding)()) {
+            syschecks::promote_code_to_hugepages();
+        } else {
+            syschecks::demote_code_from_hugepages();
+        }
+    });
     memory_groups().log_memory_group_allocations(_log);
     storage::directories::initialize(
       config::node().data_directory().as_sstring())

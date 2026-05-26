@@ -160,6 +160,8 @@ class MetricsReporterTest(RedpandaTest):
         # get the last report
         last = metadata.pop()
         assert last["topic_count"] == total_topics
+        assert last["local_topic_count"] == total_topics
+        assert last["cloud_topic_count"] == 0
         assert last["partition_count"] == total_partitions
         assert last["has_kafka_gssapi"] is False
         assert last["has_oidc"] is False
@@ -402,7 +404,7 @@ class SchemaRegistryContextMetricsTest(RedpandaTest):
             num_brokers=1,
             extra_rp_conf={
                 "health_monitor_max_metadata_age": 1000,
-                "schema_registry_enable_qualified_subjects": True,
+                "schema_registry_use_rpc": True,
                 **self.metrics.rp_conf(),
             },
             schema_registry_config=SchemaRegistryConfig(),

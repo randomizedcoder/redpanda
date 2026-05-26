@@ -10,27 +10,20 @@
 #include "cluster/metadata_dissemination_handler.h"
 
 #include "base/likely.h"
-#include "cluster/cluster_utils.h"
 #include "cluster/logger.h"
-#include "cluster/metadata_cache.h"
 #include "cluster/metadata_dissemination_types.h"
 #include "cluster/partition_leaders_table.h"
 #include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "model/timeout_clock.h"
-#include "ssx/async_algorithm.h"
 
-#include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/smp.hh>
 
 #include <boost/range/irange.hpp>
 
-#include <algorithm>
 #include <exception>
-#include <iterator>
 
 namespace cluster {
 metadata_dissemination_handler::metadata_dissemination_handler(
@@ -57,7 +50,7 @@ metadata_dissemination_handler::do_update_leadership(
              std::move(leaders),
              [this](const chunked_vector<ntp_leader_revision>& leaders) {
                  return ss::parallel_for_each(
-                   boost::irange<ss::shard_id>(0, ss::smp::count),
+                   boost::irange<ss::shard_id>(0, ss::this_smp_shard_count()),
                    [this, &leaders](ss::shard_id shard) {
                        return ss::smp::submit_to(shard, [this, &leaders] {
                            return ss::do_for_each(
@@ -85,7 +78,7 @@ make_get_leadership_reply(partition_leaders_table& leaders) {
                                            model::topic_namespace_view tp_ns,
                                            model::partition_id pid,
                                            std::optional<model::node_id> leader,
-                                           model::term_id term) mutable {
+                                           model::term_id term) {
             ret.emplace_back(model::ntp(tp_ns.ns, tp_ns.tp, pid), term, leader);
         });
         co_return get_leadership_reply{

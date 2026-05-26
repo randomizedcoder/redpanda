@@ -19,18 +19,13 @@
 #include "storage/tests/utils/disk_log_builder.h"
 #include "storage/types.h"
 
-#include <seastar/core/file.hh>
 #include <seastar/util/defer.hh>
-#include <seastar/util/later.hh>
 
-#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <exception>
 #include <iostream>
 #include <iterator>
-#include <numeric>
-#include <stdexcept>
 
 using namespace storage; // NOLINT
 
@@ -43,11 +38,10 @@ constexpr model::offset expected_last(model::offset t_offset) {
 
 TEST_F(storage_test_fixture, test_truncate_whole) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     std::vector<model::record_batch_header> headers;
     for (auto i = 0; i < 10; i++) {
         append_random_batches(log, 1, model::term_id(i));
@@ -66,11 +60,10 @@ TEST_F(storage_test_fixture, test_truncate_whole) {
 
 TEST_F(storage_test_fixture, test_truncate_in_the_middle_of_segment) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     append_random_batches(log, 6, model::term_id(0));
     log->flush().get();
 
@@ -98,18 +91,17 @@ TEST_F(storage_test_fixture, test_truncate_in_the_middle_of_segment) {
 
 TEST_F(storage_test_fixture, test_truncate_in_the_middle_of_batch) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
 
     append_batch(
       log, model::test::make_random_batch(model::offset{0}, 10, true));
     append_batch(
       log, model::test::make_random_batch(model::offset{0}, 5, true));
 
-    auto truncate_at = [log](model::offset o) mutable {
+    auto truncate_at = [&log](model::offset o) mutable {
         log->truncate(storage::truncate_config(o)).get();
     };
 
@@ -125,11 +117,10 @@ TEST_F(storage_test_fixture, test_truncate_in_the_middle_of_batch) {
 
 TEST_F(storage_test_fixture, test_truncate_empty_log) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     append_random_batches(log, 1, model::term_id(1));
     log->flush().get();
 
@@ -141,11 +132,10 @@ TEST_F(storage_test_fixture, test_truncate_empty_log) {
 TEST_F(storage_test_fixture, test_truncate_middle_of_old_segment) {
     std::cout.setf(std::ios::unitbuf);
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
 
     // Generate from 10 up to 100 batches
     for (auto i = 0; i < 10; i++) {
@@ -176,11 +166,10 @@ TEST_F(storage_test_fixture, test_truncate_middle_of_old_segment) {
 
 TEST_F(storage_test_fixture, truncate_whole_log_and_then_again) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     std::vector<model::record_batch_header> headers;
     for (auto i = 0; i < 10; i++) {
         append_random_batches(log, 1, model::term_id(i));
@@ -200,11 +189,10 @@ TEST_F(storage_test_fixture, truncate_whole_log_and_then_again) {
 
 TEST_F(storage_test_fixture, truncate_before_read) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     std::vector<model::record_batch_header> headers;
     for (auto i = 0; i < 10; i++) {
         append_random_batches(log, 1, model::term_id(i));
@@ -232,11 +220,10 @@ TEST_F(storage_test_fixture, truncate_before_read) {
 TEST_F(
   storage_test_fixture, test_truncate_in_the_middle_of_segment_and_append) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     append_random_batches(log, 6, model::term_id(0));
     log->flush().get();
 
@@ -269,11 +256,10 @@ TEST_F(
 
 TEST_F(storage_test_fixture, test_truncate_last_single_record_batch) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     auto headers = append_random_batches(
       log,
       15,
@@ -313,8 +299,8 @@ TEST_F(
   test_truncate_whole_log_when_logs_are_garbage_collected) {
     auto cfg = default_log_config(test_dir);
     storage::log_manager mgr = make_log_manager(cfg);
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
 
     auto overrides = std::make_unique<storage::ntp_config::default_overrides>();
@@ -323,11 +309,8 @@ TEST_F(
       = model::cleanup_policy_bitflags::deletion;
     overrides->segment_size = 1024;
 
-    auto log = mgr
-                 .manage(
-                   storage::ntp_config(
-                     ntp, mgr.config().base_dir, std::move(overrides)))
-                 .get();
+    auto log = manage_log(
+      mgr, {ntp, mgr.config().base_dir, std::move(overrides)});
     append_random_batches(log, 10, model::term_id(0));
     append_random_batches(log, 10, model::term_id(0));
     log->flush().get();
@@ -411,10 +394,10 @@ TEST_F(storage_test_fixture, truncated_segment_recovery) {
 
     {
         storage::log_manager mgr = make_log_manager(cfg);
-        SUCCEED() << "config: " << mgr.config();
         auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+        SUCCEED() << "config: " << mgr.config();
 
-        auto log = mgr.manage(storage::ntp_config(ntp, cfg.base_dir)).get();
+        auto log = manage_log(mgr, {ntp, cfg.base_dir});
 
         append_random_batches(log, 10, model::term_id(0));
         log->flush().get();
@@ -447,7 +430,7 @@ TEST_F(storage_test_fixture, truncated_segment_recovery) {
 
     auto rec_deferred = ss::defer(
       [&rec_mgr]() mutable { rec_mgr.stop().get(); });
-    auto rec_log = rec_mgr.manage(storage::ntp_config(ntp, cfg.base_dir)).get();
+    auto rec_log = manage_log(rec_mgr, {ntp, cfg.base_dir});
     auto& impl = *rec_log;
 
     ASSERT_EQ(impl.segment_count(), 3);
@@ -480,8 +463,8 @@ TEST_F(storage_test_fixture, truncated_segment_recovery) {
 TEST_F(storage_test_fixture, test_concurrent_prefix_truncate_and_gc) {
     auto cfg = default_log_config(test_dir);
     storage::log_manager mgr = make_log_manager(cfg);
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
 
     auto overrides = std::make_unique<storage::ntp_config::default_overrides>();
@@ -490,11 +473,8 @@ TEST_F(storage_test_fixture, test_concurrent_prefix_truncate_and_gc) {
       = model::cleanup_policy_bitflags::deletion;
     overrides->segment_size = 1024;
 
-    auto log = mgr
-                 .manage(
-                   storage::ntp_config(
-                     ntp, mgr.config().base_dir, std::move(overrides)))
-                 .get();
+    auto log = manage_log(
+      mgr, {ntp, mgr.config().base_dir, std::move(overrides)});
 
     append_random_batches(log, 10, model::term_id(0));
     auto lstats = log->offsets();
@@ -537,17 +517,14 @@ TEST_F(storage_test_fixture, test_concurrent_prefix_truncate_and_gc) {
 TEST_F(storage_test_fixture, test_concurrent_truncate_and_compaction) {
     auto cfg = default_log_config(test_dir);
     storage::log_manager mgr = make_log_manager(cfg);
-    auto deferred = ss::defer([&]() mutable { mgr.stop().get(); });
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
     auto ntp = model::ntp("default", "test", 0);
 
     auto overrides = std::make_unique<storage::ntp_config::default_overrides>();
     overrides->cleanup_policy_bitflags
       = model::cleanup_policy_bitflags::compaction;
-    auto log = mgr
-                 .manage(
-                   storage::ntp_config(
-                     ntp, mgr.config().base_dir, std::move(overrides)))
-                 .get();
+    auto log = manage_log(
+      mgr, {ntp, mgr.config().base_dir, std::move(overrides)});
     auto ts = model::timestamp::now() - model::timestamp(1000);
     for (int seg = 0; seg < 2; seg++) {
         for (int i = 0; i < 5; i++) {
@@ -643,18 +620,17 @@ TEST_F(storage_test_fixture, test_concurrent_truncate_and_compaction) {
 
 TEST_F(storage_test_fixture, test_prefix_truncate_in_the_middle_of_batch) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
 
     append_batch(
       log, model::test::make_random_batch(model::offset{0}, 10, true));
     append_batch(
       log, model::test::make_random_batch(model::offset{0}, 5, true));
 
-    auto truncate_at = [log](model::offset o) mutable {
+    auto truncate_at = [&log](model::offset o) mutable {
         log->truncate_prefix(storage::truncate_prefix_config(o)).get();
     };
 
@@ -683,11 +659,10 @@ TEST_F(storage_test_fixture, test_prefix_truncate_in_the_middle_of_batch) {
 
 TEST_F(storage_test_fixture, test_prefix_truncate_then_truncate_all) {
     storage::log_manager mgr = make_log_manager();
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
 
     append_batch(
       log, model::test::make_random_batch(model::offset{0}, 10, true));
@@ -715,11 +690,10 @@ TEST_F(storage_test_fixture, test_prefix_truncate_then_truncate_all) {
 TEST_F(storage_test_fixture, test_index_max_timestamp_update) {
     auto cfg = default_log_config(test_dir);
     storage::log_manager mgr = make_log_manager(cfg);
-    SUCCEED() << "config: " << mgr.config();
     auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    SUCCEED() << "config: " << mgr.config();
     auto ntp = model::ntp("default", "test", 0);
-    auto log
-      = mgr.manage(storage::ntp_config(ntp, mgr.config().base_dir)).get();
+    auto log = manage_log(mgr, {ntp, mgr.config().base_dir});
     append_batch(
       log,
       model::test::make_random_batch(

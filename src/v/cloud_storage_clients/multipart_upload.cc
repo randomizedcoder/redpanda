@@ -15,6 +15,7 @@
 #include "ssx/future-util.h"
 
 #include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 
 namespace cloud_storage_clients {
 
@@ -26,27 +27,12 @@ public:
     explicit multipart_data_sink_impl(multipart_upload_ref upload)
       : _upload(std::move(upload)) {}
 
-    ss::future<> put(ss::temporary_buffer<char> buf) final {
-        iobuf data;
-        data.append(std::move(buf));
-        return _upload->put(std::move(data));
-    }
-
-    ss::future<> put(ss::net::packet data) final {
-        auto buffers = data.release();
+    ss::future<> put(scattered_buffer_view data) final {
         iobuf iobuf_data;
-        for (auto& buf : buffers) {
+        for (auto& buf : data) {
             iobuf_data.append(std::move(buf));
         }
         return _upload->put(std::move(iobuf_data));
-    }
-
-    ss::future<> put(std::vector<ss::temporary_buffer<char>> all) final {
-        iobuf data;
-        for (auto& buf : all) {
-            data.append(std::move(buf));
-        }
-        return _upload->put(std::move(data));
     }
 
     ss::future<> flush() final {
@@ -82,7 +68,9 @@ multipart_upload::~multipart_upload() {
 
 ss::future<> multipart_upload::put(iobuf data) {
     if (_finalized) {
-        throw std::logic_error("Cannot put() on finalized multipart upload");
+        // May occur if a multipart upload is aborted with pending data and then
+        // its stream is closed.
+        co_return;
     }
 
     // Append data to buffer
@@ -153,7 +141,7 @@ ss::future<> multipart_upload::complete() {
               "Multipart upload final part failed, aborting: {}",
               ex);
             co_await abort_on_error();
-            std::rethrow_exception(ex);
+            co_await ss::coroutine::return_exception_ptr(std::move(ex));
         }
     }
     // Complete the multipart upload
@@ -172,7 +160,7 @@ ss::future<> multipart_upload::complete() {
           "Multipart upload completion failed, aborting: {}",
           ex);
         co_await abort_on_error();
-        std::rethrow_exception(ex);
+        co_await ss::coroutine::return_exception_ptr(std::move(ex));
     }
 }
 

@@ -21,6 +21,8 @@ import (
 	"github.com/fatih/color"
 	mTerm "github.com/moby/term"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/acl"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/ai"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/benchmark"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cloud"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/cluster"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/connect"
@@ -54,6 +56,7 @@ func Execute() {
 	}
 
 	p := new(config.Params)
+	var printTree bool
 	runXHelp := func() {
 		for _, o := range p.FlagOverrides {
 			switch o {
@@ -67,18 +70,24 @@ func Execute() {
 			os.Exit(0)
 		}
 	}
-	cobra.OnInitialize(func() {
-		runXHelp()
-		zap.ReplaceGlobals(p.Logger())
-	})
 	root := &cobra.Command{
-		Use:     "rpk",
-		Short:   "rpk is the Redpanda CLI & toolbox",
-		Long:    "",
+		Use:   "rpk",
+		Short: "rpk is the Redpanda CLI & toolbox",
+		Long: `rpk is the Redpanda CLI & toolbox.
+
+Use --print-tree to emit the full command tree as JSON.`,
 		Version: version.Pretty(),
 
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	}
+	cobra.OnInitialize(func() {
+		runXHelp()
+		if printTree {
+			printTreeAndExit(root)
+		}
+		zap.ReplaceGlobals(p.Logger())
+	})
+	root.Flags().BoolVar(&printTree, "print-tree", false, "Print the rpk command tree as JSON and exit; intended for LLM/automation tooling")
 	pf := root.PersistentFlags()
 
 	searchLocal, _ := os.UserConfigDir()
@@ -98,7 +107,7 @@ func Execute() {
 
 	root.RegisterFlagCompletionFunc("config-opt", func(_ *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		var opts []string
-		for _, line := range strings.Split(config.ParamsList(), "\n") {
+		for line := range strings.SplitSeq(config.ParamsList(), "\n") {
 			opt := strings.SplitN(line, "=", 2)
 			if len(opt) != 2 {
 				continue
@@ -114,6 +123,8 @@ func Execute() {
 
 	root.AddCommand(
 		acl.NewCommand(fs, p),
+		ai.NewCommand(fs, p, osExec),
+		benchmark.NewCommand(fs, p),
 		cloud.NewCommand(fs, p, osExec),
 		cluster.NewCommand(fs, p),
 		container.NewCommand(fs, p),
@@ -122,7 +133,7 @@ func Execute() {
 		debug.NewCommand(fs, p),
 		generate.NewCommand(fs, p),
 		group.NewCommand(fs, p),
-		plugincmd.NewCommand(fs),
+		plugincmd.NewCommand(fs, p),
 		registry.NewCommand(fs, p),
 		security.NewCommand(fs, p),
 		shadow.NewCommand(fs, p),

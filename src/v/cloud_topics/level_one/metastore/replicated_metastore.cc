@@ -90,19 +90,19 @@ meta_to_rpc_compact_update(const metastore::compaction_update& update) {
 // objects up by the appropriate metastore topic partition.
 class replicated_object_builder : public metastore::object_metadata_builder {
 public:
-    replicated_object_builder(leader_router& fe)
+    explicit replicated_object_builder(leader_router& fe)
       : object_metadata_builder()
       , fe_(fe) {}
     ~replicated_object_builder() override {}
     replicated_object_builder(const replicated_object_builder&) = delete;
     replicated_object_builder(replicated_object_builder&&) = delete;
-    replicated_object_builder& operator=(const replicated_object_builder&)
-      = delete;
+    replicated_object_builder&
+    operator=(const replicated_object_builder&) = delete;
     replicated_object_builder& operator=(replicated_object_builder&&) = delete;
 
-    std::expected<object_id, error>
+    ss::future<std::expected<object_id, error>>
     get_or_create_object_for(const model::topic_id_partition&) override;
-    std::expected<object_id, error>
+    ss::future<std::expected<object_id, error>>
     create_object_for(const model::topic_id_partition&) override;
     std::expected<void, error> remove_pending_object(object_id) override;
     std::expected<void, error>
@@ -112,6 +112,9 @@ public:
     bool is_empty() const override;
 
 private:
+    ss::future<std::expected<object_id, error>>
+    get_or_request_from_pool(model::partition_id metastore_pid);
+
     friend class cloud_topics::l1::replicated_metastore;
 
     struct partitioned_objects {
@@ -122,42 +125,74 @@ private:
         chunked_vector<metastore::object_metadata> finished_objects_;
     };
     leader_router& fe_;
+    // TODO: let callers decide.
+    static constexpr size_t pool_refill_size = 1;
+    chunked_hash_map<model::partition_id, chunked_vector<object_id>> pool_;
     chunked_hash_map<model::partition_id, partitioned_objects> partitions_;
 };
 
-std::expected<object_id, replicated_object_builder::error>
+ss::future<std::expected<object_id, replicated_object_builder::error>>
+replicated_object_builder::get_or_request_from_pool(
+  model::partition_id metastore_pid) {
+    auto& pool = pool_[metastore_pid];
+    if (pool.empty()) {
+        auto req = rpc::preregister_objects_request{
+          .metastore_partition = metastore_pid,
+          .count = static_cast<uint32_t>(pool_refill_size),
+        };
+        auto reply_fut = co_await ss::coroutine::as_future(
+          fe_.preregister_objects(std::move(req)));
+        if (reply_fut.failed()) {
+            auto ex = reply_fut.get_exception();
+            co_return std::unexpected(
+              error{fmt::format("preregister_objects() failed: {}", ex)});
+        }
+        auto reply = reply_fut.get();
+        if (reply.ec != rpc::errc::ok) {
+            co_return std::unexpected(
+              error{fmt::format("preregister_objects() error: {}", reply.ec)});
+        }
+        if (reply.object_ids.empty()) {
+            co_return std::unexpected(
+              error{fmt::format("preregister_objects() missing object IDs")});
+        }
+        pool = std::move(reply.object_ids);
+    }
+    auto oid = pool.back();
+    pool.pop_back();
+    if (pool.empty()) {
+        pool_.erase(metastore_pid);
+    }
+    partitions_[metastore_pid].pending_objects_[oid] = {};
+    co_return oid;
+}
+
+ss::future<std::expected<object_id, replicated_object_builder::error>>
 replicated_object_builder::get_or_create_object_for(
   const model::topic_id_partition& tidp) {
     auto metastore_pid = fe_.metastore_partition(tidp);
     if (!metastore_pid) {
-        return std::unexpected(
+        co_return std::unexpected(
           error{"could not determine metastore partition for "
                 "get_or_create_object_for()"});
     }
     auto& partition_objects = partitions_[*metastore_pid];
-
-    if (partition_objects.pending_objects_.empty()) {
-        auto oid = create_object_id();
-        partition_objects.pending_objects_[oid] = {};
-        return oid;
+    if (!partition_objects.pending_objects_.empty()) {
+        co_return partition_objects.pending_objects_.begin()->first;
     }
-    return partition_objects.pending_objects_.begin()->first;
+    co_return co_await get_or_request_from_pool(*metastore_pid);
 }
 
-std::expected<object_id, replicated_object_builder::error>
+ss::future<std::expected<object_id, replicated_object_builder::error>>
 replicated_object_builder::create_object_for(
   const model::topic_id_partition& tidp) {
     auto metastore_pid = fe_.metastore_partition(tidp);
     if (!metastore_pid) {
-        return std::unexpected(
+        co_return std::unexpected(
           error{
             "could not determine metastore partition for create_object_for()"});
     }
-    auto& partition_objects = partitions_[*metastore_pid];
-
-    auto oid = create_object_id();
-    partition_objects.pending_objects_[oid] = {};
-    return oid;
+    co_return co_await get_or_request_from_pool(*metastore_pid);
 }
 
 std::expected<void, replicated_object_builder::error>
@@ -185,6 +220,16 @@ replicated_object_builder::remove_pending_object(object_id oid) {
 std::expected<void, replicated_object_builder::error>
 replicated_object_builder::add(
   object_id oid, metastore::object_metadata::ntp_metadata ntp_meta) {
+    if (ntp_meta.base_offset > ntp_meta.last_offset) {
+        return std::unexpected(
+          error{fmt::format(
+            "Metadata has inverted offsets for partition {}, object {}: "
+            "base_offset {} > last_offset {}",
+            ntp_meta.tidp,
+            oid,
+            ntp_meta.base_offset,
+            ntp_meta.last_offset)});
+    }
     auto metastore_pid = fe_.metastore_partition(ntp_meta.tidp);
     if (!metastore_pid) {
         return std::unexpected(
@@ -245,7 +290,21 @@ rpc_to_meta_extent_metadata(chunked_vector<rpc::extent_metadata> v) {
     metastore::extent_metadata_vec res;
     res.reserve(v.size());
     for (auto& e : v) {
-        res.emplace_back(e.base_offset, e.last_offset, e.max_timestamp);
+        std::optional<metastore::extent_object_info> obj_info;
+        if (e.object_info.has_value()) {
+            obj_info = metastore::extent_object_info{
+              .oid = e.object_info->oid,
+              .footer_pos = e.object_info->footer_pos,
+              .object_size = e.object_info->object_size,
+            };
+        }
+        res.push_back(
+          metastore::extent_metadata{
+            .base_offset = e.base_offset,
+            .last_offset = e.last_offset,
+            .max_timestamp = e.max_timestamp,
+            .object_info = std::move(obj_info),
+          });
     }
     return res;
 }
@@ -320,6 +379,7 @@ replicated_metastore::get_size(const model::topic_id_partition& tidp) {
 
     metastore::size_response resp;
     resp.size = reply.size;
+    resp.num_extents = reply.num_extents;
     co_return resp;
 }
 
@@ -394,7 +454,8 @@ replicated_metastore::add_objects(
 
 ss::future<std::expected<void, metastore::errc>>
 replicated_metastore::replace_objects(
-  const metastore::object_metadata_builder& builder) {
+  const metastore::object_metadata_builder& builder,
+  const metastore::replace_epoch_map_t& epoch_map) {
     auto& replicated_builder = static_cast<const replicated_object_builder&>(
       builder);
 
@@ -407,6 +468,28 @@ replicated_metastore::replace_objects(
             co_return std::unexpected(metastore::errc::invalid_request);
         }
     }
+    chunked_hash_map<
+      model::partition_id,
+      chunked_hash_map<
+        model::topic_id_partition,
+        partition_state::compaction_epoch_t>>
+      epochs_by_partition;
+    for (const auto& [tp, epoch] : epoch_map) {
+        auto metastore_partition = fe_.metastore_partition(tp);
+        if (!metastore_partition) {
+            vlog(cd_log.warn, "Unable to get metastore partition for {}", tp);
+            co_return std::unexpected(errc::transport_error);
+        }
+        if (!replicated_builder.partitions_.contains(*metastore_partition)) {
+            vlog(
+              cd_log.error,
+              "Expected objects for partition {}",
+              *metastore_partition);
+            co_return std::unexpected(errc::invalid_request);
+        }
+        epochs_by_partition[*metastore_partition].emplace(
+          tp, partition_state::compaction_epoch_t{epoch()});
+    }
     for (auto& [partition_id, partition_objects] :
          replicated_builder.partitions_) {
         rpc::replace_objects_request req;
@@ -416,9 +499,10 @@ replicated_metastore::replace_objects(
             new_objects.emplace_back(meta_to_rpc_obj(obj));
         }
         req.new_objects = std::move(new_objects);
-
-        // Empty compaction updates for basic replace
-        req.compaction_updates.clear();
+        auto it = epochs_by_partition.find(partition_id);
+        if (it != epochs_by_partition.end()) {
+            req.expected_epochs = std::move(it->second);
+        }
         auto reply_fut = co_await ss::coroutine::as_future(
           fe_.replace_objects(std::move(req)));
         if (reply_fut.failed()) {
@@ -441,23 +525,26 @@ replicated_metastore::replace_objects(
 ss::future<std::expected<void, metastore::errc>>
 replicated_metastore::set_start_offset(
   const model::topic_id_partition& tidp, kafka::offset offset) {
-    rpc::set_start_offset_request req;
-    req.tp = tidp;
-    req.start_offset = offset;
+    while (true) {
+        rpc::set_start_offset_request req;
+        req.tp = tidp;
+        req.start_offset = offset;
 
-    auto reply_fut = co_await ss::coroutine::as_future(
-      fe_.set_start_offset(std::move(req)));
-    if (reply_fut.failed()) {
-        auto ex = reply_fut.get_exception();
-        vlog(cd_log.warn, "Error while sending request: {}", ex);
-        co_return std::unexpected(metastore::errc::transport_error);
+        auto reply_fut = co_await ss::coroutine::as_future(
+          fe_.set_start_offset(std::move(req)));
+        if (reply_fut.failed()) {
+            auto ex = reply_fut.get_exception();
+            vlog(cd_log.warn, "Error while sending request: {}", ex);
+            co_return std::unexpected(metastore::errc::transport_error);
+        }
+        auto reply = reply_fut.get();
+        if (reply.ec != rpc::errc::ok) {
+            co_return std::unexpected(rpc_to_meta_errc(reply.ec));
+        }
+        if (!reply.has_more) {
+            co_return std::expected<void, metastore::errc>{};
+        }
     }
-    auto reply = reply_fut.get();
-    if (reply.ec != rpc::errc::ok) {
-        co_return std::unexpected(rpc_to_meta_errc(reply.ec));
-    }
-
-    co_return std::expected<void, metastore::errc>{};
 }
 
 ss::future<std::expected<metastore::topic_removal_response, metastore::errc>>
@@ -470,35 +557,37 @@ replicated_metastore::remove_topics(
     }
     static constexpr auto max_rpc_concurrency = 10;
     chunked_hash_set<model::topic_id> not_removed;
+    std::optional<rpc::errc> first_error;
     auto fut = co_await ss::coroutine::as_future(
       ss::max_concurrent_for_each(
         std::views::iota(0, *num_metastore_partitions),
         max_rpc_concurrency,
-        [this, &topics, &not_removed](int pid) {
+        [this, &topics, &not_removed, &first_error](int pid) {
             return fe_
               .remove_topics(
                 rpc::remove_topics_request{
                   .metastore_partition = model::partition_id{pid},
                   .topics = topics.copy(),
                 })
-              .then(
-                [&not_removed, &topics](const rpc::remove_topics_reply& repl) {
-                    if (topics.size() == not_removed.size()) {
-                        // Minor optimization: exit early if the set needing
-                        // retry is the complete set of topics to remove.
-                        return;
-                    }
-                    if (repl.ec != rpc::errc::ok) {
-                        not_removed.insert(topics.begin(), topics.end());
-                    }
-                    not_removed.insert(
-                      repl.not_removed.begin(), repl.not_removed.end());
-                });
+              .then([&not_removed,
+                     &first_error](const rpc::remove_topics_reply& repl) {
+                  if (repl.ec != rpc::errc::ok) {
+                      if (!first_error.has_value()) {
+                          first_error = repl.ec;
+                      }
+                      return;
+                  }
+                  not_removed.insert(
+                    repl.not_removed.begin(), repl.not_removed.end());
+              });
         }));
     if (fut.failed()) {
         auto ex = fut.get_exception();
         vlog(cd_log.warn, "Error while sending topic removal requests: {}", ex);
         co_return std::unexpected(metastore::errc::transport_error);
+    }
+    if (first_error.has_value()) {
+        co_return std::unexpected(rpc_to_meta_errc(*first_error));
     }
     co_return topic_removal_response{
       .not_removed = std::move(not_removed),
@@ -667,7 +756,7 @@ replicated_metastore::compact_objects(
     }
     for (auto& [partition_id, partition_objects] :
          replicated_builder.partitions_) {
-        rpc::replace_objects_request req;
+        rpc::compact_objects_request req;
         req.metastore_partition = partition_id;
         chunked_vector<new_object> new_objects;
         for (auto& obj : partition_objects.finished_objects_) {
@@ -678,7 +767,7 @@ replicated_metastore::compact_objects(
         req.compaction_updates = std::move(
           compaction_updates_by_partition.at(partition_id));
         auto reply_fut = co_await ss::coroutine::as_future(
-          fe_.replace_objects(std::move(req)));
+          fe_.compact_objects(std::move(req)));
         if (reply_fut.failed()) {
             auto ex = reply_fut.get_exception();
             vlog(cd_log.warn, "Error while sending request: {}", ex);
@@ -826,12 +915,83 @@ replicated_metastore::get_compaction_infos(
     co_return resp;
 }
 
+ss::future<std::expected<metastore::leveling_info_map, metastore::errc>>
+replicated_metastore::get_leveling_infos(
+  const chunked_vector<leveling_info_spec>& specs) {
+    chunked_hash_map<model::partition_id, rpc::get_leveling_infos_request>
+      partitioned_reqs;
+    metastore::leveling_info_map resp;
+    for (const auto& spec : specs) {
+        const auto& tp = spec.tidp;
+        auto metastore_partition = fe_.metastore_partition(tp);
+        if (!metastore_partition) {
+            vlog(cd_log.warn, "Unable to get metastore partition for {}", tp);
+            resp.insert_or_assign(tp, std::unexpected(errc::transport_error));
+            continue;
+        }
+        auto [it, inserted] = partitioned_reqs.try_emplace(
+          metastore_partition.value(),
+          rpc::get_leveling_infos_request{
+            .metastore_partition = metastore_partition.value()});
+        auto& req = it->second;
+
+        req.logs.push_back(
+          rpc::get_leveling_info_request{
+            .tp = tp,
+            .min_acceptable_extent_bytes = spec.min_acceptable_extent_bytes});
+    }
+
+    static constexpr auto max_rpc_concurrency = 10;
+    auto fut = co_await ss::coroutine::as_future(
+      ss::max_concurrent_for_each(
+        partitioned_reqs,
+        max_rpc_concurrency,
+        [this, &resp](auto& partition_and_request) {
+            auto& request = partition_and_request.second;
+            auto logs = request.logs.copy();
+            return fe_.get_leveling_infos(std::move(request))
+              .then([&resp, logs = std::move(logs)](
+                      rpc::get_leveling_infos_reply reply) {
+                  if (reply.ec != rpc::errc::ok) {
+                      for (const auto& l : logs) {
+                          resp[l.tp] = std::unexpected(
+                            rpc_to_meta_errc(reply.ec));
+                      }
+                      return;
+                  }
+
+                  for (auto& [log, log_reply] : reply.responses) {
+                      if (log_reply.ec == rpc::errc::ok) {
+                          metastore::leveling_info_response log_resp{
+                            .ranges = std::move(log_reply.ranges),
+                            .epoch = metastore::compaction_epoch{
+                              log_reply.epoch()}};
+                          resp.insert_or_assign(log, std::move(log_resp));
+                      } else {
+                          resp.insert_or_assign(
+                            log,
+                            std::unexpected(rpc_to_meta_errc(log_reply.ec)));
+                      }
+                  }
+              });
+        }));
+
+    if (fut.failed()) {
+        auto e = fut.get_exception();
+        vlog(cd_log.warn, "Error while sending leveling info requests: {}", e);
+        co_return std::unexpected(metastore::errc::transport_error);
+    }
+
+    co_return resp;
+}
+
 ss::future<std::expected<metastore::extent_metadata_response, metastore::errc>>
 replicated_metastore::get_extent_metadata_forwards(
   const model::topic_id_partition& tidp,
   kafka::offset min_offset,
   kafka::offset max_offset,
-  size_t max_num_extents) {
+  size_t max_num_extents,
+  include_object_metadata include_object_metadata) {
     static constexpr auto o = rpc::get_extent_metadata_request::order::forwards;
 
     rpc::get_extent_metadata_request req;
@@ -840,6 +1000,7 @@ replicated_metastore::get_extent_metadata_forwards(
     req.max_offset = max_offset;
     req.max_num_extents = max_num_extents;
     req.o = o;
+    req.include_object_metadata = bool(include_object_metadata);
 
     auto reply_fut = co_await ss::coroutine::as_future(
       fe_.get_extent_metadata(std::move(req)));

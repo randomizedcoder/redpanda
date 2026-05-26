@@ -2,7 +2,6 @@
 #include "config/mock_property.h"
 #include "kafka/server/datalake_throttle_manager.h"
 #include "random/generators.h"
-#include "ssx/future-util.h"
 #include "test_utils/async.h"
 #include "test_utils/test.h"
 
@@ -86,7 +85,7 @@ ss::future<> mark_producers_on_random_shards(
   ss::sharded<kafka::datalake_throttle_manager>& mgr, int producer_cnt) {
     for (auto i : std::ranges::views::iota(0, producer_cnt)) {
         auto shard = random_generators::get_int<uint32_t>(
-          0, ss::smp::count - 1);
+          0, ss::this_smp_shard_count() - 1);
         co_await mgr.invoke_on(
           shard, [i](kafka::datalake_throttle_manager& local_mgr) {
               local_mgr.mark_datalake_producer(fmt::format("producer-{}", i));
@@ -156,7 +155,8 @@ TEST_F(IcebergThrottlingManagerTest, TestProducerEviction) {
 
 TEST_F(IcebergThrottlingManagerTest, TestHandlingAnonymousProducers) {
     // mark anonymous producer on random shard
-    auto shard = random_generators::get_int<uint32_t>(0, ss::smp::count - 1);
+    auto shard = random_generators::get_int<uint32_t>(
+      0, ss::this_smp_shard_count() - 1);
     manager
       .invoke_on(
         shard,

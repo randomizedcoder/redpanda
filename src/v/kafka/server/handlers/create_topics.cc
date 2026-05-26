@@ -9,7 +9,6 @@
 
 #include "kafka/server/handlers/create_topics.h"
 
-#include "cluster/cluster_utils.h"
 #include "cluster/metadata_cache.h"
 #include "cluster/topics_frontend.h"
 #include "cluster/types.h"
@@ -19,7 +18,7 @@
 #include "kafka/protocol/timeout.h"
 #include "kafka/protocol/types.h"
 #include "kafka/server/connection_context.h"
-#include "kafka/server/handlers/configs/config_response_utils.h"
+#include "kafka/server/handlers/topics/sr_context_validator.h"
 #include "kafka/server/handlers/topics/topic_utils.h"
 #include "kafka/server/handlers/topics/types.h"
 #include "kafka/server/handlers/topics/validators.h"
@@ -27,13 +26,10 @@
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "security/acl.h"
-#include "utils/to_string.h"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/log.hh>
-
-#include <fmt/ostream.h>
 
 #include <array>
 #include <chrono>
@@ -83,6 +79,7 @@ bool is_supported(std::string_view name) {
        topic_property_iceberg_partition_spec,
        topic_property_iceberg_invalid_record_action,
        topic_property_iceberg_target_lag_ms,
+       topic_property_schema_registry_context,
        topic_property_min_cleanable_dirty_ratio,
        topic_property_min_compaction_lag_ms,
        topic_property_max_compaction_lag_ms,
@@ -91,10 +88,11 @@ bool is_supported(std::string_view name) {
        topic_property_message_timestamp_after_max_ms,
        topic_property_redpanda_storage_mode});
 
-    if (std::any_of(
-          supported_configs.begin(),
-          supported_configs.end(),
-          [name](std::string_view p) { return name == p; })) {
+    if (
+      std::any_of(
+        supported_configs.begin(),
+        supported_configs.end(),
+        [name](std::string_view p) { return name == p; })) {
         return true;
     }
 
@@ -122,6 +120,7 @@ using validators = make_validator_types<
   iceberg_config_validator,
   iceberg_invalid_record_action_validator,
   iceberg_target_lag_ms_validator,
+  schema_registry_context_create_validator,
   min_max_compaction_lag_ms_validator,
   storage_mode_config_validator>;
 
@@ -318,7 +317,9 @@ ss::future<response_ptr> create_topics_handler::handle(
       begin,
       valid_range_end,
       std::back_inserter(response.data.topics),
-      validators{});
+      validators{},
+      ctx.feature_table().local_is_initialized() ? &ctx.feature_table().local()
+                                                 : nullptr);
 
     // Print log if not supported configuration options are present
     for (auto& r : boost::make_iterator_range(begin, valid_range_end)) {
@@ -352,9 +353,10 @@ ss::future<response_ptr> create_topics_handler::handle(
           std::back_inserter(response.data.topics),
           [&ctx](const creatable_topic& t) {
               auto result = generate_successfull_result(t);
-              if (ctx.metadata_cache().contains(
-                    model::topic_namespace_view{
-                      model::kafka_namespace, t.name})) {
+              if (
+                ctx.metadata_cache().contains(
+                  model::topic_namespace_view{
+                    model::kafka_namespace, t.name})) {
                   result.error_code = error_code::topic_already_exists;
                   return result;
               }

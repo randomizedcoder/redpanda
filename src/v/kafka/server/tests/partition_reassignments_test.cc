@@ -7,22 +7,17 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0
 
-#include "absl/container/flat_hash_map.h"
-#include "config/configuration.h"
 #include "container/chunked_vector.h"
 #include "kafka/protocol/alter_partition_reassignments.h"
 #include "kafka/protocol/list_partition_reassignments.h"
-#include "kafka/protocol/metadata.h"
 #include "kafka/protocol/schemata/alter_partition_reassignments_request.h"
 #include "kafka/protocol/schemata/list_partition_reassignments_request.h"
-#include "kafka/server/handlers/topics/types.h"
 #include "model/namespace.h"
 #include "redpanda/tests/fixture.h"
 #include "test_utils/boost_fixture.h"
 
 #include <seastar/core/loop.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/util/defer.hh>
 
 #include <optional>
 
@@ -40,7 +35,7 @@ public:
         ss::parallel_for_each(
           boost::irange(0, partitions),
           [this, tp_ns](int i) {
-              return wait_for_partition_offset(
+              return wait_for_committed_offset(
                 model::ntp(tp_ns.ns, tp_ns.tp, model::partition_id(i)),
                 model::offset(0));
           })
@@ -65,8 +60,7 @@ public:
     kafka::list_partition_reassignments_response list_partition_reassignments(
       kafka::client::transport& client,
       std::optional<chunked_vector<kafka::list_partition_reassignments_topics>>
-        topics
-      = std::nullopt) {
+        topics = std::nullopt) {
         kafka::list_partition_reassignments_request req;
         req.data.topics = std::move(topics);
         return client.dispatch(std::move(req), kafka::api_version(0)).get();

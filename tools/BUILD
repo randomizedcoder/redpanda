@@ -3,6 +3,8 @@ load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_python//python:defs.bzl", "py_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
+exports_files(["run-cov"])
+
 buildifier(
     name = "buildifier.check",
     exclude_patterns = [
@@ -52,6 +54,7 @@ py_binary(
         "--minio_executable $(rootpath //bazel/thirdparty:minio)",
         "--prometheus $(rootpath //bazel/thirdparty:prometheus)",
         "--grafana $(rootpath //bazel/thirdparty:grafana)",
+        "--iceberg-catalog-jar $(rootpath //tests/java/iceberg-rest-catalog:iceberg_rest_catalog_jar)",
         "--lsan_suppression_file $(rootpath //:lsan_suppressions)",
         "--ubsan_suppression_file $(rootpath //:ubsan_suppressions)",
     ],
@@ -63,6 +66,7 @@ py_binary(
         "//bazel/thirdparty:prometheus",
         "//src/go/rpk/cmd/rpk",
         "//src/v/redpanda",
+        "//tests/java/iceberg-rest-catalog:iceberg_rest_catalog_jar",
     ],
     visibility = ["//visibility:public"],
     deps = DEV_CLUSTER_PYTHON_DEPS,

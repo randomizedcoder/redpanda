@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
@@ -37,8 +38,7 @@ class probe;
 class log {
 public:
     explicit log(ntp_config cfg) noexcept
-      : _config(std::move(cfg))
-      , _stm_manager(ss::make_lw_shared<storage::stm_manager>()) {}
+      : _config(std::move(cfg)) {}
     log(log&&) noexcept = delete;
     log& operator=(log&&) noexcept = delete;
     log(const log&) = delete;
@@ -130,7 +130,7 @@ public:
     // Base offset of the first batch in the most recent term stored in log
     virtual model::offset find_last_term_start_offset() const = 0;
     virtual model::timestamp start_timestamp() const = 0;
-    virtual std::ostream& print(std::ostream& o) const = 0;
+    virtual fmt::iterator format_to(fmt::iterator it) const = 0;
     virtual std::optional<model::term_id> get_term(model::offset) const = 0;
     virtual std::optional<model::offset>
       get_term_last_offset(model::term_id) const = 0;
@@ -157,9 +157,8 @@ public:
      *
      */
     virtual ss::future<model::offset> monitor_eviction(ss::abort_source&) = 0;
-    ss::lw_shared_ptr<storage::stm_manager> stm_manager() {
-        return _stm_manager;
-    }
+
+    virtual ss::lw_shared_ptr<storage::stm_hookset> stm_hookset() = 0;
 
     virtual size_t size_bytes() const = 0;
     // Byte size of the log for all segments after offset 'o'
@@ -185,8 +184,7 @@ public:
     offset_range_size(
       model::offset first,
       model::offset last,
-      ss::semaphore::time_point timeout = ss::semaphore::time_point::max())
-      = 0;
+      ss::semaphore::time_point timeout = ss::semaphore::time_point::max()) = 0;
 
     /// Find the offset range based on size requirements
     ///
@@ -195,11 +193,10 @@ public:
     /// acceptable size.
     virtual ss::future<std::optional<offset_range_size_result_t>>
     offset_range_size(
-      model::offset first, offset_range_size_requirements_t target)
-      = 0;
+      model::offset first, offset_range_size_requirements_t target) = 0;
 
-    virtual bool is_compacted(model::offset first, model::offset last) const
-      = 0;
+    virtual bool
+    is_compacted(model::offset first, model::offset last) const = 0;
 
     /// Determine whether an offset range is eligible for compacted reupload by
     /// the archival system.
@@ -216,13 +213,11 @@ public:
     ///   - no-delete policy: all segments have a clean compact timestamp
     /// Otherwise returns true iff all segments have a self compact timestamp
     virtual bool eligible_for_compacted_reupload(
-      model::offset first, model::offset last) const
-      = 0;
+      model::offset first, model::offset last) const = 0;
 
     virtual std::optional<model::offset>
     max_eligible_for_compacted_reupload_offset(
-      model::offset first = model::offset{0}) const
-      = 0;
+      model::offset first = model::offset{0}) const = 0;
 
     /// Mutates the ntp_config stored in the log with the new
     /// topic/partition-level overrides
@@ -278,13 +273,8 @@ public:
 private:
     ntp_config _config;
 
-    friend std::ostream& operator<<(std::ostream& o, const log& lg) {
-        return lg.print(o);
-    }
-
 protected:
     ntp_config& mutable_config() { return _config; }
-    ss::lw_shared_ptr<storage::stm_manager> _stm_manager;
 };
 
 class log_manager;

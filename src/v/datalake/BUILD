@@ -10,7 +10,6 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        "//src/v/base",
         "//src/v/features",
         "//src/v/iceberg:compatibility",
         "//src/v/iceberg:compatibility_types",
@@ -20,8 +19,10 @@ redpanda_cc_library(
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/base",
         "//src/v/iceberg:catalog",
         "//src/v/iceberg:datatypes",
+        "//src/v/iceberg:field_name_comparison",
         "//src/v/iceberg:table_identifier",
         "@seastar",
     ],
@@ -62,13 +63,13 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         ":logger",
-        "//src/v/base",
         "//src/v/iceberg:struct_accessor",
     ],
     visibility = [":__subpackages__"],
     deps = [
         ":partition_key_path",
         ":writer",
+        "//src/v/base",
         "//src/v/container:chunked_hash_map",
         "//src/v/iceberg:datatypes",
         "//src/v/iceberg:partition_key",
@@ -157,6 +158,11 @@ redpanda_cc_library(
         ":types",
         "//src/v/base",
         "//src/v/cluster",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:ntp_callbacks",
+        "//src/v/cluster:partition_properties_stm",
+        "//src/v/cluster:topic_table",
+        "//src/v/cluster:types",
         "//src/v/cluster/utils:partition_change_notifier_api",
         "//src/v/config",
         "//src/v/container:chunked_hash_map",
@@ -168,6 +174,7 @@ redpanda_cc_library(
         "//src/v/datalake/translation:translation_probe",
         "//src/v/features",
         "//src/v/model",
+        "//src/v/pandaproxy/schema_registry:fwd",
         "//src/v/pandaproxy/schema_registry:types",
         "//src/v/raft",
         "//src/v/schema:registry",
@@ -205,6 +212,26 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "validators",
+    srcs = [
+        "validators.cc",
+    ],
+    hdrs = [
+        "validators.h",
+    ],
+    implementation_deps = [
+        "@abseil-cpp//absl/strings",
+        "@fmt",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "@ada",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "translation_task",
     srcs = [
         "translation_task.cc",
@@ -223,6 +250,7 @@ redpanda_cc_library(
         "//src/v/base",
         "//src/v/datalake/coordinator:translated_offset_range",
         "//src/v/datalake/translation:translation_probe",
+        "//src/v/iceberg:field_name_comparison",
         "//src/v/iceberg:values_bytes",
         "//src/v/model",
         "//src/v/utils:lazy_abort_source",
@@ -238,24 +266,27 @@ redpanda_cc_library(
         "table_definition.cc",
     ],
     hdrs = [
+        "schema_descriptor.h",
         "table_definition.h",
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/iceberg:datatypes",
         "//src/v/iceberg:schema",
+        "//src/v/iceberg:values",
+        "//src/v/model",
+        "@seastar",
     ],
 )
 
 redpanda_cc_library(
     name = "base_types",
-    srcs = [
-        "base_types.cc",
-    ],
     hdrs = [
         "base_types.h",
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/base",
         "//src/v/utils:named_type",
         "@fmt",
     ],
@@ -293,13 +324,14 @@ redpanda_cc_library(
     hdrs = ["schema_registry.h"],
     implementation_deps = [
         ":logger",
-        "//src/v/base",
         "//src/v/bytes:iobuf",
         "//src/v/bytes:iobuf_parser",
     ],
     visibility = [":__subpackages__"],
     deps = [
+        "//src/v/base",
         "//src/v/pandaproxy/schema_registry:types",
+        "@fmt",
     ],
 )
 
@@ -334,6 +366,7 @@ redpanda_cc_library(
         ":writer",
         "//src/v/container:chunked_hash_map",
         "//src/v/datalake/translation:translation_probe",
+        "//src/v/iceberg:field_name_comparison",
         "//src/v/model",
         "@seastar",
     ],
@@ -357,7 +390,8 @@ redpanda_cc_library(
         "//src/v/iceberg/conversion:schema_protobuf",
         "//src/v/iceberg/conversion/json_schema:frontend",
         "//src/v/metrics",
-        "//src/v/pandaproxy/schema_registry:registry",
+        "//src/v/pandaproxy/schema_registry:json_schema",
+        "//src/v/pandaproxy/schema_registry:protobuf_schema",
         "//src/v/schema:registry",
         "@avro",
         "@protobuf",
@@ -369,6 +403,7 @@ redpanda_cc_library(
         "//src/v/config",
         "//src/v/iceberg:datatypes",
         "//src/v/json",
+        "//src/v/pandaproxy/schema_registry:types",
         "//src/v/utils:chunked_kv_cache",
         "@seastar",
     ],
@@ -455,15 +490,13 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "table_creator",
-    srcs = [
-        "table_creator.cc",
-    ],
     hdrs = [
         "table_creator.h",
     ],
     visibility = [":__subpackages__"],
     deps = [
         ":schema_identifier",
+        "//src/v/base",
     ],
 )
 
@@ -556,6 +589,21 @@ redpanda_cc_library(
         ":types",
         "//src/v/base",
         "//src/v/cluster",
+        "//src/v/cluster:client_quota_backend",
+        "//src/v/cluster:cloud_metadata_types",
+        "//src/v/cluster:cluster_link_table",
+        "//src/v/cluster:cluster_recovery_table",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_group_proxy",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:node_status_table",
+        "//src/v/cluster:plugin_backend",
+        "//src/v/cluster:rpc_utils",
+        "//src/v/cluster:topic_metrics_watcher",
+        "//src/v/cluster:topic_table",
         "//src/v/datalake/coordinator:frontend",
         "//src/v/kafka/server:datalake_usage_api",
         "//src/v/utils:retry_chain_node",

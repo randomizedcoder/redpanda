@@ -57,6 +57,7 @@ void auth_refresh_bg_op::do_start_auth_refresh_op(
         try {
             cloud_roles::aws_service_name service_name;
             cloud_roles::aws_region_name region_name;
+            std::optional<ss::sstring> host_override;
 
             ss::visit(
               _source_config,
@@ -69,6 +70,7 @@ void auth_refresh_bg_op::do_start_auth_refresh_op(
                   s3_cfg) {
                   service_name = s3_cfg.service;
                   region_name = s3_cfg.region;
+                  host_override = s3_cfg.host;
               },
               [&](const cloud_roles::auth_refresh_bg_op::abs_config&) {});
 
@@ -80,6 +82,7 @@ void auth_refresh_bg_op::do_start_auth_refresh_op(
                 service_name,
                 region_name,
                 std::nullopt,
+                std::move(host_override),
                 cloud_roles::default_retry_params,
                 std::move(metrics_tag)));
 
@@ -124,8 +127,9 @@ uint64_t auth_refresh_bg_op::token_refresh_count() const noexcept {
 }
 
 cloud_roles::credentials auth_refresh_bg_op::build_static_credentials() const {
-    if (auto creds = std::get_if<cloud_roles::credentials>(&_source_config);
-        creds) {
+    if (
+      auto creds = std::get_if<cloud_roles::credentials>(&_source_config);
+      creds) {
         return *creds;
     } else {
         throw std::runtime_error(

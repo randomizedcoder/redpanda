@@ -29,8 +29,11 @@ public:
     ss::future<add_objects_reply>
     add_objects(add_objects_request, ::rpc::streaming_context&) override;
 
-    ss::future<replace_objects_reply> replace_objects(
+    ss::future<replace_objects_reply> replace_objects_no_compact(
       replace_objects_request, ::rpc::streaming_context&) override;
+
+    ss::future<compact_objects_reply> compact_objects(
+      compact_objects_request, ::rpc::streaming_context&) override;
 
     ss::future<set_start_offset_reply> set_start_offset(
       set_start_offset_request, ::rpc::streaming_context&) override;
@@ -65,6 +68,9 @@ public:
     ss::future<get_compaction_infos_reply> get_compaction_infos(
       get_compaction_infos_request, ::rpc::streaming_context&) override;
 
+    ss::future<get_leveling_infos_reply> get_leveling_infos(
+      get_leveling_infos_request, ::rpc::streaming_context&) override;
+
     ss::future<get_extent_metadata_reply> get_extent_metadata(
       get_extent_metadata_request, ::rpc::streaming_context&) override;
 
@@ -73,6 +79,9 @@ public:
 
     ss::future<restore_domain_reply>
     restore_domain(restore_domain_request, ::rpc::streaming_context&) override;
+
+    ss::future<preregister_objects_reply> preregister_objects(
+      preregister_objects_request, ::rpc::streaming_context&) override;
 
 private:
     ss::sharded<leader_router>* _leader_router;

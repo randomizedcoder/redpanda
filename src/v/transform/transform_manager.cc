@@ -27,7 +27,6 @@
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -182,9 +181,10 @@ public:
     }
 
     ss::future<> clear() {
-        co_await ss::parallel_for_each(
+        co_await ss::max_concurrent_for_each(
           _table.begin(),
           _table.end(),
+          64,
           // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
           [](auto& e) { return e.second.processor()->stop(); });
         _table.clear();

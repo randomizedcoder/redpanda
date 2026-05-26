@@ -12,15 +12,12 @@
 #pragma once
 
 #include <seastar/core/abort_source.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/util/optimized_optional.hh>
-
-#include <tuple>
 
 namespace ssx {
 /// Same as seastar::abort_source but accepts multiple abort sources
@@ -37,8 +34,9 @@ sleep_abortable(typename Clock::duration dur, AbortSource&... src) {
         explicit as_callback(as_state& st)
           : state(st.weak_from_this()) {}
         void operator()() noexcept {
-            if (auto st = state.get();
-                st != nullptr && !st->as.abort_requested()) {
+            if (
+              auto st = state.get();
+              st != nullptr && !st->as.abort_requested()) {
                 st->as.request_abort();
             }
         }

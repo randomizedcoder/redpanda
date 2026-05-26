@@ -79,23 +79,17 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_3rdparty) {
     auto fixture = pandaproxy::schema_registry::test_utils::store_fixture{};
     auto& s = fixture.store();
 
-    // This kafka client will not be used by the sequencer
+    // This transport will not be used by the sequencer
     // (which itself is only instantiated to receive consume_to_store's
-    //  offset updates), is just needed for constructor;
-    ss::sharded<kafka::client::client> dummy_kafka_client;
-    dummy_kafka_client
-      .start(
-        to_yaml(kafka::client::configuration{}, config::redact_secrets::no))
-      .get();
-    auto stop_kafka_client = ss::defer(
-      [&dummy_kafka_client]() { dummy_kafka_client.stop().get(); });
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
 
     ss::sharded<pps::seq_writer> seq;
     seq
       .start(
         model::node_id{0},
         ss::default_smp_service_group(),
-        std::reference_wrapper(dummy_kafka_client),
+        std::ref(dummy_transport),
         std::reference_wrapper(s),
         ss::sharded_parameter(
           [] { return std::make_unique<sequence_state_checker_test>(); }))
@@ -144,13 +138,17 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_3rdparty) {
 
     // Test mode default
     BOOST_REQUIRE_EQUAL(
-      c._store.get_mode(pps::default_context).get(), pps::mode::read_write);
+      c._store.get_mode(pps::default_context, pps::default_to_global::yes)
+        .get(),
+      pps::mode::read_write);
 
     // Test mode READONLY
     BOOST_REQUIRE_NO_THROW(
       c(make_record_batch(mode_key_0, mode_value_ro, base_offset++)).get());
     BOOST_REQUIRE_EQUAL(
-      c._store.get_mode(pps::default_context).get(), pps::mode::read_only);
+      c._store.get_mode(pps::default_context, pps::default_to_global::yes)
+        .get(),
+      pps::mode::read_only);
 
     // Test mode no subject, no fallback
     BOOST_REQUIRE_EXCEPTION(
@@ -177,7 +175,9 @@ SEASTAR_THREAD_TEST_CASE(test_consume_to_store_3rdparty) {
     BOOST_REQUIRE_NO_THROW(
       c(make_record_batch(mode_key_0, mode_value_rw, base_offset++)).get());
     BOOST_REQUIRE_EQUAL(
-      c._store.get_mode(pps::default_context).get(), pps::mode::read_write);
+      c._store.get_mode(pps::default_context, pps::default_to_global::yes)
+        .get(),
+      pps::mode::read_write);
 
     // test mode subject override
     BOOST_REQUIRE_NO_THROW(

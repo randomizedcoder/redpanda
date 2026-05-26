@@ -25,19 +25,6 @@
 
 namespace cloud_topics {
 
-std::ostream& operator<<(std::ostream& o, ctp_stm_api_errc errc) {
-    switch (errc) {
-    case ctp_stm_api_errc::timeout:
-        return o << "timeout";
-    case ctp_stm_api_errc::not_leader:
-        return o << "not_leader";
-    case ctp_stm_api_errc::shutdown:
-        return o << "shutdown";
-    case ctp_stm_api_errc::failure:
-        return o << "failure";
-    }
-}
-
 ctp_stm_api::ctp_stm_api(ss::shared_ptr<ctp_stm> stm)
   : _stm(std::move(stm))
   , _log(_stm->log()) {}
@@ -197,6 +184,40 @@ ctp_stm_api::set_start_offset(
 }
 
 ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
+ctp_stm_api::set_allowed_local_start_offset(
+  std::optional<kafka::offset> value,
+  model::timeout_clock::time_point deadline,
+  ss::abort_source& as) {
+    // Idempotency: skip replication if the cached value already matches.
+    if (_stm->state().get_allowed_local_start_offset() == value) {
+        co_return std::monostate{};
+    }
+
+    vlog(
+      _log.debug,
+      "Replicating ctp_stm_cmd::set_allowed_local_start_offset{{{}}}",
+      value);
+
+    // Capture the leader's term up front so the replicate fails fast if
+    // leadership transfers between building the batch and submitting it.
+    auto term = _stm->_raft->term();
+
+    storage::record_batch_builder builder(
+      model::record_batch_type::ctp_stm_command, model::offset(0));
+    builder.add_raw_kv(
+      serde::to_iobuf(set_allowed_local_start_offset_cmd::key),
+      serde::to_iobuf(set_allowed_local_start_offset_cmd(value)));
+
+    auto batch = std::move(builder).build();
+    auto apply_result = co_await replicated_apply(
+      std::move(batch), term, deadline, as);
+    if (!apply_result.has_value()) {
+        co_return std::unexpected(apply_result.error());
+    }
+    co_return std::monostate{};
+}
+
+ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
 ctp_stm_api::advance_epoch(
   cluster_epoch new_epoch,
   model::timeout_clock::time_point deadline,
@@ -309,8 +330,9 @@ std::optional<cluster_epoch> ctp_stm_api::get_max_epoch() const {
     return _stm->state().get_max_applied_epoch();
 }
 
-std::optional<cluster_epoch> ctp_stm_api::get_max_seen_epoch() const {
-    return _stm->state().get_max_seen_epoch();
+std::optional<cluster_epoch>
+ctp_stm_api::get_max_seen_epoch(model::term_id term) const {
+    return _stm->state().get_max_seen_epoch(term);
 }
 
 l0::producer_queue& ctp_stm_api::producer_queue() {
@@ -319,6 +341,10 @@ l0::producer_queue& ctp_stm_api::producer_queue() {
 
 uint64_t ctp_stm_api::estimated_data_size() const noexcept {
     return _stm->state().estimated_data_size();
+}
+
+void ctp_stm_api::register_reader(active_reader_state* state) {
+    return _stm->register_reader(state);
 }
 
 }; // namespace cloud_topics

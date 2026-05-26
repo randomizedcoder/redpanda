@@ -10,12 +10,11 @@
 #include "filter.h"
 
 #include "compaction/utils.h"
+#include "container/chunked_vector.h"
 #include "model/batch_compression.h"
 #include "model/record.h"
 
 #include <seastar/core/coroutine.hh>
-
-#include <vector>
 
 namespace compaction {
 
@@ -37,8 +36,8 @@ filter::filter_batch(model::record_batch b) const {
     }
 
     // compute which records to keep
-    std::vector<int32_t> offset_deltas = co_await compute_offset_deltas_to_keep(
-      b);
+    chunked_vector<int32_t> offset_deltas
+      = co_await compute_offset_deltas_to_keep(b);
 
     auto ret = co_await filter_batch_with_offset_deltas(
       std::move(b), std::move(offset_deltas));
@@ -46,7 +45,7 @@ filter::filter_batch(model::record_batch b) const {
 }
 
 ss::future<std::optional<model::record_batch>> filter::do_filter_batch(
-  model::record_batch b, std::vector<int32_t> offset_deltas) const {
+  model::record_batch b, chunked_vector<int32_t> offset_deltas) const {
     // no records to keep
     if (offset_deltas.empty()) {
         co_return std::nullopt;
@@ -68,10 +67,11 @@ ss::future<std::optional<model::record_batch>> filter::do_filter_batch(
                                       &ret,
                                       &offset_deltas](model::record record) {
         // contains the key
-        if (std::count(
-              offset_deltas.begin(),
-              offset_deltas.end(),
-              record.offset_delta())) {
+        if (
+          std::count(
+            offset_deltas.begin(),
+            offset_deltas.end(),
+            record.offset_delta())) {
             /*
              * TODO when we further optimize lazy record materialization ot
              * make use of views we can avoid this re-encoding by copying or
@@ -134,7 +134,11 @@ ss::future<ss::stop_iteration> filter::filter_and_rewrite_with_sink(
             ++_stats.non_compactible_batches;
         }
 
-        co_return co_await _sink(std::move(to_copy).value(), original);
+        auto batch = std::move(to_copy).value();
+        if (original != model::compression::none) {
+            batch = co_await model::compress_batch(original, std::move(batch));
+        }
+        co_return co_await _sink(std::move(batch));
     } else {
         ++_stats.batches_discarded;
         _stats.records_discarded += record_count_before;

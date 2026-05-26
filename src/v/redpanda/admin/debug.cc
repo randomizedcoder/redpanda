@@ -586,7 +586,7 @@ void admin_server::register_debug_routes() {
 using admin::apply_validator;
 
 void check_shard_id(seastar::shard_id id) {
-    auto max_shard_id = ss::smp::count - 1;
+    auto max_shard_id = ss::this_smp_shard_count() - 1;
     if (id > max_shard_id) {
         throw ss::httpd::bad_param_exception(
           fmt::format("Shard id too high, max shard id is {}", max_shard_id));
@@ -763,8 +763,9 @@ admin_server::cloud_storage_usage_handler(
   std::unique_ptr<ss::http::request> req) {
     auto batch_size
       = cluster::topic_table_partition_generator::default_batch_size;
-    if (auto batch_size_param = req->get_query_param("batch_size");
-        !batch_size_param.empty()) {
+    if (
+      auto batch_size_param = req->get_query_param("batch_size");
+      !batch_size_param.empty()) {
         try {
             batch_size = std::stoi(batch_size_param);
         } catch (...) {
@@ -776,8 +777,9 @@ admin_server::cloud_storage_usage_handler(
 
     auto retries_allowed
       = cluster::cloud_storage_size_reducer::default_retries_allowed;
-    if (auto retries_param = req->get_query_param("retries_allowed");
-        !retries_param.empty()) {
+    if (
+      auto retries_param = req->get_query_param("retries_allowed");
+      !retries_param.empty()) {
         try {
             retries_allowed = std::stoi(retries_param);
         } catch (...) {
@@ -1170,7 +1172,7 @@ ss::future<std::unique_ptr<ss::http::reply>> admin_server::put_ctracker_va(
           fmt::format("Invalid shard id: {}", req->get_path_param("shard")));
     }
 
-    if (shard >= ss::smp::count) {
+    if (shard >= ss::this_smp_shard_count()) {
         throw ss::httpd::bad_param_exception(
           fmt::format("Invalid shard id: {}", shard));
     }

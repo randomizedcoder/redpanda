@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "base/format_to.h"
 #include "cluster/fwd.h"
 #include "datalake/coordinator/types.h"
 #include "datalake/data_writer_interface.h"
@@ -132,8 +133,7 @@ public:
 
     virtual ss::future<coordinator::fetch_latest_translated_offset_reply>
       fetch_latest_translated_offset(
-        coordinator::fetch_latest_translated_offset_request)
-      = 0;
+        coordinator::fetch_latest_translated_offset_request) = 0;
 
     static std::unique_ptr<coordinator_api>
     make_default_coordinator_api(coordinator::frontend&);
@@ -183,8 +183,7 @@ public:
     virtual ss::future<std::optional<kafka::offset>> wait_for_data_to_translate(
       std::optional<kafka::offset> last_translated_offset,
       ss::lowres_clock::time_point deadline,
-      ss::abort_source&)
-      = 0;
+      ss::abort_source&) = 0;
 
     virtual ss::future<std::optional<model::record_batch_reader>>
     make_log_reader(kafka::offset, ss::abort_source&) = 0;
@@ -198,8 +197,7 @@ public:
       std::optional<model::timestamp> translation_timestamp,
       model::term_id,
       model::timeout_clock::duration timeout,
-      ss::abort_source&)
-      = 0;
+      ss::abort_source&) = 0;
 
     static std::unique_ptr<data_source>
       make_default_data_source(ss::lw_shared_ptr<cluster::partition>);
@@ -218,7 +216,30 @@ enum translation_errc {
     type_resolution_error,
 };
 
-std::ostream& operator<<(std::ostream&, translation_errc);
+inline fmt::iterator format_to(translation_errc ec, fmt::iterator out) {
+    switch (ec) {
+    case no_data:
+        return fmt::format_to(out, "translation_errc::no_data");
+    case file_io_error:
+        return fmt::format_to(out, "translation_errc::file_io_error");
+    case cloud_io_error:
+        return fmt::format_to(out, "translation_errc::cloud_io_error");
+    case flush_error:
+        return fmt::format_to(out, "translation_errc::flush_error");
+    case discard_error:
+        return fmt::format_to(out, "translation_errc::discard_error");
+    case oom_error:
+        return fmt::format_to(out, "translation_errc::oom_error");
+    case time_limit_exceeded:
+        return fmt::format_to(out, "translation_errc::time_limit_exceeded");
+    case shutting_down:
+        return fmt::format_to(out, "translation_errc::shutting_down");
+    case out_of_disk:
+        return fmt::format_to(out, "translation_errc::out_of_disk");
+    case type_resolution_error:
+        return fmt::format_to(out, "translation_errc::type_resolution_error");
+    }
+}
 
 class translation_context {
 public:
@@ -233,9 +254,8 @@ public:
     /**
      * Translates using the record reader until aborted.
      */
-    virtual ss::future<>
-    translate_now(model::record_batch_reader, kafka::offset, ss::abort_source&)
-      = 0;
+    virtual ss::future<> translate_now(
+      model::record_batch_reader, kafka::offset, ss::abort_source&) = 0;
 
     /**
      * Flushes all the buffered state guaranteeing release of resources.
@@ -347,8 +367,7 @@ public:
      * discarded.
      */
     virtual void
-      notify_inflight_translation_iteration(std::optional<kafka::offset>)
-      = 0;
+      notify_inflight_translation_iteration(std::optional<kafka::offset>) = 0;
 
     /**
      * Returns an estimated timestamp for the batch with requested

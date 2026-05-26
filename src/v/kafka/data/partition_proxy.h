@@ -12,6 +12,8 @@
 
 #include "base/outcome.h"
 #include "cluster/fwd.h"
+#include "cluster/types.h"
+#include "kafka/data/exact_offset_replicator.h"
 #include "kafka/data/log_reader_config.h"
 #include "kafka/protocol/errors.h"
 #include "kafka/protocol/types.h"
@@ -78,27 +80,32 @@ public:
         virtual ss::future<std::vector<model::tx_range>> aborted_transactions(
           model::offset,
           model::offset,
-          ss::lw_shared_ptr<const storage::offset_translator_state>)
-          = 0;
+          ss::lw_shared_ptr<const storage::offset_translator_state>) = 0;
         virtual ss::future<error_code> validate_fetch_offset(
-          model::offset, bool, model::timeout_clock::time_point)
-          = 0;
+          model::offset, bool, model::timeout_clock::time_point) = 0;
 
         virtual ss::future<result<model::offset>> replicate(
-          chunked_vector<model::record_batch>, raft::replicate_options)
-          = 0;
+          chunked_vector<model::record_batch>, raft::replicate_options) = 0;
         virtual raft::replicate_stages replicate(
-          model::batch_identity, model::record_batch, raft::replicate_options)
-          = 0;
+          model::batch_identity,
+          model::record_batch,
+          raft::replicate_options) = 0;
+
+        /// Returns a replicator for writing batches at exact offsets,
+        /// or nullptr if the partition does not support this operation.
+        virtual std::unique_ptr<exact_offset_replicator>
+        make_exact_offset_replicator() && = 0;
 
         virtual result<partition_info> get_partition_info() const = 0;
-        virtual size_t estimate_size_between(kafka::offset, kafka::offset) const
-          = 0;
+        virtual size_t
+          estimate_size_between(kafka::offset, kafka::offset) const = 0;
         virtual cluster::partition_probe& probe() = 0;
 
         virtual size_t local_size_bytes() const = 0;
         virtual ss::future<std::optional<size_t>> cloud_size_bytes() const = 0;
         virtual model::offset offset_lag() const = 0;
+        virtual ss::future<cluster::partition_cloud_storage_status>
+        get_cloud_storage_status() const = 0;
     };
 
     explicit partition_proxy(std::unique_ptr<impl> impl) noexcept
@@ -188,6 +195,10 @@ public:
         return _impl->replicate(bi, std::move(batch), opts);
     }
 
+    std::unique_ptr<exact_offset_replicator> make_exact_offset_replicator() && {
+        return std::move(*_impl).make_exact_offset_replicator();
+    }
+
     /*
      * Returns the local on-disk size of the partition.
      */
@@ -211,6 +222,11 @@ public:
      * zero. It's calculated as the highwater mark minus the dirty offset.
      */
     model::offset offset_lag() const { return _impl->offset_lag(); }
+
+    ss::future<cluster::partition_cloud_storage_status>
+    get_cloud_storage_status() const {
+        return _impl->get_cloud_storage_status();
+    }
 
 private:
     std::unique_ptr<impl> _impl;

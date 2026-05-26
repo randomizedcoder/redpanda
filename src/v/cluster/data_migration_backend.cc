@@ -10,19 +10,24 @@
  */
 #include "cluster/data_migration_backend.h"
 
+#include "base/format_to.h"
 #include "cloud_storage/topic_manifest.h"
 #include "cloud_storage/topic_manifest_downloader.h"
 #include "cloud_storage/topic_mount_handler.h"
+#include "cluster/data_migration_frontend.h"
+#include "cluster/data_migration_types.h"
+#include "cluster/data_migration_worker.h"
+#include "cluster/errc.h"
+#include "cluster/fwd.h"
+#include "cluster/logger.h"
 #include "cluster/partition_leaders_table.h"
+#include "cluster/topic_configuration.h"
+#include "cluster/topic_table.h"
+#include "cluster/topics_frontend.h"
+#include "cluster/types.h"
 #include "config/node_config.h"
 #include "container/chunked_hash_map.h"
 #include "container/chunked_vector.h"
-#include "data_migration_frontend.h"
-#include "data_migration_types.h"
-#include "data_migration_worker.h"
-#include "errc.h"
-#include "fwd.h"
-#include "logger.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
 #include "model/namespace.h"
@@ -30,10 +35,6 @@
 #include "model/timestamp.h"
 #include "ssx/async_algorithm.h"
 #include "ssx/future-util.h"
-#include "topic_configuration.h"
-#include "topic_table.h"
-#include "topics_frontend.h"
-#include "types.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/core/abort_source.hh>
@@ -44,7 +45,6 @@
 
 #include <chrono>
 #include <exception>
-#include <memory>
 #include <optional>
 #include <ranges>
 
@@ -286,8 +286,9 @@ backend::get_entities_status(id migration_id) {
           migration_id,
           groups_by_partition.size());
         errc last_errc = errc::success;
-        co_await ss::parallel_for_each(
+        co_await ss::max_concurrent_for_each(
           std::move(groups_by_partition),
+          64,
           [this, &ret, &last_errc](auto&& pair) {
               // TODO: retry per-partition
               auto&& [pid, groups] = pair;
@@ -405,8 +406,9 @@ backend::set_entities_status(id migration_id, entities_status status) {
                   std::move(status.groups),
                   [&rev_map, &requests, migration_id](group_offsets& group) {
                       kafka::group_id gid{group.group_id};
-                      if (auto it = rev_map.find(gid);
-                          likely(it != rev_map.end())) {
+                      if (
+                        auto it = rev_map.find(gid);
+                        likely(it != rev_map.end())) {
                           auto pid = it->second;
                           requests[pid].groups.push_back(std::move(group));
                       } else {
@@ -420,8 +422,9 @@ backend::set_entities_status(id migration_id, entities_status status) {
                   });
 
                 errc last_error = errc::success;
-                co_await ss::parallel_for_each(
+                co_await ss::max_concurrent_for_each(
                   *mrstate.partition_group_map,
+                  64,
                   [&requests, this, &last_error](const auto& pair) {
                       auto& [pid, groups] = pair;
                       auto& request = requests.at(pid);
@@ -835,7 +838,7 @@ backend::do_topic_work(model::topic_namespace nt, topic_work tw) noexcept {
     } catch (...) {
         vlog(
           dm_log.warn,
-          "exception occured during topic work {} on nt={}",
+          "exception occurred during topic work {} on nt={}",
           tw,
           nt,
           std::current_exception());
@@ -1548,7 +1551,7 @@ void backend::handle_shard_update(
 }
 
 ss::future<check_ntp_states_reply>
-backend::check_ntp_states_locally(check_ntp_states_request&& req) {
+backend::check_ntp_states_locally(check_ntp_states_request req) {
     vlog(dm_log.debug, "processing node request {}", req);
     check_ntp_states_reply reply;
     co_await ssx::async_for_each(
@@ -2322,16 +2325,13 @@ void backend::topic_scoped_work_state::set_value(errc ec) {
 ss::future<errc> backend::topic_scoped_work_state::future() {
     return _promise.get_shared_future();
 }
-
-std::ostream&
-operator<<(std::ostream& os, const backend::replica_work_state& rws) {
-    fmt::print(
-      os,
+fmt::iterator backend::replica_work_state::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
       "{{sought_state: {}, shard: {}, status: {}}}",
-      rws.sought_state,
-      rws.shard,
-      rws.status);
-    return os;
+      sought_state,
+      shard,
+      status);
 }
 
 chunked_vector<partition_assignment>

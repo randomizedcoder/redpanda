@@ -11,20 +11,18 @@
 #include "cluster/rm_stm_types.h"
 #include "cluster/tests/randoms.h"
 #include "cluster/tests/rm_stm_test_fixture.h"
-#include "finjector/hbadger.h"
 #include "finjector/stress_fiber.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/record.h"
 #include "model/record_batch_types.h"
 #include "model/tests/random_batch.h"
 #include "model/tests/randoms.h"
 #include "model/timestamp.h"
-#include "raft/consensus_utils.h"
+#include "raft/consensus.h"
+#include "raft/tests/raft_fixture_base.h"
 #include "random/generators.h"
-#include "storage/record_batch_builder.h"
+#include "storage/disk_log_impl.h"
 #include "storage/tests/batch_generators.h"
-#include "storage/tests/utils/disk_log_builder.h"
 #include "storage/types.h"
 #include "test_utils/async.h"
 #include "test_utils/boost_fixture.h"
@@ -32,8 +30,6 @@
 #include "utils/directory_walker.h"
 
 #include <seastar/util/defer.hh>
-
-#include <system_error>
 
 using namespace std::chrono_literals;
 
@@ -134,9 +130,6 @@ FIXTURE_TEST(test_tx_happy_tx, rm_stm_test_fixture) {
     wait_for_confirmed_leader();
     wait_for_meta_initialized();
 
-    auto min_offset = model::offset(0);
-    auto max_offset = model::offset(std::numeric_limits<int64_t>::max());
-
     auto pid1 = model::producer_identity{1, 0};
     auto rreader = make_batches(pid1, 0, 5, false);
     auto offset_r = replicate_all(stm, std::move(rreader)).get();
@@ -144,7 +137,7 @@ FIXTURE_TEST(test_tx_happy_tx, rm_stm_test_fixture) {
     RPTEST_REQUIRE_EVENTUALLY(
       1s, [&] { return stm.highest_producer_id() == pid1.get_id(); });
     BOOST_REQUIRE((bool)offset_r);
-    auto aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    auto aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
     auto first_offset = offset_r.value().last_offset();
     tests::cooperative_spin_wait_with_timeout(10s, [&stm, first_offset]() {
@@ -167,12 +160,12 @@ FIXTURE_TEST(test_tx_happy_tx, rm_stm_test_fixture) {
     }).get();
     BOOST_REQUIRE_LE(stm.last_stable_offset(), tx_offset);
 
-    aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
 
     auto op = stm.commit_tx(pid2, tx_seq, 2'000ms).get();
     BOOST_REQUIRE_EQUAL(op, cluster::tx::errc::none);
-    aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
     tests::cooperative_spin_wait_with_timeout(10s, [&stm, tx_offset]() {
         return tx_offset < stm.last_stable_offset();
@@ -189,8 +182,6 @@ FIXTURE_TEST(test_tx_aborted_tx_1, rm_stm_test_fixture) {
     auto& stm = start_and_disable_auto_abort();
 
     auto tx_seq = model::tx_seq(0);
-    auto min_offset = model::offset(0);
-    auto max_offset = model::offset(std::numeric_limits<int64_t>::max());
 
     auto pid1 = model::producer_identity{1, 0};
     auto rreader = make_batches(pid1, 0, 5, false);
@@ -198,7 +189,7 @@ FIXTURE_TEST(test_tx_aborted_tx_1, rm_stm_test_fixture) {
     RPTEST_REQUIRE_EVENTUALLY(
       1s, [&] { return stm.highest_producer_id() == pid1.get_id(); });
     BOOST_REQUIRE((bool)offset_r);
-    auto aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    auto aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
     auto first_offset = offset_r.value().last_offset();
     tests::cooperative_spin_wait_with_timeout(10s, [&stm, first_offset]() {
@@ -219,7 +210,7 @@ FIXTURE_TEST(test_tx_aborted_tx_1, rm_stm_test_fixture) {
         return first_offset < stm.last_stable_offset();
     }).get();
     BOOST_REQUIRE_LE(stm.last_stable_offset(), tx_offset);
-    aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
 
     auto op = stm.abort_tx(pid2, tx_seq, 2'000ms).get();
@@ -229,7 +220,7 @@ FIXTURE_TEST(test_tx_aborted_tx_1, rm_stm_test_fixture) {
                       _raft.get()->committed_offset(),
                       model::timeout_clock::now() + 2'000ms)
                     .get());
-    aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    aborted_txs = get_aborted_txs().get();
 
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 1);
     BOOST_REQUIRE(
@@ -251,16 +242,13 @@ FIXTURE_TEST(test_tx_aborted_tx_2, rm_stm_test_fixture) {
     auto& stm = start_and_disable_auto_abort();
     auto tx_seq = model::tx_seq(0);
 
-    auto min_offset = model::offset(0);
-    auto max_offset = model::offset(std::numeric_limits<int64_t>::max());
-
     auto pid1 = model::producer_identity{1, 0};
     auto rreader = make_batches(pid1, 0, 5, false);
     auto offset_r = replicate_all(stm, std::move(rreader)).get();
     RPTEST_REQUIRE_EVENTUALLY(
       1s, [&] { return stm.highest_producer_id() == pid1.get_id(); });
     BOOST_REQUIRE((bool)offset_r);
-    auto aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    auto aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
     auto first_offset = offset_r.value().last_offset();
     tests::cooperative_spin_wait_with_timeout(10s, [&stm, first_offset]() {
@@ -282,7 +270,7 @@ FIXTURE_TEST(test_tx_aborted_tx_2, rm_stm_test_fixture) {
         return first_offset < stm.last_stable_offset();
     }).get();
     BOOST_REQUIRE_LE(stm.last_stable_offset(), tx_offset);
-    aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    aborted_txs = get_aborted_txs().get();
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 0);
 
     auto op = stm.abort_tx(pid2, tx_seq, 2'000ms).get();
@@ -292,7 +280,7 @@ FIXTURE_TEST(test_tx_aborted_tx_2, rm_stm_test_fixture) {
                       _raft.get()->committed_offset(),
                       model::timeout_clock::now() + 2'000ms)
                     .get());
-    aborted_txs = stm.aborted_transactions(min_offset, max_offset).get();
+    aborted_txs = get_aborted_txs().get();
 
     BOOST_REQUIRE_EQUAL(aborted_txs.size(), 1);
     BOOST_REQUIRE(
@@ -437,12 +425,6 @@ FIXTURE_TEST(test_aborted_transactions, rm_stm_test_fixture) {
 
     auto& segments = disk_log->segments();
 
-    // Few helpers to avoid repeated boiler plate code.
-
-    auto aborted_txs = [&](auto begin, auto end) {
-        return stm.aborted_transactions(begin, end).get();
-    };
-
     // Aborted transactions in a given segment index.
     auto aborted_txes_seg = [&](auto segment_index) {
         BOOST_REQUIRE_GE(segment_index, 0);
@@ -454,12 +436,13 @@ FIXTURE_TEST(test_aborted_transactions, rm_stm_test_fixture) {
           segment_index,
           offsets.get_base_offset(),
           offsets.get_dirty_offset());
-        return aborted_txs(
-          offsets.get_base_offset(), offsets.get_dirty_offset());
+        return stm
+          .aborted_transactions(
+            offsets.get_base_offset(), offsets.get_dirty_offset())
+          .get();
     };
 
-    BOOST_REQUIRE_EQUAL(
-      aborted_txs(model::offset::min(), model::offset::max()).size(), 0);
+    BOOST_REQUIRE_EQUAL(get_aborted_txs().get().size(), 0);
 
     // Begins a tx with random pid and writes a data batch.
     // Returns the associated pid.
@@ -666,13 +649,15 @@ void async_ser_verify(T type) {
 }
 
 cluster::tx::tx_snapshot_v4 make_tx_snapshot_v4() {
+    auto offset = model::random_offset_above(model::offset(1));
     return {
       .fenced = tests::random_frag_vector(model::random_producer_identity),
-      .ongoing = tests::random_frag_vector(model::random_tx_range),
+      .ongoing = tests::random_frag_vector(
+        model::random_tx_range_below, 20, offset),
       .prepared = tests::random_frag_vector(cluster::random_prepare_marker),
       .aborted = tests::random_frag_vector(model::random_tx_range),
       .abort_indexes = tests::random_frag_vector(cluster::random_abort_index),
-      .offset = model::random_offset(),
+      .offset = offset,
       .seqs = tests::random_frag_vector(cluster::random_seq_entry),
       .tx_data = tests::random_frag_vector(cluster::random_tx_data_snapshot),
       .expiration = tests::random_frag_vector(
@@ -698,14 +683,15 @@ cluster::tx::tx_snapshot_v5 make_tx_snapshot_v5() {
         snapshots.push_back(std::move(old_snapshot));
     }
     cluster::tx::tx_snapshot_v5 snap;
-    snap.offset = model::random_offset();
-    snap.producers = std::move(snapshots),
-    snap.fenced = tests::random_frag_vector(model::random_producer_identity),
-    snap.ongoing = tests::random_frag_vector(model::random_tx_range),
-    snap.prepared = tests::random_frag_vector(cluster::random_prepare_marker),
-    snap.aborted = tests::random_frag_vector(model::random_tx_range),
-    snap.abort_indexes = tests::random_frag_vector(cluster::random_abort_index),
-    snap.tx_data = tests::random_frag_vector(cluster::random_tx_data_snapshot),
+    snap.offset = model::random_offset_above(model::offset(1));
+    snap.producers = std::move(snapshots);
+    snap.fenced = tests::random_frag_vector(model::random_producer_identity);
+    snap.ongoing = tests::random_frag_vector(
+      model::random_tx_range_below, 20, snap.offset);
+    snap.prepared = tests::random_frag_vector(cluster::random_prepare_marker);
+    snap.aborted = tests::random_frag_vector(model::random_tx_range);
+    snap.abort_indexes = tests::random_frag_vector(cluster::random_abort_index);
+    snap.tx_data = tests::random_frag_vector(cluster::random_tx_data_snapshot);
     snap.expiration = tests::random_frag_vector(
       cluster::random_expiration_snapshot);
     snap.highest_producer_id = model::random_producer_identity().get_id();
@@ -970,7 +956,7 @@ FIXTURE_TEST(test_tx_compaction_last_producer_batch, rm_stm_test_fixture) {
 
     auto log = _storage.local().log_mgr().get(_raft->ntp());
     BOOST_REQUIRE(log);
-    log->stm_manager()->add_stm(_stm);
+    log->stm_hookset()->add_stm(_stm);
 
     auto tx_seq_zero = model::tx_seq{0};
     auto produce = [&](auto pid, auto& seq, int count = 5) {
@@ -1209,4 +1195,267 @@ FIXTURE_TEST(test_raft_snapshot_roundtrip, rm_stm_test_fixture) {
         auto offset_r = replicate_all(stm, std::move(rreader)).get();
         BOOST_REQUIRE((bool)offset_r);
     }
+}
+
+// Ensures that a transaction whose begin marker is in a local snapshot, but
+// whose data batches aren't is still able to be committed and aborted after a
+// restart.
+FIXTURE_TEST(
+  test_local_snapshot_preserves_open_tx_producer, rm_stm_test_fixture) {
+    start_and_disable_auto_abort();
+    auto* stm = _stm.get();
+
+    auto pid1 = model::producer_identity{1, 0};
+    auto pid2 = model::producer_identity{2, 0};
+    auto tx_seq = model::tx_seq{0};
+
+    BOOST_REQUIRE(stm->begin_tx(pid1, tx_seq, timeout, model::partition_id(0))
+                    .get()
+                    .has_value());
+    BOOST_REQUIRE(stm->begin_tx(pid2, tx_seq, timeout, model::partition_id(0))
+                    .get()
+                    .has_value());
+
+    // Take a local snapshot after the fences but before data batches.
+    // Both producers have open transactions (status=initialized) but no
+    // finished_requests.
+    stm->write_local_snapshot().get();
+
+    // Replicate data batches for both producers.
+    auto r1 = replicate_all(*stm, make_batches(pid1, 0, 5, true)).get();
+    BOOST_REQUIRE(r1.has_value());
+    auto r2 = replicate_all(*stm, make_batches(pid2, 0, 5, true)).get();
+    BOOST_REQUIRE(r2.has_value());
+    auto last_data_offset = r2.value().last_offset;
+
+    // Restart the entire raft group. On start, the STM loads the local
+    // snapshot from disk and replays the log from the snapshot offset.
+    restart_stm_and_raft();
+    stm = _stm.get();
+
+    // Ensure the producers weren't lost from restarting.
+    BOOST_REQUIRE(producers().contains(pid1.get_id()));
+    BOOST_REQUIRE(producers().contains(pid2.get_id()));
+
+    // Ensure the LSO is held back by the open transactions.
+    auto lso = stm->last_stable_offset();
+    BOOST_REQUIRE_NE(lso, model::invalid_lso);
+    BOOST_REQUIRE_LE(lso, model::offset(last_data_offset()));
+
+    // Ensure pid1's transaction can be committed
+    auto commit_result = stm->commit_tx(pid1, tx_seq, 2'000ms).get();
+    BOOST_REQUIRE_EQUAL(commit_result, cluster::tx::errc::none);
+
+    // Ensure pid2's transaction can be aborted
+    auto abort_result
+      = stm->abort_tx(pid2, tx_seq, model::timeout_clock::duration{2'000ms})
+          .get();
+    BOOST_REQUIRE_EQUAL(abort_result, cluster::tx::errc::none);
+
+    RPTEST_REQUIRE_EVENTUALLY(10s, [stm, last_data_offset]() {
+        return model::offset(last_data_offset()) < stm->last_stable_offset();
+    });
+}
+
+// 3-node fixture for testing rm_stm behavior on follower restart.
+struct rm_stm_multinode_fixture : raft::raft_fixture_base {
+    static constexpr auto large_timeout = std::chrono::minutes(30);
+
+    void setup() {
+        raft_fixture_base::start().get();
+        producer_state_manager
+          .start(
+            config::mock_binding(std::numeric_limits<uint64_t>::max()),
+            config::mock_binding(std::chrono::milliseconds(large_timeout)),
+            config::mock_binding(std::numeric_limits<size_t>::max()))
+          .get();
+        producer_state_manager
+          .invoke_on_all([](cluster::tx::producer_state_manager& mgr) {
+              return mgr.start();
+          })
+          .get();
+        for (auto i = 0; i < 3; ++i) {
+            add_node(model::node_id(i), model::revision_id(0));
+        }
+        for (auto& [_, n] : nodes()) {
+            do_start_node(*n);
+        }
+    }
+
+    void teardown() {
+        raft_fixture_base::stop().get();
+        producer_state_manager.stop().get();
+    }
+
+    void do_start_node(raft::raft_node_instance& n) {
+        n.initialise(all_vnodes()).get();
+        raft::state_machine_manager_builder builder;
+        builder.create_stm<cluster::rm_stm>(
+          ::logger,
+          n.raft().get(),
+          tx_gateway_frontend,
+          n.get_feature_table(),
+          producer_state_manager,
+          std::nullopt);
+        n.start(std::move(builder)).get();
+        get_stm(n)->testing_only_disable_auto_abort();
+    }
+
+    ss::shared_ptr<cluster::rm_stm> get_stm(raft::raft_node_instance& n) {
+        return n.raft()->stm_manager()->get<cluster::rm_stm>();
+    }
+
+    bool is_bootstrapped(ss::shared_ptr<cluster::rm_stm> stm) {
+        return stm->_bootstrap_committed_offset.has_value();
+    }
+
+    ss::sharded<cluster::tx_gateway_frontend> tx_gateway_frontend;
+    ss::sharded<cluster::tx::producer_state_manager> producer_state_manager;
+};
+
+// Regression test: verifies that apply_local_snapshot sets _apply_watermark
+// so that last_stable_offset() does not return invalid_lso after loading a
+// snapshot that contains an open transaction. Uses a 3-node raft group and
+// restarts a follower — a follower doesn't write leader-election config
+// batches, so _apply_watermark is only set by apply_local_snapshot().
+FIXTURE_TEST(
+  test_local_snapshot_sets_apply_watermark_for_open_tx,
+  rm_stm_multinode_fixture) {
+    setup();
+    auto cleanup = ss::defer([this] { teardown(); });
+
+    auto leader_id = wait_for_leader(10s).get();
+    auto leader_stm = get_stm(node(leader_id));
+
+    auto pid = model::producer_identity{1, 0};
+    auto tx_seq = model::tx_seq{0};
+    BOOST_REQUIRE(
+      leader_stm->begin_tx(pid, tx_seq, large_timeout, model::partition_id(0))
+        .get()
+        .has_value());
+
+    auto r = replicate_all(*leader_stm, ::make_batches(pid, 0, 5, true)).get();
+    BOOST_REQUIRE(r.has_value());
+    auto committed = node(leader_id).raft()->committed_offset();
+
+    // Pick a follower, wait for it to apply, then take a snapshot.
+    auto follower_id = *random_follower_id();
+    auto follower_stm = get_stm(node(follower_id));
+    follower_stm->wait(committed, model::timeout_clock::now() + 10s).get();
+    follower_stm->write_local_snapshot().get();
+
+    // Restart the follower preserving its data directory.
+    auto data_dir = node(follower_id).raft()->log()->config().base_directory();
+    stop_node(follower_id).get();
+    add_node(follower_id, model::revision_id(0), std::move(data_dir));
+    do_start_node(node(follower_id));
+    follower_stm = get_stm(node(follower_id));
+
+    // Wait for restarted follower STM to bootstrap and apply local snapshot.
+    RPTEST_REQUIRE_EVENTUALLY(
+      10s, [this, &follower_stm] { return is_bootstrapped(follower_stm); });
+    follower_stm->wait(committed, model::timeout_clock::now() + 10s).get();
+
+    // Without _apply_watermark = hdr.offset in apply_local_snapshot(),
+    // the watermark stays at 0 and the open transaction's first offset
+    // exceeds it, causing last_stable_offset() to return invalid_lso.
+    auto lso = follower_stm->last_stable_offset();
+    BOOST_REQUIRE_NE(lso, model::invalid_lso);
+}
+// Stress test for the lock inversion between
+// state_machine_manager::take_snapshot and concurrent tx operations. The
+// inversion:
+//
+//   take_snapshot path:  acquire _apply_mutex -> stm->take_raft_snapshot
+//                                             -> block on _state_lock.write
+//   tx op path:          acquire _state_lock.read -> wait_no_throw/sync
+//                                                 -> wait for apply
+//                                                 -> need _apply_mutex
+//
+// When both paths run concurrently, tx ops stall until _sync_timeout fires
+// (default 10s), after which they return errc::timeout. The test verifies
+// that concurrent tx ops and raft snapshots produce no timeout errors.
+//
+// To make the test sensitive to the bug, reduce internal_rpc_request_timeout_ms
+// (which drives _sync_timeout) to a value shorter than the snapshot duration.
+FIXTURE_TEST(test_no_deadlock_raft_snapshot_with_tx_ops, rm_stm_test_fixture) {
+    start_and_disable_auto_abort();
+
+    struct test_state {
+        ss::abort_source as;
+        int64_t pid_counter = 0;
+        int tx_completed = 0;
+        int tx_timeouts = 0;
+        int snapshots_taken = 0;
+    };
+    auto state = ss::make_lw_shared<test_state>();
+    auto stm = _stm;
+    auto raft = _raft;
+
+    // Tx loop: begin -> replicate one data batch -> commit, fresh pid per
+    // round.
+    auto tx_fiber = ss::do_until(
+      [state] { return state->as.abort_requested(); },
+      [state, stm] {
+          auto pid = model::producer_identity{state->pid_counter++, 0};
+          auto tx_seq = model::tx_seq{0};
+
+          return stm->begin_tx(pid, tx_seq, timeout, model::partition_id(0))
+            .then([state, stm, pid, tx_seq](auto term) -> ss::future<> {
+                if (!term) {
+                    if (term.error() == cluster::tx::errc::timeout) {
+                        ++state->tx_timeouts;
+                    }
+                    return ss::now();
+                }
+                return replicate_all(*stm, make_batches(pid, 0, 1, true))
+                  .then([state, stm, pid, tx_seq](auto result) -> ss::future<> {
+                      if (!result) {
+                          return stm->abort_tx(pid, tx_seq, timeout)
+                            .discard_result();
+                      }
+                      return stm->commit_tx(pid, tx_seq, timeout)
+                        .then([state](cluster::tx::errc err) {
+                            if (err == cluster::tx::errc::none) {
+                                ++state->tx_completed;
+                            } else if (err == cluster::tx::errc::timeout) {
+                                ++state->tx_timeouts;
+                            }
+                        });
+                  });
+            })
+            .handle_exception([](std::exception_ptr) {});
+      });
+
+    auto snapshot_fiber = ss::do_until(
+      [state] { return state->as.abort_requested(); },
+      [state, stm, raft]() -> ss::future<> {
+          auto offset = stm->last_applied_offset();
+          if (offset < model::offset{0}) {
+              return ss::sleep(1ms);
+          }
+          return raft->stm_manager()
+            ->take_snapshot(offset)
+            .then([state](auto) { ++state->snapshots_taken; })
+            .handle_exception([](std::exception_ptr) {});
+      });
+
+    ss::sleep(5s).finally([state] { state->as.request_abort(); }).get();
+    ss::with_timeout(
+      ss::lowres_clock::now() + 15s,
+      ss::when_all_succeed(std::move(tx_fiber), std::move(snapshot_fiber)))
+      .get();
+
+    vlog(
+      logger.info,
+      "tx_completed={} tx_timeouts={} snapshots_taken={}",
+      state->tx_completed,
+      state->tx_timeouts,
+      state->snapshots_taken);
+
+    BOOST_REQUIRE_GT(state->tx_completed, 0);
+    BOOST_REQUIRE_GT(state->snapshots_taken, 0);
+    // Tx operations must not time out due to lock contention with snapshots.
+    // Failures here indicate the lock inversion stall is live.
+    BOOST_REQUIRE_EQUAL(state->tx_timeouts, 0);
 }

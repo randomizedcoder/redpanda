@@ -12,10 +12,9 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_map.h"
+#include "kafka/protocol/types.h"
 #include "pandaproxy/schema_registry/types.h"
 #include "security/acl_store.h"
-#include "security/logger.h"
-#include "serde/envelope.h"
 #include "serde/read_header.h"
 #include "serde/rw/rw.h"
 #include "utils/to_string.h"
@@ -54,8 +53,9 @@ extract_principal_and_type(std::string_view principal) {
 
 void acl_entry_set::insert(acl_entry entry) {
     auto [it, ins] = _entries.insert(std::move(entry));
-    if (const auto& principal = it->principal();
-        ins && principal.type() == principal_type::role) {
+    if (
+      const auto& principal = it->principal();
+      ins && principal.type() == principal_type::role) {
         _role_cache[principal.name_view()] += 1;
     }
 }
@@ -130,25 +130,28 @@ std::optional<security::acl_match> acl_matches::find(
   const acl_host& host,
   acl_permission perm) const {
     for (const auto& entries : prefixes) {
-        if (auto entry = entries.acl_entry_set.get().find(
-              operation, principal, host, perm);
-            entry.has_value()) {
+        if (
+          auto entry = entries.acl_entry_set.get().find(
+            operation, principal, host, perm);
+          entry.has_value()) {
             return {{entries.resource, *entry}};
         }
     }
 
     if (wildcards) {
-        if (auto entry = wildcards->acl_entry_set.get().find(
-              operation, principal, host, perm);
-            entry.has_value()) {
+        if (
+          auto entry = wildcards->acl_entry_set.get().find(
+            operation, principal, host, perm);
+          entry.has_value()) {
             return {{wildcards->resource, *entry}};
         }
     }
 
     if (literals) {
-        if (auto entry = literals->acl_entry_set.get().find(
-              operation, principal, host, perm);
-            entry.has_value()) {
+        if (
+          auto entry = literals->acl_entry_set.get().find(
+            operation, principal, host, perm);
+          entry.has_value()) {
             return {{literals->resource, *entry}};
         }
     }
@@ -182,14 +185,14 @@ acl_store::find(resource_type resource, const ss::sstring& name) const {
     return acl_matches(wildcards, literals, std::move(prefixes));
 }
 
-std::vector<std::vector<acl_binding>> acl_store::remove_bindings(
-  const std::vector<acl_binding_filter>& filters, bool dry_run) {
+chunked_vector<chunked_vector<acl_binding>> acl_store::remove_bindings(
+  const chunked_vector<acl_binding_filter>& filters, bool dry_run) {
     // the pair<filter, size_t> is used to record the index of the filter in the
     // input so that returned set of matching binding is organized in the same
     // order as the input filters. this is a property needed by the kafka api.
     absl::flat_hash_map<
       resource_pattern,
-      std::vector<std::pair<acl_binding_filter, size_t>>>
+      chunked_vector<std::pair<acl_binding_filter, size_t>>>
       resources;
 
     // collect binding filters that match resources
@@ -246,8 +249,9 @@ std::vector<std::vector<acl_binding>> acl_store::remove_bindings(
                   if (filter.first.entry().matches(entry)) {
                       auto binding = acl_binding(resource, entry);
                       auto [it, _] = deleted.emplace(binding, filter.second);
-                      if (const auto& p = it->first.entry().principal();
-                          !dry_run && p.type() == principal_type::role) {
+                      if (
+                        const auto& p = it->first.entry().principal();
+                        !dry_run && p.type() == principal_type::role) {
                           maybe_roles.emplace_back(p);
                       }
                       return !dry_run;
@@ -263,8 +267,11 @@ std::vector<std::vector<acl_binding>> acl_store::remove_bindings(
         maybe_roles.clear();
     }
 
-    std::vector<std::vector<acl_binding>> res;
-    res.assign(filters.size(), {});
+    chunked_vector<chunked_vector<acl_binding>> res;
+    res.reserve(filters.size());
+    for (size_t i = 0; i < filters.size(); ++i) {
+        res.emplace_back();
+    }
 
     for (const auto& binding : deleted) {
         res[binding.second].push_back(binding.first);
@@ -273,9 +280,9 @@ std::vector<std::vector<acl_binding>> acl_store::remove_bindings(
     return res;
 }
 
-std::vector<acl_binding>
+chunked_vector<acl_binding>
 acl_store::acls(const acl_binding_filter& filter) const {
-    std::vector<acl_binding> result;
+    chunked_vector<acl_binding> result;
     for (const auto& acl : _acls) {
         for (const auto& entry : acl.second) {
             acl_binding binding(acl.first, entry);
@@ -409,128 +416,6 @@ from_string_view<principal_type>(std::string_view str) {
       .default_match(std::nullopt);
 }
 
-std::ostream& operator<<(std::ostream& os, acl_operation op) {
-    return os << to_string_view(op);
-}
-
-std::ostream& operator<<(std::ostream& os, acl_permission perm) {
-    return os << to_string_view(perm);
-}
-
-std::ostream& operator<<(std::ostream& os, resource_type type) {
-    return os << to_string_view(type);
-}
-
-std::ostream& operator<<(std::ostream& os, pattern_type type) {
-    return os << to_string_view(type);
-}
-
-std::ostream& operator<<(std::ostream& os, principal_type type) {
-    return os << to_string_view(type);
-}
-
-std::ostream&
-operator<<(std::ostream& os, const acl_principal_base& principal) {
-    fmt::print(os, "{:l}", principal);
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const resource_pattern& r) {
-    fmt::print(
-      os,
-      "type {{{}}} name {{{}}} pattern {{{}}}",
-      r._resource,
-      r._name,
-      r._pattern);
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const acl_host& host) {
-    if (host._addr) {
-        fmt::print(os, "{{{}}}", *host._addr);
-    } else {
-        // we can log whatever representation we want for a wildcard host,
-        // but kafka expects "*" as the wildcard representation.
-        os << "{{any_host}}";
-    }
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const acl_entry& entry) {
-    fmt::print(
-      os,
-      "{{principal {} host {} op {} perm {}}}",
-      entry._principal,
-      entry._host,
-      entry._operation,
-      entry._permission);
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& os, const acl_binding& binding) {
-    fmt::print(os, "{{pattern {} entry {}}}", binding._pattern, binding._entry);
-    return os;
-}
-
-std::ostream&
-operator<<(std::ostream& os, const resource_pattern_filter::pattern_match&) {
-    fmt::print(os, "{{}}");
-    return os;
-}
-
-std::ostream&
-operator<<(std::ostream& os, resource_pattern_filter::resource_subsystem s) {
-    using resource_subsystem = resource_pattern_filter::resource_subsystem;
-    switch (s) {
-    case resource_subsystem::kafka:
-        return os << "kafka";
-    case resource_subsystem::schema_registry:
-        return os << "schema_registry";
-    }
-    __builtin_unreachable();
-}
-
-std::ostream& operator<<(std::ostream& o, const resource_pattern_filter& f) {
-    fmt::print(
-      o,
-      "{{ resource: {} name: {} pattern: {} subsystem: {}}}",
-      f._resource,
-      f._name,
-      f._pattern,
-      f._subsystem);
-    return o;
-}
-
-std::ostream& operator<<(
-  std::ostream& os, resource_pattern_filter::serialized_pattern_type type) {
-    using pattern_type = resource_pattern_filter::serialized_pattern_type;
-    switch (type) {
-    case pattern_type::literal:
-        return os << "literal";
-    case pattern_type::match:
-        return os << "match";
-    case pattern_type::prefixed:
-        return os << "prefixed";
-    }
-    __builtin_unreachable();
-}
-
-std::ostream& operator<<(std::ostream& o, const acl_entry_filter& f) {
-    fmt::print(
-      o,
-      "{{ pattern: {} host: {} operation: {}, permission: {} }}",
-      f._principal,
-      f._host,
-      f._operation,
-      f._permission);
-    return o;
-}
-
-std::ostream& operator<<(std::ostream& o, const acl_binding_filter& f) {
-    fmt::print(o, "{{ pattern: {} acl: {} }}", f._pattern, f._acl);
-    return o;
-}
-
 bool acl_entry_filter::matches(const acl_entry& other) const {
     if (_principal && _principal != other.principal()) {
         return false;
@@ -561,8 +446,9 @@ resource_pattern_filter::to_resource_patterns() const {
     }
 
     if (_pattern) {
-        if (std::holds_alternative<resource_pattern_filter::pattern_match>(
-              *_pattern)) {
+        if (
+          std::holds_alternative<resource_pattern_filter::pattern_match>(
+            *_pattern)) {
             return {};
         }
         return {
@@ -665,9 +551,10 @@ void write_v0(iobuf& out, resource_pattern_filter filter) {
 
     std::optional<serialized_pattern_type> pattern;
     if (filter.pattern()) {
-        if (std::holds_alternative<
-              security::resource_pattern_filter::pattern_match>(
-              *filter.pattern())) {
+        if (
+          std::holds_alternative<
+            security::resource_pattern_filter::pattern_match>(
+            *filter.pattern())) {
             pattern = serialized_pattern_type::match;
         } else {
             auto source_pattern = std::get<security::pattern_type>(
@@ -754,8 +641,9 @@ void write_other_version(iobuf& out, Writer writer) {
     writer();
 
     const auto written_size = out.size_bytes() - size_before;
-    if (unlikely(
-          written_size > std::numeric_limits<serde::serde_size_t>::max())) {
+    if (
+      unlikely(
+        written_size > std::numeric_limits<serde::serde_size_t>::max())) {
         throw serde::serde_exception("envelope too big");
     }
     const auto size = ss::cpu_to_le(
@@ -823,6 +711,36 @@ void acl_binding_filter::testing_serde_full_read_v2(
       in, bytes_left_limit);
     *this = acl_binding_filter{res._pattern, res._acl};
 }
+
+template<typename T>
+resource_type get_resource_type() {
+    if constexpr (std::is_same_v<T, model::topic>) {
+        return resource_type::topic;
+    } else if constexpr (std::is_same_v<T, kafka::group_id>) {
+        return resource_type::group;
+    } else if constexpr (std::is_same_v<T, acl_cluster_name>) {
+        return resource_type::cluster;
+    } else if constexpr (std::is_same_v<T, kafka::transactional_id>) {
+        return resource_type::transactional_id;
+    } else if constexpr (
+      std::is_same_v<T, pandaproxy::schema_registry::context_subject>) {
+        return resource_type::sr_subject;
+    } else if constexpr (
+      std::is_same_v<T, pandaproxy::schema_registry::registry_resource>) {
+        return resource_type::sr_registry;
+    } else {
+        static_assert(base::unsupported_type<T>::value, "Unsupported type");
+    }
+}
+
+template resource_type get_resource_type<model::topic>();
+template resource_type get_resource_type<kafka::group_id>();
+template resource_type get_resource_type<acl_cluster_name>();
+template resource_type get_resource_type<kafka::transactional_id>();
+template resource_type
+get_resource_type<pandaproxy::schema_registry::context_subject>();
+template resource_type
+get_resource_type<pandaproxy::schema_registry::registry_resource>();
 
 template<typename T>
 const std::vector<acl_operation>& get_allowed_operations() {

@@ -28,13 +28,14 @@ public:
       aws_service_name service,
       aws_region_name region,
       ss::abort_source& as,
-      retry_params retry_params);
+      retry_params retry_params,
+      ss::sstring metrics_tag = "");
 
     /// Fetches credentials from api, the result can be iobuf or an error
     /// encountered during the fetch operation
     ss::future<api_response> fetch_credentials() override;
 
-    std::ostream& print(std::ostream& os) const override;
+    fmt::iterator format_to(fmt::iterator it) const override;
 
 protected:
     /// Helper to parse the iobuf returned from API into a credentials

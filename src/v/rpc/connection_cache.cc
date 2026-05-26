@@ -9,19 +9,13 @@
 
 #include "rpc/connection_cache.h"
 
-#include "rpc/logger.h"
 #include "ssx/semaphore.h"
 #include "utils/backoff_policy.h"
 
 #include <seastar/core/loop.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/smp.hh>
 
-#include <fmt/format.h>
-
 #include <algorithm>
-#include <chrono>
-#include <iterator>
 #include <ranges>
 #include <vector>
 
@@ -142,7 +136,8 @@ connection_cache::connection_cache(
     if (ss::this_shard_id() == _coordinator_shard) {
         _coordinator_state = std::make_unique<coordinator_state>(
           ssx::mutex{"connection_cache"},
-          connection_allocation_strategy(connections_per_node, ss::smp::count));
+          connection_allocation_strategy(
+            connections_per_node, ss::this_smp_shard_count()));
     }
 }
 

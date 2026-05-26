@@ -19,7 +19,6 @@
 #include "kafka/protocol/incremental_alter_configs.h"
 #include "kafka/protocol/metadata.h"
 #include "kafka/server/handlers/topics/types.h"
-#include "kafka/server/rm_group_frontend.h"
 #include "kafka/server/tests/topic_properties_helpers.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -34,7 +33,6 @@
 #include <boost/test/tools/context.hpp>
 #include <boost/test/unit_test.hpp>
 
-#include <functional>
 #include <optional>
 
 using namespace std::chrono_literals; // NOLINT
@@ -55,7 +53,7 @@ public:
         ss::parallel_for_each(
           boost::irange(0, partitions),
           [this, tp_ns](int i) {
-              return wait_for_partition_offset(
+              return wait_for_committed_offset(
                 model::ntp(tp_ns.ns, tp_ns.tp, model::partition_id(i)),
                 model::offset(0));
           })
@@ -488,11 +486,47 @@ public:
         if (enable_cluster_config) {
             update_cluster_config("enable_schema_id_validation", "compat");
             update_cluster_config("cloud_storage_enabled", "true");
+            update_cluster_config("iceberg_enabled", "true");
         }
         auto unset_cluster_config = ss::defer([&] {
             update_cluster_config("enable_schema_id_validation", "none");
             update_cluster_config("cloud_storage_enabled", "false");
+            update_cluster_config("iceberg_enabled", "false");
         });
+
+        // Specific tests for iceberg.
+        if (enable_cluster_config) {
+            const auto iceberg_disabled = props_t{
+              with(kafka::topic_property_iceberg_mode, "disabled")};
+            const auto iceberg_enabled = props_t{
+              with(kafka::topic_property_iceberg_mode, "key_value")};
+            const auto non_enterprise_prop = props_t::value_type{
+              kafka::topic_property_max_message_bytes, "4096"};
+
+            test_cases.emplace_back(
+              "iceberg.enable",
+              iceberg_disabled,
+              alter_props_t{
+                {set(kafka::topic_property_iceberg_mode, "key_value")}},
+              failure);
+            test_cases.emplace_back(
+              "iceberg.disable",
+              iceberg_enabled,
+              alter_props_t{
+                {set(kafka::topic_property_iceberg_mode, "disabled")}},
+              success);
+            test_cases.emplace_back(
+              "iceberg.change_mode",
+              iceberg_enabled,
+              alter_props_t{{set(
+                kafka::topic_property_iceberg_mode, "value_schema_id_prefix")}},
+              success);
+            test_cases.emplace_back(
+              "iceberg.set_other",
+              iceberg_enabled,
+              alter_props_t{{std::apply(set, non_enterprise_prop)}},
+              success);
+        }
 
         // Specific tests for leadership pinning
         {
@@ -752,6 +786,7 @@ FIXTURE_TEST(
       "flush.bytes",
       "redpanda.iceberg.mode",
       "redpanda.leaders.preference",
+      "redpanda.schema.registry.context",
       "delete.retention.ms",
       "min.cleanable.dirty.ratio",
       "redpanda.remote.allowgaps",
@@ -1719,4 +1754,123 @@ FIXTURE_TEST(test_tristate_handling_alter_config, alter_config_test_fixture) {
         assert_property_value(
           test_tp, "min.cleanable.dirty.ratio", "-1", describe_resp);
     }
+}
+
+FIXTURE_TEST(
+  test_schema_registry_context_locked_while_translation_enabled,
+  alter_config_test_fixture) {
+    scoped_config config;
+    config.get("iceberg_enabled").set_value(true);
+
+    model::topic tp{"test-sr-ctx"};
+    BOOST_REQUIRE_EQUAL(
+      create_topic(tp, {{"redpanda.iceberg.mode", "value_schema_id_prefix"}})
+        .data.topics[0]
+        .error_code,
+      kafka::error_code::none);
+
+    // Changing schema_registry_context while translation is enabled must fail.
+    {
+        absl::flat_hash_map<ss::sstring, ss::sstring> props;
+        props.emplace("redpanda.schema.registry.context", ".mycontext");
+        auto resp = alter_configs(
+          make_alter_topic_config_resource_cv(tp, props));
+        BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+        BOOST_REQUIRE_EQUAL(
+          resp.data.responses[0].error_code, kafka::error_code::invalid_config);
+    }
+    {
+        absl::flat_hash_map<
+          ss::sstring,
+          std::
+            pair<std::optional<ss::sstring>, kafka::config_resource_operation>>
+          props;
+        props.emplace(
+          "redpanda.schema.registry.context",
+          std::make_pair(".mycontext", kafka::config_resource_operation::set));
+        auto resp = incremental_alter_configs(
+          make_incremental_alter_topic_config_resource_cv(tp, props));
+        BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+        BOOST_REQUIRE_EQUAL(
+          resp.data.responses[0].error_code, kafka::error_code::invalid_config);
+    }
+
+    // Disable translation, then changing the context must succeed.
+    {
+        absl::flat_hash_map<ss::sstring, ss::sstring> props;
+        props.emplace("redpanda.iceberg.mode", "disabled");
+        BOOST_REQUIRE_EQUAL(
+          alter_configs(make_alter_topic_config_resource_cv(tp, props))
+            .data.responses[0]
+            .error_code,
+          kafka::error_code::none);
+    }
+    {
+        absl::flat_hash_map<ss::sstring, ss::sstring> props;
+        props.emplace("redpanda.schema.registry.context", ".mycontext");
+        auto resp = alter_configs(
+          make_alter_topic_config_resource_cv(tp, props));
+        BOOST_REQUIRE_EQUAL(resp.data.responses.size(), 1);
+        BOOST_REQUIRE_EQUAL(
+          resp.data.responses[0].error_code, kafka::error_code::none);
+    }
+}
+
+FIXTURE_TEST(
+  test_schema_registry_context_and_iceberg_mode_at_creation,
+  alter_config_test_fixture) {
+    scoped_config config;
+    config.get("iceberg_enabled").set_value(true);
+
+    // Setting both iceberg_mode and schema_registry_context in a single
+    // CreateTopics request is valid: the two validators are independent and
+    // both properties are applied atomically.
+    model::topic tp{"test-sr-ctx-create"};
+    BOOST_REQUIRE_EQUAL(
+      create_topic(
+        tp,
+        {{"redpanda.iceberg.mode", "value_schema_id_prefix"},
+         {"redpanda.schema.registry.context", ".mycontext"}})
+        .data.topics[0]
+        .error_code,
+      kafka::error_code::none);
+
+    auto describe_resp = describe_configs(tp);
+    assert_property_value(
+      tp, "redpanda.iceberg.mode", "value_schema_id_prefix", describe_resp);
+    assert_property_value(
+      tp, "redpanda.schema.registry.context", ".mycontext", describe_resp);
+}
+
+FIXTURE_TEST(
+  test_schema_registry_context_sticky_in_alter_configs,
+  alter_config_test_fixture) {
+    scoped_config config;
+    config.get("iceberg_enabled").set_value(true);
+
+    model::topic tp{"test-sr-ctx-sticky"};
+    BOOST_REQUIRE_EQUAL(
+      create_topic(
+        tp,
+        {{"redpanda.iceberg.mode", "disabled"},
+         {"redpanda.schema.registry.context", ".mycontext"}})
+        .data.topics[0]
+        .error_code,
+      kafka::error_code::none);
+
+    // AlterConfigs is full-replace, but schema_registry_context is sticky:
+    // omitting it must not silently reset it to default.
+    {
+        absl::flat_hash_map<ss::sstring, ss::sstring> props;
+        props.emplace("retention.ms", "12345");
+        BOOST_REQUIRE_EQUAL(
+          alter_configs(make_alter_topic_config_resource_cv(tp, props))
+            .data.responses[0]
+            .error_code,
+          kafka::error_code::none);
+    }
+
+    auto describe_resp = describe_configs(tp);
+    assert_property_value(
+      tp, "redpanda.schema.registry.context", ".mycontext", describe_resp);
 }

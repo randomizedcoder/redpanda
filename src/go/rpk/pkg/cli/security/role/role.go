@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	rolePrefix = "RedpandaRole:"
-	userPrefix = "User:"
+	rolePrefix  = "RedpandaRole:"
+	userPrefix  = "User:"
+	groupPrefix = "Group:"
 )
 
 func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -48,9 +49,13 @@ func NewCommand(fs afero.Fs, p *config.Params) *cobra.Command {
 // parsePrincipal returns the prefix, and principal. If no prefix is present,
 // returns 'User'.
 func parsePrincipal(p string) (principalType string, name string) {
-	if strings.HasPrefix(p, userPrefix) {
-		return "User", strings.TrimPrefix(p, userPrefix)
+	if s, ok := strings.CutPrefix(p, userPrefix); ok {
+		return "User", s
 	}
+	if s, ok := strings.CutPrefix(p, groupPrefix); ok {
+		return "Group", s
+	}
+
 	return "User", p
 }
 

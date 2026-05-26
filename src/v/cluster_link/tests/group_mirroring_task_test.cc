@@ -14,8 +14,6 @@
 #include "test_utils/async.h"
 #include "test_utils/test.h"
 
-#include <gmock/gmock.h>
-
 using namespace std::chrono_literals;
 
 namespace cluster_link::tests {
@@ -240,8 +238,7 @@ public:
             for (auto& [p, offset] : partitions) {
                 metadata
                   .offsets[::model::topic(topic)][::model::partition_id(p)]
-                  .committed_offset
-                  = kafka::offset(offset);
+                  .committed_offset = kafka::offset(offset);
             }
         }
     }

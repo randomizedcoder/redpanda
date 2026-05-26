@@ -18,8 +18,6 @@
 #include "model/fundamental.h"
 #include "model/namespace.h"
 
-#include <seastar/core/coroutine.hh>
-
 #include <utility>
 
 namespace cloud_topics {
@@ -87,9 +85,12 @@ ss::future<> cloud_topics_manager::start() {
               return;
           }
           if (
-            config->properties.storage_mode
-              != model::redpanda_storage_mode::cloud
+            !config->is_cloud_topic()
             && model::topic_namespace_view(ntp) != model::l1_metastore_nt) {
+              return;
+          }
+          if (config->is_read_replica()) {
+              // Read replicas are handled explicitly separately.
               return;
           }
           if (is_leader) {

@@ -9,14 +9,11 @@
 
 #pragma once
 
-#include "compaction/types.h"
-#include "model/compression.h"
 #include "model/record.h"
 
 #include <seastar/core/loop.hh>
 
 #include <memory>
-#include <ostream>
 #include <utility>
 
 namespace compaction {
@@ -59,11 +56,14 @@ public:
     // skip compaction. `finalize()` will still be called regardless of the
     // return value here.
     // 2. `operator()(record_batch)`: This operator accepts a record batch
-    // (which has already been determined to be written by a
+    // (which has already been filtered and recompressed by a
     // `compaction::filter`) and is responsible for writing its contents to
     // whichever data format/store this `sink` represents.
-    // 3. `finalize()`: perform any final steps required in the `sink` layer,
-    // i.e flushing in progress writes, update final metadata, etc.
+    // 3. `finalize(success)`: perform any final steps required in the `sink`
+    // layer, i.e flushing in progress writes, update final metadata, etc.
+    // `success` is true if the deduplication pass completed without exception,
+    // false if an exception was caught. Implementations may use this to discard
+    // partially-written state rather than committing it.
     class sink {
     public:
         sink() noexcept = default;
@@ -76,8 +76,10 @@ public:
     public:
         virtual ss::future<bool> initialize(source&) = 0;
         virtual ss::future<ss::stop_iteration>
-        operator()(model::record_batch, model::compression) = 0;
-        virtual ss::future<> finalize() = 0;
+        operator()(model::record_batch) = 0;
+        virtual ss::future<> finalize(bool) = 0;
+        virtual ss::future<> prepare_iteration(kafka::offset) = 0;
+        virtual ss::future<> finish_iteration(kafka::offset, kafka::offset) = 0;
     };
 
     // The source of data for compaction.
@@ -119,8 +121,8 @@ public:
     sliding_window_reducer(const sliding_window_reducer&) = delete;
     sliding_window_reducer& operator=(const sliding_window_reducer&) = delete;
     sliding_window_reducer(sliding_window_reducer&&) noexcept = default;
-    sliding_window_reducer& operator=(sliding_window_reducer&&) noexcept
-      = default;
+    sliding_window_reducer&
+    operator=(sliding_window_reducer&&) noexcept = default;
     ~sliding_window_reducer() noexcept = default;
 
     ss::future<> run() &&;

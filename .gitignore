@@ -139,6 +139,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 genhtml/
+coverage-out/
 
 # Translations
 *.mo
@@ -284,9 +285,13 @@ bazel_cc_flags.json
 
 # claude local settings
 **/.claude/settings.local.json
+**/.claude/worktrees/
 
 # perf
 perf.data*
 
 #nix
 result*
+
+# rpk binary
+src/go/rpk/cmd/rpk/rpk

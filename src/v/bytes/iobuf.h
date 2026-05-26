@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "base/format_to.h"
 #include "base/likely.h"
 #include "base/seastarx.h"
 #include "bytes/details/io_allocation_size.h"
@@ -24,8 +25,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
+#include <span>
 #include <string_view>
 #include <type_traits>
+#include <vector>
+
+class iobuf;
+
+/// \brief a vector of temporary buffers, typically used to represent an
+/// iobuf's fragment structure for zero-copy output operations.
+using scattered_buffer = std::vector<ss::temporary_buffer<char>>;
+
+/// \brief non-owning view over a scattered_buffer, used as the parameter
+/// type for data_sink_impl::put overrides (the seastar API takes a span of
+/// temporary_buffer<char>).
+using scattered_buffer_view = std::span<ss::temporary_buffer<char>>;
 
 /*
  * Our iobuf is a fragmented buffer modeled after
@@ -110,6 +124,21 @@ public:
             append(std::move(buf));
         }
     }
+
+    /// \brief converts this iobuf into a scattered_buffer of
+    /// temporary_buffer<char>. No byte copying occurs, temporary buffers
+    /// reflect the iobuf's fragment structure and take ownership of their
+    /// underlying buffers (using the usual temporary buffer reference
+    /// counting).
+    ///
+    /// After this call returns the iobuf is in an unspecified-but-valid
+    /// state: it may be (and currently is) moved-from, with no fragments
+    /// and zero size. Callers must not rely on the iobuf retaining its
+    /// contents.
+    scattered_buffer as_scattered() &&;
+
+    /// \brief returns the total size in bytes of a scattered_buffer
+    static size_t scattered_size(const scattered_buffer& bufs);
 
     /**
      * Returns a new iobuf of length len with the contents of this iobuf
@@ -276,6 +305,14 @@ public:
     // this method will throw as to not cause an oversized allocation.
     ss::sstring linearize_to_string() const;
 
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{bytes={}, fragments={}}}",
+          size_bytes(),
+          std::distance(cbegin(), cend()));
+    }
+
 private:
     void prepend(std::unique_ptr<fragment>);
 
@@ -292,8 +329,11 @@ private:
 
     container _frags;
     size_t _size{0};
-    friend std::ostream& operator<<(std::ostream&, const iobuf&);
 };
+
+template<>
+struct fmt::range_format_kind<iobuf, char>
+  : std::integral_constant<fmt::range_format, fmt::range_format::disabled> {};
 
 inline void iobuf::clear() {
     _frags.clear_and_dispose(&details::dispose_io_fragment);

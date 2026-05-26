@@ -12,6 +12,7 @@
 #pragma once
 #include "absl/container/node_hash_map.h"
 #include "absl/container/node_hash_set.h"
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "cluster/fwd.h"
 #include "cluster/simple_batch_builder.h"
@@ -42,6 +43,7 @@
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/log.hh>
 
+#include <exception>
 #include <iosfwd>
 #include <optional>
 #include <vector>
@@ -107,13 +109,28 @@ enum class group_state {
     dead,
 };
 
-std::ostream& operator<<(std::ostream&, group_state gs);
+inline std::string_view to_string_view(group_state gs) {
+    switch (gs) {
+    case group_state::empty:
+        return group_state_name_empty;
+    case group_state::preparing_rebalance:
+        return group_state_name_preparing_rebalance;
+    case group_state::completing_rebalance:
+        return group_state_name_completing_rebalance;
+    case group_state::stable:
+        return group_state_name_stable;
+    case group_state::dead:
+        return group_state_name_dead;
+    }
+    std::terminate();
+}
+
+inline fmt::iterator format_to(group_state gs, fmt::iterator out) {
+    return fmt::format_to(out, "{}", to_string_view(gs));
+}
 
 ss::sstring group_state_to_kafka_name(group_state);
 std::optional<group_state> group_state_from_kafka_name(std::string_view);
-cluster::begin_group_tx_reply make_begin_tx_reply(cluster::tx::errc);
-cluster::commit_group_tx_reply make_commit_tx_reply(cluster::tx::errc);
-cluster::abort_group_tx_reply make_abort_tx_reply(cluster::tx::errc);
 kafka::error_code map_store_offset_error_code(std::error_code);
 
 /// \brief A Kafka group.
@@ -222,7 +239,7 @@ public:
          */
         bool non_reclaimable{false};
 
-        friend std::ostream& operator<<(std::ostream&, const offset_metadata&);
+        fmt::iterator format_to(fmt::iterator it) const;
     };
 
     struct offset_metadata_with_probe {
@@ -729,11 +746,11 @@ public:
      */
     ss::future<cluster::tx::errc> abort_txes(bool expired_only);
 
+    fmt::iterator format_to(fmt::iterator it) const;
+
 private:
     using member_map = absl::node_hash_map<kafka::member_id, member_ptr>;
     using protocol_support = absl::node_hash_map<kafka::protocol_name, int>;
-
-    friend std::ostream& operator<<(std::ostream&, const group&);
 
     class ctx_log {
     public:
@@ -860,18 +877,20 @@ private:
     bool has_transactions_in_progress() const;
 
     bool has_pending_transaction(const model::topic_partition& tp) {
-        if (std::any_of(
-              _pending_offset_commits.begin(),
-              _pending_offset_commits.end(),
-              [&tp](const auto& tp_info) { return tp_info.first == tp; })) {
+        if (
+          std::any_of(
+            _pending_offset_commits.begin(),
+            _pending_offset_commits.end(),
+            [&tp](const auto& tp_info) { return tp_info.first == tp; })) {
             return true;
         }
 
-        if (std::any_of(
-              _producers.begin(), _producers.end(), [&tp](const auto& p) {
-                  return p.second.transaction
-                         && p.second.transaction->offsets.contains(tp);
-              })) {
+        if (
+          std::any_of(
+            _producers.begin(), _producers.end(), [&tp](const auto& p) {
+                return p.second.transaction
+                       && p.second.transaction->offsets.contains(tp);
+            })) {
             return true;
         }
 

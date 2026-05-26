@@ -26,15 +26,14 @@
 #include "config/configuration.h"
 #include "features/feature_table.h"
 #include "model/fundamental.h"
-#include "model/metadata.h"
 #include "model/namespace.h"
 #include "raft/fundamental.h"
 #include "raft/fwd.h"
 #include "raft/state_machine_manager.h"
+#include "ssx/future-util.h"
 #include "ssx/when_all.h"
 #include "storage/ntp_config.h"
 
-#include <seastar/core/shared_ptr_incomplete.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 
@@ -169,7 +168,7 @@ cluster::cloud_storage_mode partition::get_cloud_storage_mode() const {
 
     const auto& cfg = _raft->log_config();
 
-    if (cfg.is_read_replica_mode_enabled()) {
+    if (cfg.is_read_replica_mode_enabled() && !cfg.cloud_topic_enabled()) {
         return cluster::cloud_storage_mode::read_replica;
     }
     if (cfg.is_tiered_storage()) {
@@ -473,11 +472,6 @@ ss::future<> partition::start(
     // store partition properties stm offset for fast access
     _partition_properties_stm
       = _raft->stm_manager()->get<cluster::partition_properties_stm>();
-
-    // the cloud topics stm provides access to garbage collection metadata. this
-    // metadata is collected into cluster health reports as a way to disseminate
-    // this information to the garbage collection process.
-    _ctp_stm = _raft->stm_manager()->get<cloud_topics::ctp_stm>();
 
     // Start the probe after the partition is fully initialised
     _probe.setup_metrics(ntp);
@@ -795,6 +789,7 @@ bool partition::should_construct_archiver() {
            // for it.
            && _raft->ntp().ns == model::kafka_namespace
            && _raft->ntp().tp.topic != model::kafka_consumer_offsets_topic
+           && !ntp_config.cloud_topic_enabled()
            && (ntp_config.is_archival_enabled() || ntp_config.is_read_replica_mode_enabled());
 }
 
@@ -1423,7 +1418,7 @@ partition::do_unsafe_reset_remote_partition_manifest_from_cloud(bool force) {
     }
 
     const auto max_removable
-      = _raft->log()->stm_manager()->max_removable_local_log_offset();
+      = _raft->log()->stm_hookset()->max_removable_local_log_offset();
     if (new_manifest.get_last_offset() < max_removable) {
         auto msg = ssx::sformat(
           "Applying the cloud manifest would cause data loss since the last "
@@ -1455,68 +1450,83 @@ partition::get_cloud_storage_manifest_view() {
 ss::future<result<model::offset, std::error_code>>
 partition::sync_kafka_start_offset_override(
   model::timeout_clock::duration timeout) {
-    if (is_read_replica_mode_enabled()) {
-        auto term = _raft->term();
-        if (!co_await _archival_meta_stm->sync(timeout)) {
-            if (term != _raft->term()) {
-                co_return errc::not_leader;
-            } else {
-                co_return errc::timeout;
+    try {
+        if (is_read_replica_mode_enabled()) {
+            auto term = _raft->term();
+            if (!co_await _archival_meta_stm->sync(timeout)) {
+                if (term != _raft->term()) {
+                    co_return errc::not_leader;
+                } else {
+                    co_return errc::timeout;
+                }
+            }
+            auto start_kafka_offset = _archival_meta_stm->manifest()
+                                        .get_start_kafka_offset_override();
+
+            co_return kafka::offset_cast(start_kafka_offset);
+        }
+
+        if (_log_eviction_stm) {
+            auto offset_res = co_await _log_eviction_stm
+                                ->sync_kafka_start_offset_override(timeout);
+            if (offset_res.has_failure()) {
+                co_return offset_res.as_failure();
+            }
+            if (offset_res.value() != kafka::offset{}) {
+                co_return kafka::offset_cast(offset_res.value());
             }
         }
+
+        if (!_archival_meta_stm) {
+            co_return model::offset{};
+        }
+
+        // There are a few cases in which the log_eviction_stm will return a
+        // kafka offset of `kafka::offset{}` for the start offset override.
+        // - The topic was remotely recovered.
+        // - A start offset override was never set.
+        // - The broker has restarted and the log_eviction_stm couldn't recover
+        //   the kafka offset for the start offset override.
+        //
+        // In all cases we'll need to fall back to the archival stm to figure
+        // out if a start offset override exists, and if so, what it is.
+        //
+        // For this we'll sync the archival stm a single time to ensure we have
+        // the most up-to-date manifest. From that point onwards the offset
+        // `_archival_meta_stm->manifest().get_start_kafka_offset_override()`
+        // will be correct without having to sync again. This is since the
+        // offset will not change until another offset override has been applied
+        // to the log eviction stm. And at that point the log eviction stm will
+        // be able to give us the correct offset override.
+        if (!_has_synced_archival_for_start_override) [[unlikely]] {
+            auto term = _raft->term();
+            if (!co_await _archival_meta_stm->sync(timeout)) {
+                if (term != _raft->term()) {
+                    co_return errc::not_leader;
+                } else {
+                    co_return errc::timeout;
+                }
+            }
+            _has_synced_archival_for_start_override = true;
+        }
+
         auto start_kafka_offset
           = _archival_meta_stm->manifest().get_start_kafka_offset_override();
-
         co_return kafka::offset_cast(start_kafka_offset);
-    }
-
-    if (_log_eviction_stm) {
-        auto offset_res = co_await _log_eviction_stm
-                            ->sync_kafka_start_offset_override(timeout);
-        if (offset_res.has_failure()) {
-            co_return offset_res.as_failure();
+    } catch (...) {
+        auto eptr = std::current_exception();
+        bool is_shutdown = ssx::is_shutdown_exception(eptr);
+        vlogl(
+          clusterlog,
+          is_shutdown ? ss::log_level::debug : ss::log_level::warn,
+          "ntp {}: exception in sync_kafka_start_offset_override: {}",
+          _raft->ntp(),
+          eptr);
+        if (is_shutdown) {
+            co_return errc::shutting_down;
         }
-        if (offset_res.value() != kafka::offset{}) {
-            co_return kafka::offset_cast(offset_res.value());
-        }
+        co_return errc::timeout;
     }
-
-    if (!_archival_meta_stm) {
-        co_return model::offset{};
-    }
-
-    // There are a few cases in which the log_eviction_stm will return a kafka
-    // offset of `kafka::offset{}` for the start offset override.
-    // - The topic was remotely recovered.
-    // - A start offset override was never set.
-    // - The broker has restarted and the log_eviction_stm couldn't recover the
-    //   kafka offset for the start offset override.
-    //
-    // In all cases we'll need to fall back to the archival stm to figure out if
-    // a start offset override exists, and if so, what it is.
-    //
-    // For this we'll sync the archival stm a single time to ensure we have the
-    // most up-to-date manifest. From that point onwards the offset
-    // `_archival_meta_stm->manifest().get_start_kafka_offset_override()` will
-    // be correct without having to sync again. This is since the offset will
-    // not change until another offset override has been applied to the log
-    // eviction stm. And at that point the log eviction stm will be able to give
-    // us the correct offset override.
-    if (!_has_synced_archival_for_start_override) [[unlikely]] {
-        auto term = _raft->term();
-        if (!co_await _archival_meta_stm->sync(timeout)) {
-            if (term != _raft->term()) {
-                co_return errc::not_leader;
-            } else {
-                co_return errc::timeout;
-            }
-        }
-        _has_synced_archival_for_start_override = true;
-    }
-
-    auto start_kafka_offset
-      = _archival_meta_stm->manifest().get_start_kafka_offset_override();
-    co_return kafka::offset_cast(start_kafka_offset);
 }
 
 model::offset partition::last_stable_offset() const {
@@ -1539,8 +1549,8 @@ ss::shared_ptr<cluster::id_allocator_stm> partition::id_allocator_stm() const {
     return _raft->stm_manager()->get<cluster::id_allocator_stm>();
 }
 
-std::ostream& operator<<(std::ostream& o, const partition& x) {
-    return o << x._raft;
+fmt::iterator partition::format_to(fmt::iterator it) const {
+    return fmt::format_to(it, "{}", *_raft);
 }
 ss::shared_ptr<cluster::tm_stm> partition::tm_stm() {
     return _raft->stm_manager()->get<cluster::tm_stm>();
@@ -1573,7 +1583,7 @@ partition::archival_meta_stm() const {
 }
 
 model::offset partition::max_removable_local_log_offset() {
-    return _raft->log()->stm_manager()->max_removable_local_log_offset();
+    return _raft->log()->stm_hookset()->max_removable_local_log_offset();
 }
 
 std::optional<model::offset> partition::kafka_start_offset_override() const {
@@ -1843,13 +1853,6 @@ ss::future<result<ss::rwlock::holder>> partition::hold_writes_enabled() {
     }
 
     co_return *std::move(maybe_units);
-}
-
-std::optional<int64_t> partition::cloud_topic_max_gc_eligible_epoch() const {
-    if (_ctp_stm) {
-        return _ctp_stm->estimate_inactive_epoch();
-    }
-    return std::nullopt;
 }
 
 ss::sharded<cloud_topics::state_accessors>*

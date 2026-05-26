@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/hash/hash.h"
+#include "base/format_to.h"
 #include "base/seastarx.h"
 #include "base/units.h"
 #include "model/fundamental.h"
@@ -57,8 +58,7 @@ struct broker_properties
 
     bool operator==(const broker_properties& other) const = default;
 
-    friend std::ostream&
-    operator<<(std::ostream&, const model::broker_properties&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     auto serde_fields() {
         return std::tie(
@@ -88,7 +88,7 @@ struct broker_endpoint final
       : address(std::move(address)) {}
 
     bool operator==(const broker_endpoint&) const = default;
-    friend std::ostream& operator<<(std::ostream&, const broker_endpoint&);
+    fmt::iterator format_to(fmt::iterator it) const;
 
     static std::optional<ss::sstring>
     validate_not_is_addr_any(const broker_endpoint& ep) {
@@ -169,8 +169,8 @@ enum class membership_state : int8_t { active, draining, removed };
  */
 enum class maintenance_state { active, inactive };
 
-std::ostream& operator<<(std::ostream&, membership_state);
-std::ostream& operator<<(std::ostream&, maintenance_state);
+fmt::iterator format_to(membership_state st, fmt::iterator out);
+fmt::iterator format_to(maintenance_state st, fmt::iterator out);
 
 class broker
   : public serde::
@@ -242,14 +242,14 @@ public:
           _id, _kafka_advertised_listeners, _rpc_address, _rack, _properties);
     }
 
+    fmt::iterator format_to(fmt::iterator it) const;
+
 private:
     node_id _id;
     std::vector<broker_endpoint> _kafka_advertised_listeners;
     net::unresolved_address _rpc_address;
     std::optional<rack_id> _rack;
     broker_properties _properties;
-
-    friend std::ostream& operator<<(std::ostream&, const broker&);
 };
 
 /// type representing single replica assignment it contains the id of a broker
@@ -260,7 +260,7 @@ struct broker_shard {
     /// however, seastar uses unsized-ints (unsigned)
     /// and for predictability we need fixed-sized ints
     uint32_t shard;
-    friend std::ostream& operator<<(std::ostream&, const broker_shard&);
+    fmt::iterator format_to(fmt::iterator it) const;
     bool operator==(const broker_shard&) const = default;
     auto operator<=>(const model::broker_shard&) const = default;
 
@@ -295,9 +295,9 @@ struct partition_metadata
     std::vector<broker_shard> replicas;
     std::optional<model::node_id> leader_node;
 
-    friend std::ostream& operator<<(std::ostream&, const partition_metadata&);
-    friend bool operator==(const partition_metadata&, const partition_metadata&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+    friend bool
+    operator==(const partition_metadata&, const partition_metadata&) = default;
 
     auto serde_fields() { return std::tie(id, replicas, leader_node); }
 };
@@ -306,6 +306,8 @@ enum class isolation_level : int8_t {
     read_uncommitted = 0,
     read_committed = 1,
 };
+
+fmt::iterator format_to(isolation_level l, fmt::iterator out);
 
 struct topic_namespace_view {
     topic_namespace_view(const model::ns& n, const model::topic& t)
@@ -331,7 +333,7 @@ struct topic_namespace_view {
     const model::ns& ns;
     const model::topic& tp;
 
-    friend std::ostream& operator<<(std::ostream&, const topic_namespace_view&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct topic_namespace {
@@ -355,8 +357,8 @@ struct topic_namespace {
         return tp == other.tp && ns == other.ns;
     }
 
-    friend bool operator==(const topic_namespace&, const topic_namespace&)
-      = default;
+    friend bool
+    operator==(const topic_namespace&, const topic_namespace&) = default;
 
     bool operator<(const topic_namespace_view& other) const {
         return topic_namespace_view(*this) < other;
@@ -390,7 +392,7 @@ struct topic_namespace {
 
     ss::sstring path() const;
 
-    friend std::ostream& operator<<(std::ostream&, const topic_namespace&);
+    fmt::iterator format_to(fmt::iterator it) const;
 };
 
 struct topic_namespace_hash {
@@ -437,9 +439,9 @@ struct topic_metadata
     topic_namespace tp_ns;
     std::vector<partition_metadata> partitions;
 
-    friend std::ostream& operator<<(std::ostream&, const topic_metadata&);
-    friend bool operator==(const topic_metadata&, const topic_metadata&)
-      = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+    friend bool
+    operator==(const topic_metadata&, const topic_metadata&) = default;
 
     auto serde_fields() { return std::tie(tp_ns, partitions); }
 };
@@ -453,7 +455,7 @@ enum class cloud_credentials_source {
     azure_vm_instance_metadata = 5,
 };
 
-std::ostream& operator<<(std::ostream& os, const cloud_credentials_source& cs);
+fmt::iterator format_to(cloud_credentials_source cs, fmt::iterator out);
 
 enum class partition_autobalancing_mode {
     off = 0,
@@ -461,16 +463,17 @@ enum class partition_autobalancing_mode {
     continuous,
 };
 
-inline std::ostream&
-operator<<(std::ostream& o, const partition_autobalancing_mode& m) {
+inline fmt::iterator
+format_to(partition_autobalancing_mode m, fmt::iterator out) {
     switch (m) {
-    case model::partition_autobalancing_mode::off:
-        return o << "off";
-    case model::partition_autobalancing_mode::node_add:
-        return o << "node_add";
-    case model::partition_autobalancing_mode::continuous:
-        return o << "continuous";
+    case partition_autobalancing_mode::off:
+        return fmt::format_to(out, "off");
+    case partition_autobalancing_mode::node_add:
+        return fmt::format_to(out, "node_add");
+    case partition_autobalancing_mode::continuous:
+        return fmt::format_to(out, "continuous");
     }
+    return fmt::format_to(out, "unknown");
 }
 
 enum class cloud_storage_backend : uint8_t {
@@ -483,28 +486,30 @@ enum class cloud_storage_backend : uint8_t {
     unknown
 };
 
-inline std::ostream& operator<<(std::ostream& os, cloud_storage_backend csb) {
+inline fmt::iterator format_to(cloud_storage_backend csb, fmt::iterator out) {
     switch (csb) {
     case cloud_storage_backend::aws:
-        return os << "aws";
+        return fmt::format_to(out, "aws");
     case cloud_storage_backend::google_s3_compat:
-        return os << "google_s3_compat";
+        return fmt::format_to(out, "google_s3_compat");
     case cloud_storage_backend::azure:
-        return os << "azure";
+        return fmt::format_to(out, "azure");
     case cloud_storage_backend::minio:
-        return os << "minio";
+        return fmt::format_to(out, "minio");
     case cloud_storage_backend::oracle_s3_compat:
-        return os << "oracle_s3_compat";
+        return fmt::format_to(out, "oracle_s3_compat");
     case cloud_storage_backend::linode_s3_compat:
-        return os << "linode_s3_compat";
+        return fmt::format_to(out, "linode_s3_compat");
     case cloud_storage_backend::unknown:
-        return os << "unknown";
+        return fmt::format_to(out, "unknown");
     }
+    return fmt::format_to(out, "unknown");
 }
 
 enum class leader_balancer_mode : uint8_t {
     calibrated = 0,
     random = 1,
+    greedy = 2,
 };
 
 constexpr const char*
@@ -514,13 +519,15 @@ leader_balancer_mode_to_string(leader_balancer_mode mode) {
         return "calibrated";
     case leader_balancer_mode::random:
         return "random";
+    case leader_balancer_mode::greedy:
+        return "greedy";
     default:
         throw std::invalid_argument("unknown leader_balancer_mode");
     }
 }
 
-inline std::ostream& operator<<(std::ostream& os, leader_balancer_mode mode) {
-    return os << leader_balancer_mode_to_string(mode);
+inline fmt::iterator format_to(leader_balancer_mode mode, fmt::iterator out) {
+    return fmt::format_to(out, "{}", leader_balancer_mode_to_string(mode));
 }
 
 enum class cloud_storage_chunk_eviction_strategy {
@@ -529,16 +536,17 @@ enum class cloud_storage_chunk_eviction_strategy {
     predictive = 2,
 };
 
-inline std::ostream&
-operator<<(std::ostream& os, cloud_storage_chunk_eviction_strategy st) {
+inline fmt::iterator
+format_to(cloud_storage_chunk_eviction_strategy st, fmt::iterator out) {
     switch (st) {
     case cloud_storage_chunk_eviction_strategy::eager:
-        return os << "eager";
+        return fmt::format_to(out, "eager");
     case cloud_storage_chunk_eviction_strategy::capped:
-        return os << "capped";
+        return fmt::format_to(out, "capped");
     case cloud_storage_chunk_eviction_strategy::predictive:
-        return os << "predictive";
+        return fmt::format_to(out, "predictive");
     }
+    return fmt::format_to(out, "unknown");
 }
 
 enum class fetch_read_strategy : uint8_t {
@@ -563,7 +571,7 @@ constexpr const char* fetch_read_strategy_to_string(fetch_read_strategy s) {
     }
 }
 
-std::ostream& operator<<(std::ostream&, fetch_read_strategy);
+fmt::iterator format_to(fetch_read_strategy s, fmt::iterator out);
 std::istream& operator>>(std::istream&, fetch_read_strategy&);
 
 /**
@@ -600,7 +608,7 @@ constexpr const char* write_caching_mode_to_string(write_caching_mode s) {
 std::optional<write_caching_mode>
   write_caching_mode_from_string(std::string_view);
 
-std::ostream& operator<<(std::ostream&, write_caching_mode);
+fmt::iterator format_to(write_caching_mode s, fmt::iterator out);
 std::istream& operator>>(std::istream&, write_caching_mode&);
 
 // Storage mode for a Redpanda topic
@@ -611,6 +619,7 @@ enum class redpanda_storage_mode : uint8_t {
     local = 0,
     tiered = 1,
     cloud = 2,
+    tiered_cloud = 3,
     unset = 255
 };
 
@@ -622,6 +631,8 @@ constexpr const char* redpanda_storage_mode_to_string(redpanda_storage_mode m) {
         return "tiered";
     case redpanda_storage_mode::cloud:
         return "cloud";
+    case redpanda_storage_mode::tiered_cloud:
+        return "tiered_cloud";
     case redpanda_storage_mode::unset:
         return "unset";
     }
@@ -631,7 +642,7 @@ constexpr const char* redpanda_storage_mode_to_string(redpanda_storage_mode m) {
 std::optional<redpanda_storage_mode>
   redpanda_storage_mode_from_string(std::string_view);
 
-std::ostream& operator<<(std::ostream&, redpanda_storage_mode);
+fmt::iterator format_to(redpanda_storage_mode m, fmt::iterator out);
 std::istream& operator>>(std::istream&, redpanda_storage_mode&);
 
 enum class recovery_validation_mode : std::uint16_t {
@@ -645,7 +656,7 @@ enum class recovery_validation_mode : std::uint16_t {
     no_check = 0xff,
 };
 
-std::ostream& operator<<(std::ostream&, recovery_validation_mode);
+fmt::iterator format_to(recovery_validation_mode vm, fmt::iterator out);
 std::istream& operator>>(std::istream&, recovery_validation_mode&);
 
 // Iceberg enablement options for a topic
@@ -716,6 +727,7 @@ public:
     }
 
     bool operator==(const iceberg_mode&) const = default;
+    fmt::iterator format_to(fmt::iterator it) const;
 
     friend void write_nested(iobuf& out, const iceberg_mode& m);
 
@@ -764,7 +776,6 @@ private:
       _impl;
 };
 
-std::ostream& operator<<(std::ostream&, const iceberg_mode&);
 std::istream& operator>>(std::istream&, iceberg_mode&);
 
 // How to handle invalid records during Iceberg translation.
@@ -775,8 +786,24 @@ enum class iceberg_invalid_record_action : uint8_t {
     dlq_table = 1,
 };
 
-std::ostream& operator<<(std::ostream&, const iceberg_invalid_record_action&);
+fmt::iterator format_to(iceberg_invalid_record_action a, fmt::iterator out);
 std::istream& operator>>(std::istream&, iceberg_invalid_record_action&);
+
+/// Whether field names are compared case-insensitively when matching
+/// Redpanda's schema against the one returned by the Iceberg catalog.
+/// Some catalogs (e.g. AWS Glue) return field names with inconsistent casing
+/// relative to what was originally written, so exact-match comparisons fail.
+enum class iceberg_schema_case_insensitive : uint8_t {
+    /// Infer from catalog type: yes for Glue, no otherwise.
+    auto_ = 0,
+    /// Exact (case-sensitive) comparison.
+    no = 1,
+    /// Case-insensitive comparison (Unicode lowercase via boost::locale).
+    yes = 2,
+};
+
+fmt::iterator format_to(iceberg_schema_case_insensitive n, fmt::iterator out);
+std::istream& operator>>(std::istream&, iceberg_schema_case_insensitive&);
 
 enum class kafka_batch_validation_mode : uint8_t {
     legacy = 0,
@@ -799,31 +826,10 @@ kafka_batch_validation_mode_to_string(const kafka_batch_validation_mode& m) {
 std::optional<kafka_batch_validation_mode>
 kafka_batch_validation_mode_from_string(std::string_view s);
 
-std::ostream&
-operator<<(std::ostream& o, const kafka_batch_validation_mode& mode);
-
+fmt::iterator format_to(kafka_batch_validation_mode m, fmt::iterator out);
 std::istream& operator>>(std::istream& i, kafka_batch_validation_mode& mode);
 
 } // namespace model
-
-template<>
-struct fmt::formatter<model::isolation_level> final
-  : fmt::formatter<std::string_view> {
-    using isolation_level = model::isolation_level;
-    template<typename FormatContext>
-    auto format(const isolation_level& s, FormatContext& ctx) const {
-        std::string_view str = "unknown";
-        switch (s) {
-        case isolation_level::read_uncommitted:
-            str = "read_uncommitted";
-            break;
-        case isolation_level::read_committed:
-            str = "read_committed";
-            break;
-        }
-        return fmt::format_to(ctx.out(), "{}", str);
-    }
-};
 
 namespace std {
 template<>

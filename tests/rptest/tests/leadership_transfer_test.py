@@ -8,14 +8,15 @@
 # by the Apache License, Version 2.0
 
 import collections
-from enum import Enum
 from dataclasses import dataclass
+from enum import Enum
 import math
 import random
 import time
-from typing import Dict
+from typing import Any, TypedDict, cast
 
 from ducktape.mark import matrix
+from ducktape.tests.test import TestContext
 from ducktape.utils.util import wait_until
 
 from rptest.clients.kafka_cat import KafkaCat
@@ -23,9 +24,33 @@ from rptest.clients.rpk import RpkTool
 from rptest.clients.types import TopicSpec
 from rptest.services.admin import Admin
 from rptest.services.cluster import cluster
-from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST
+from rptest.services.redpanda import RESTART_LOG_ALLOW_LIST, ResourceSettings
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import wait_until_result
+
+
+class ReplicaMetadata(TypedDict):
+    id: int
+
+
+class BrokerMetadata(TypedDict):
+    id: int
+
+
+class PartitionMetadata(TypedDict):
+    partition: int
+    leader: int
+    replicas: list[ReplicaMetadata]
+
+
+class TopicMetadata(TypedDict):
+    topic: str
+    partitions: list[PartitionMetadata]
+
+
+class KafkaMetadata(TypedDict):
+    brokers: list[BrokerMetadata]
+    topics: list[TopicMetadata]
 
 
 class LeadershipTransferTest(RedpandaTest):
@@ -35,7 +60,7 @@ class LeadershipTransferTest(RedpandaTest):
 
     topics = (TopicSpec(partition_count=3, replication_factor=3),)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super(LeadershipTransferTest, self).__init__(
             *args,
             extra_rp_conf={
@@ -47,23 +72,29 @@ class LeadershipTransferTest(RedpandaTest):
         )
 
     @cluster(num_nodes=3)
-    def test_controller_recovery(self):
+    def test_controller_recovery(self) -> None:
         kc = KafkaCat(self.redpanda)
 
         # choose a partition and a target node
         partition = self._get_partition(kc)
         target_node_id = next(
-            filter(lambda r: r["id"] != partition["leader"], partition["replicas"])
-        )["id"]
+            replica["id"]
+            for replica in partition["replicas"]
+            if replica["id"] != partition["leader"]
+        )
         self.logger.debug(
             f"Transfering leader from {partition['leader']} to {target_node_id}"
         )
 
         # build the transfer url
-        meta = kc.metadata()
+        meta = cast(KafkaMetadata, kc.metadata())
         brokers = meta["brokers"]
-        source_broker = next(filter(lambda b: b["id"] == partition["leader"], brokers))
-        target_broker = next(filter(lambda b: b["id"] == target_node_id, brokers))
+        source_broker = next(
+            broker for broker in brokers if broker["id"] == partition["leader"]
+        )
+        target_broker = next(
+            broker for broker in brokers if broker["id"] == target_node_id
+        )
         self.logger.debug(f"Source broker {source_broker}")
         self.logger.debug(f"Target broker {target_broker}")
 
@@ -76,15 +107,14 @@ class LeadershipTransferTest(RedpandaTest):
             "kafka", self.topic, partition_id, target_node_id
         )
 
-        def transfer_complete():
+        def transfer_complete() -> bool:
             for _ in range(3):  # just give it a moment
                 time.sleep(1)
-                meta = kc.metadata()
+                meta = cast(KafkaMetadata, kc.metadata())
                 partition = next(
-                    filter(
-                        lambda p: p["partition"] == partition_id,
-                        meta["topics"][0]["partitions"],
-                    )
+                    topic_partition
+                    for topic_partition in meta["topics"][0]["partitions"]
+                    if topic_partition["partition"] == partition_id
                 )
                 if partition["leader"] == target_node_id:
                     return True
@@ -97,24 +127,27 @@ class LeadershipTransferTest(RedpandaTest):
             err_msg="Transfer did not complete",
         )
 
-    def _get_partition(self, kc):
-        def get_partition():
-            meta = kc.metadata()
+    def _get_partition(self, kc: KafkaCat) -> PartitionMetadata:
+        def get_partition() -> tuple[bool, PartitionMetadata]:
+            meta = cast(KafkaMetadata, kc.metadata())
             topics = meta["topics"]
             assert len(topics) == 1
             assert topics[0]["topic"] == self.topic
             partition = random.choice(topics[0]["partitions"])
             return partition["leader"] > 0, partition
 
-        return wait_until_result(
-            get_partition,
-            timeout_sec=30,
-            backoff_sec=2,
-            err_msg="No partition with leader available",
+        return cast(
+            PartitionMetadata,
+            wait_until_result(
+                get_partition,
+                timeout_sec=30,
+                backoff_sec=2,
+                err_msg="No partition with leader available",
+            ),
         )
 
     @cluster(num_nodes=3)
-    def test_self_transfer(self):
+    def test_self_transfer(self) -> None:
         admin = Admin(self.redpanda)
         for topic in self.topics:
             for partition in range(topic.partition_count):
@@ -124,25 +157,31 @@ class LeadershipTransferTest(RedpandaTest):
                 )
 
 
-class MultiTopicAutomaticLeadershipBalancingTest(RedpandaTest):
-    def __init__(self, test_context):
-        extra_rp_conf = dict(
+class TopicAwareRebalanceTestBase(RedpandaTest):
+    def __init__(
+        self,
+        test_context: TestContext,
+        mode: str,
+        topic_specs: list[TopicSpec],
+        leaders_per_node_ratio: float = 0.8,
+        improvement_deadline: int = 70,
+        require_even_distribution: bool = False,
+        **kwargs: Any,
+    ):
+        extra_rp_conf: dict[str, Any] = dict(
             leader_balancer_idle_timeout=20000,
-            leader_balancer_mode="random_hill_climbing",
+            leader_balancer_mode=mode,
         )
 
-        super(MultiTopicAutomaticLeadershipBalancingTest, self).__init__(
-            test_context=test_context, extra_rp_conf=extra_rp_conf
+        super().__init__(
+            test_context=test_context, extra_rp_conf=extra_rp_conf, **kwargs
         )
-        self.topics = [
-            TopicSpec(partition_count=61, replication_factor=3),
-            TopicSpec(partition_count=151, replication_factor=3),
-        ]
-        if not self.debug_mode:
-            self.topics.append(TopicSpec(partition_count=263, replication_factor=3))
+        self.topics = topic_specs
+        self._leaders_per_node_ratio = leaders_per_node_ratio
+        self._improvement_deadline = improvement_deadline
+        self._require_even_distribution = require_even_distribution
 
-    @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
-    def test_topic_aware_rebalance(self):
+    def _do_test_topic_aware_rebalance(self, num_nodes: int = 3):
         def all_partitions_present(nodes: int):
             for t in self.topics:
                 tps = self.redpanda.partitions(t.name)
@@ -171,16 +210,16 @@ class MultiTopicAutomaticLeadershipBalancingTest(RedpandaTest):
 
             return True
 
-        def count_leaders_per_node(topic_name: str):
-            leaders_per_node = collections.defaultdict(int)
+        def count_leaders_per_node(topic_name: str) -> dict[int, int]:
+            leaders_per_node: dict[int, int] = collections.defaultdict(int)
             tps = self.redpanda.partitions(topic_name)
             for p in tps:
                 if p.leader:
-                    leaders_per_node[p.leader] += 1
+                    leaders_per_node[self.redpanda.node_id(p.leader)] += 1
 
             return leaders_per_node
 
-        def distribution_error():
+        def distribution_error() -> float:
             nodes = [self.redpanda.node_id(n) for n in self.redpanda.started_nodes()]
             error = 0.0
             for t in self.topics:
@@ -206,22 +245,24 @@ class MultiTopicAutomaticLeadershipBalancingTest(RedpandaTest):
                 leader_cnt >= min_per_node for leader_cnt in leaders_per_node.values()
             )
 
-        def topic_leadership_evenly_distributed():
+        def topic_leadership_evenly_distributed() -> bool:
             for t in self.topics:
-                expected_leaders_per_node = int(0.8 * (t.partition_count / 3))
+                expected_leaders_per_node = int(
+                    self._leaders_per_node_ratio * (t.partition_count / num_nodes)
+                )
                 self.logger.info(
                     f"for topic {t} expecting {expected_leaders_per_node} leaders"
                 )
 
-                if not has_leader_count(t.name, expected_leaders_per_node, 3):
+                if not has_leader_count(t.name, expected_leaders_per_node, num_nodes):
                     return False
 
             return True
 
         self.logger.info("initial stabilization")
         wait_until(
-            lambda: all_partitions_present(3),
-            timeout_sec=30,
+            lambda: all_partitions_present(num_nodes),
+            timeout_sec=120,
             backoff_sec=2,
             err_msg="Leadership did not stablize",
         )
@@ -230,8 +271,8 @@ class MultiTopicAutomaticLeadershipBalancingTest(RedpandaTest):
         self.redpanda.stop_node(node)
         self.logger.info("stabilization post stop")
         wait_until(
-            lambda: all_partitions_present(2),
-            timeout_sec=30,
+            lambda: all_partitions_present(num_nodes - 1),
+            timeout_sec=120,
             backoff_sec=2,
             err_msg="Leadership did not stablize",
         )
@@ -248,7 +289,32 @@ class MultiTopicAutomaticLeadershipBalancingTest(RedpandaTest):
             start_timeout = 60
         self.redpanda.start_node(node, timeout=start_timeout)
 
-        def wait_for_topics_evenly_distributed(improvement_deadline):
+        admin = Admin(self.redpanda)
+
+        def cluster_healthy() -> bool:
+            try:
+                overview = admin.get_cluster_health_overview()
+                return overview.get("is_healthy", False)
+            except Exception:
+                return False
+
+        self.logger.info("waiting for healthy cluster post start")
+        wait_until(
+            cluster_healthy,
+            timeout_sec=120,
+            backoff_sec=2,
+            err_msg="Cluster did not become healthy after restart",
+        )
+
+        self.logger.info("waiting for leadership to stabilize post start")
+        wait_until(
+            lambda: all_partitions_present(num_nodes),
+            timeout_sec=120,
+            backoff_sec=2,
+            err_msg="Leadership did not stablize after restart",
+        )
+
+        def wait_for_topics_evenly_distributed(improvement_deadline: int) -> bool:
             last_update = time.time()
             last_error = distribution_error()
             while time.time() - last_update < improvement_deadline:
@@ -264,8 +330,88 @@ class MultiTopicAutomaticLeadershipBalancingTest(RedpandaTest):
 
                 time.sleep(5)
 
+            return False
+
         self.logger.info("stabilization post start")
-        wait_for_topics_evenly_distributed(30)
+        balanced = wait_for_topics_evenly_distributed(self._improvement_deadline)
+        if self._require_even_distribution:
+            assert balanced
+
+
+class MultiTopicAutomaticLeadershipBalancingTest(TopicAwareRebalanceTestBase):
+    def __init__(self, test_context: TestContext):
+        topics = [
+            TopicSpec(partition_count=61, replication_factor=3),
+            TopicSpec(partition_count=151, replication_factor=3),
+        ]
+        super().__init__(
+            test_context,
+            mode="random_hill_climbing",
+            topic_specs=topics,
+        )
+        # Avoid the largest topic in debug builds where it is slow.
+        if not self.debug_mode:
+            assert isinstance(self.topics, list)
+            self.topics.append(TopicSpec(partition_count=263, replication_factor=3))
+
+    @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_topic_aware_rebalance(self):
+        self._do_test_topic_aware_rebalance()
+
+
+class GreedyLeaderBalancingTest(TopicAwareRebalanceTestBase):
+    def __init__(self, test_context: TestContext):
+        super().__init__(
+            test_context,
+            mode="greedy",
+            topic_specs=[
+                TopicSpec(partition_count=9, replication_factor=3),
+                TopicSpec(partition_count=9, replication_factor=3),
+            ],
+            leaders_per_node_ratio=1.0,
+            improvement_deadline=120,
+            require_even_distribution=True,
+        )
+
+    @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_greedy_rebalance(self):
+        self._do_test_topic_aware_rebalance()
+
+
+class GreedyLeaderBalancingFourShardsTest(TopicAwareRebalanceTestBase):
+    def __init__(self, test_context: TestContext):
+        super().__init__(
+            test_context,
+            mode="greedy",
+            topic_specs=[],
+            leaders_per_node_ratio=1.0,
+            improvement_deadline=120,
+            require_even_distribution=True,
+            resource_settings=ResourceSettings(num_cpus=4),
+        )
+
+    def _run_scenario(self, specs: list[TopicSpec]):
+        self.topics = specs
+        for s in specs:
+            self.client().create_topic(s)
+        self._do_test_topic_aware_rebalance()
+
+    @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_one_topic_18p(self):
+        self._run_scenario([TopicSpec(partition_count=18, replication_factor=3)])
+
+    @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_one_topic_12p(self):
+        self._run_scenario([TopicSpec(partition_count=12, replication_factor=3)])
+
+    @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
+    def test_two_topics_18p(self):
+        self._run_scenario(
+            [
+                TopicSpec(partition_count=18, replication_factor=3),
+                TopicSpec(partition_count=18, replication_factor=3),
+            ]
+        )
 
 
 class AutomaticLeadershipBalancingTest(RedpandaTest):
@@ -274,7 +420,7 @@ class AutomaticLeadershipBalancingTest(RedpandaTest):
     # parts per core = 7
     topics = (TopicSpec(partition_count=63, replication_factor=3),)
 
-    def __init__(self, test_context):
+    def __init__(self, test_context: Any) -> None:
         extra_rp_conf = dict(
             leader_balancer_idle_timeout=20000,
         )
@@ -283,28 +429,32 @@ class AutomaticLeadershipBalancingTest(RedpandaTest):
             test_context=test_context, extra_rp_conf=extra_rp_conf
         )
 
-    def _get_leaders_by_node(self):
+    def _get_leaders_by_node(self) -> collections.Counter[int]:
         kc = KafkaCat(self.redpanda)
-        md = kc.metadata()
-        topic = next(filter(lambda t: t["topic"] == self.topic, md["topics"]))
+        md = cast(KafkaMetadata, kc.metadata())
+        topic = next(
+            metadata_topic
+            for metadata_topic in md["topics"]
+            if metadata_topic["topic"] == self.topic
+        )
         leaders = (p["leader"] for p in topic["partitions"])
         return collections.Counter(leaders)
 
-    def _get_leaders_by_shard(self):
+    def _get_leaders_by_shard(self) -> dict[tuple[int, int], int]:
         admin = Admin(self.redpanda)
-        shard2count = dict()
+        shard2count: dict[tuple[int, int], int] = {}
         for n in self.redpanda.started_nodes():
             node_id = self.redpanda.node_id(n)
             partitions = admin.get_partitions(node=n)
             for p in partitions:
                 if p.get("leader") == node_id:
-                    shard = (node_id, p["core"])
+                    shard = (node_id, cast(int, p["core"]))
                     shard2count[shard] = shard2count.setdefault(shard, 0) + 1
         return shard2count
 
     @cluster(num_nodes=3, log_allow_list=RESTART_LOG_ALLOW_LIST)
-    def test_automatic_rebalance(self):
-        def all_partitions_present(num_nodes, per_node=None):
+    def test_automatic_rebalance(self) -> None:
+        def all_partitions_present(num_nodes: int, per_node: int | None = None) -> bool:
             leaders = self._get_leaders_by_node()
             for l in leaders:
                 self.redpanda.logger.debug(f"Leaders on {l}: {leaders[l]}")
@@ -385,8 +535,16 @@ class LeaderPinningConfig:
         return "racks"
 
 
+@dataclass
+class RackPreference:
+    """Encodes expected rack placement for a topic's leaders."""
+
+    racks: list[str]
+    is_ordered: bool
+
+
 class LeadershipPinningTest(RedpandaTest):
-    def __init__(self, test_context):
+    def __init__(self, test_context: Any) -> None:
         super(LeadershipPinningTest, self).__init__(
             test_context=test_context,
             num_brokers=6,
@@ -401,15 +559,15 @@ class LeadershipPinningTest(RedpandaTest):
             },
         )
 
-    def setUp(self):
+    def setUp(self) -> None:
         pass
 
-    RACK_LAYOUT = ["A", "A", "B", "B", "C", "C"]
+    rack_layout: list[str] = ["A", "A", "B", "B", "C", "C"]
 
-    def _get_topic2node2leaders(self):
+    def _get_topic2node2leaders(self) -> dict[str, dict[int, int]]:
         kc = KafkaCat(self.redpanda)
-        md = kc.metadata()
-        ret = dict()
+        md = cast(KafkaMetadata, kc.metadata())
+        ret: dict[str, dict[int, int]] = {}
         for topic in md["topics"]:
             name = topic["topic"]
             node2leaders = dict(
@@ -420,17 +578,17 @@ class LeadershipPinningTest(RedpandaTest):
             ret[name] = node2leaders
         return ret
 
-    def _rack_counts(self, node_counts):
-        rack2count = dict()
+    def _rack_counts(self, node_counts: dict[int, int]) -> dict[str, int]:
+        rack2count: dict[str, int] = {}
         for ix, node in enumerate(self.redpanda.nodes):
             node_id = self.redpanda.node_id(node)
             leaders = node_counts.get(node_id, 0)
             if leaders > 0:
-                rack = self.RACK_LAYOUT[ix]
+                rack = self.rack_layout[ix]
                 rack2count[rack] = rack2count.setdefault(rack, 0) + leaders
         return rack2count
 
-    def _get_topic2racks(self):
+    def _get_topic2racks(self) -> dict[str, set[str]]:
         t2n2l = self._get_topic2node2leaders()
         return {
             topic: set(self._rack_counts(node2leaders).keys())
@@ -439,9 +597,9 @@ class LeadershipPinningTest(RedpandaTest):
 
     def wait_for_racks(
         self,
-        partition_counts: Dict[str, int],
-        topic2expected_racks: Dict[str, list[str]],
-        is_ordered: bool,
+        partition_counts: dict[str, int],
+        topic2expected_racks: dict[str, RackPreference],
+        dead_racks: list[str] | None = None,
         check_balance: bool = True,
         timeout_sec: int = 60,
     ) -> None:
@@ -457,18 +615,19 @@ class LeadershipPinningTest(RedpandaTest):
         Args:
             partition_counts: Dict mapping topic names to expected partition counts
                              e.g., {"foo": 60, "bar": 20}
-            topic2expected_racks: Dict mapping topic names to lists of expected rack IDs
-                                 e.g., {"foo": ["A"], "bar": ["C"]}
-            is_ordered: swaps the validation logic from spread across all provided racks (false)
-                        to preference the first rack in the list proided (true)
+            topic2expected_racks: Dict mapping topic names to RackPreference instances
+                                 encoding expected racks and whether the preference is ordered
+            dead_racks: racks that are currently down, filtered from each
+                        topic's expected racks before validation
             check_balance: If True, also verify even distribution within racks
             timeout_sec: Maximum time to wait for conditions to be met (default: 60)
 
         Raises:
             TimeoutError: If the conditions are not met within timeout_sec
         """
+        excluded = set(dead_racks) if dead_racks else set[str]()
 
-        def predicate():
+        def predicate() -> bool:
             t2n2l = self._get_topic2node2leaders()
 
             def check_leader_placement(
@@ -493,15 +652,18 @@ class LeadershipPinningTest(RedpandaTest):
                     )
                     return False
 
-                expected_racks = topic2expected_racks.get(topic, list())
+                pref = topic2expected_racks.get(
+                    topic, RackPreference(racks=[], is_ordered=False)
+                )
+                effective_racks = [r for r in pref.racks if r not in excluded]
                 rack2leaders = self._rack_counts(node2leaders)
 
                 if not check_leader_placement(
-                    is_ordered, expected_racks, set(rack2leaders.keys())
+                    pref.is_ordered, effective_racks, set(rack2leaders.keys())
                 ):
                     self.logger.debug(
-                        f"leader rack expectations failed for topic {topic}, is_ordered: {is_ordered} "
-                        f"expected: {expected_racks}, actual: {list(rack2leaders.keys())}"
+                        f"leader rack expectations failed for topic {topic}, is_ordered: {pref.is_ordered} "
+                        f"expected: {effective_racks}, actual: {list(rack2leaders.keys())}"
                     )
                     return False
 
@@ -525,7 +687,7 @@ class LeadershipPinningTest(RedpandaTest):
         and return to the highest priority if and when it again becomes available
         """
         rack_layout = ["A", "A", "B", "C", "D", "E"]
-        self.RACK_LAYOUT = rack_layout
+        self.rack_layout = rack_layout
 
         for ix, node in enumerate(self.redpanda.nodes):
             self.redpanda.set_extra_node_conf(node, {"rack": rack_layout[ix]})
@@ -551,10 +713,11 @@ class LeadershipPinningTest(RedpandaTest):
             },
         )
 
+        topic_pref = {topic: RackPreference(racks=preference, is_ordered=True)}
+
         self.wait_for_racks(
             partition_counts,
-            {topic: preference},
-            is_ordered=True,
+            topic_pref,
             timeout_sec=90,
         )
 
@@ -562,8 +725,8 @@ class LeadershipPinningTest(RedpandaTest):
         self.redpanda.stop_node(node_e)
         self.wait_for_racks(
             partition_counts,
-            {topic: ["D", "C", "B", "A"]},
-            is_ordered=True,
+            topic_pref,
+            dead_racks=["E"],
             timeout_sec=60,
         )
 
@@ -571,16 +734,16 @@ class LeadershipPinningTest(RedpandaTest):
         self.redpanda.stop_node(node_d)
         self.wait_for_racks(
             partition_counts,
-            {topic: ["C", "B", "A"]},
-            is_ordered=True,
+            topic_pref,
+            dead_racks=["E", "D"],
             timeout_sec=60,
         )
 
         self.redpanda.start_node(node_e)
         self.wait_for_racks(
             partition_counts,
-            {topic: ["E", "C", "B", "A"]},
-            is_ordered=True,
+            topic_pref,
+            dead_racks=["D"],
             timeout_sec=90,
         )
 
@@ -588,8 +751,8 @@ class LeadershipPinningTest(RedpandaTest):
         self.redpanda.stop_node(node_b)
         self.wait_for_racks(
             partition_counts,
-            {topic: ["E", "C", "A"]},
-            is_ordered=True,
+            topic_pref,
+            dead_racks=["D", "B"],
             timeout_sec=60,
         )
 
@@ -601,7 +764,7 @@ class LeadershipPinningTest(RedpandaTest):
         3. swap to ordered, check ordered leadership
         """
         for ix, node in enumerate(self.redpanda.nodes):
-            self.redpanda.set_extra_node_conf(node, {"rack": self.RACK_LAYOUT[ix]})
+            self.redpanda.set_extra_node_conf(node, {"rack": self.rack_layout[ix]})
         self.redpanda.start()
 
         self.redpanda.set_cluster_config({"enable_leader_balancer": False})
@@ -622,8 +785,7 @@ class LeadershipPinningTest(RedpandaTest):
 
         self.wait_for_racks(
             partition_counts,
-            {topic: ["A", "B"]},
-            is_ordered=True,
+            {topic: RackPreference(racks=["A", "B"], is_ordered=True)},
             timeout_sec=90,
         )
 
@@ -631,8 +793,7 @@ class LeadershipPinningTest(RedpandaTest):
 
         self.wait_for_racks(
             partition_counts,
-            {topic: ["A", "B"]},
-            is_ordered=False,
+            {topic: RackPreference(racks=["A", "B"], is_ordered=False)},
             timeout_sec=60,
         )
 
@@ -642,8 +803,7 @@ class LeadershipPinningTest(RedpandaTest):
 
         self.wait_for_racks(
             partition_counts,
-            {topic: ["A", "B"]},
-            is_ordered=True,
+            {topic: RackPreference(racks=["A", "B"], is_ordered=True)},
             timeout_sec=60,
         )
 
@@ -651,8 +811,7 @@ class LeadershipPinningTest(RedpandaTest):
 
         self.wait_for_racks(
             partition_counts,
-            {topic: ["A", "B"]},
-            is_ordered=False,
+            {topic: RackPreference(racks=["A", "B"], is_ordered=False)},
             timeout_sec=60,
         )
 
@@ -685,7 +844,7 @@ class LeadershipPinningTest(RedpandaTest):
             self.redpanda.set_extra_node_conf(
                 node,
                 {
-                    "rack": self.RACK_LAYOUT[ix],
+                    "rack": self.rack_layout[ix],
                 },
             )
         self.redpanda.add_extra_rp_conf(
@@ -710,11 +869,16 @@ class LeadershipPinningTest(RedpandaTest):
             config={"redpanda.leaders.preference": f"{config.preference_str}: C"},
         )
 
+        ordered = config.is_ordered
+        all_racks = sorted(set(self.rack_layout))
+
         # bigger timeout to allow balancer to activate, health reports to propagate, etc.
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A"], "bar": ["C"]},
-            is_ordered=config.is_ordered,
+            {
+                "foo": RackPreference(racks=["A"], is_ordered=ordered),
+                "bar": RackPreference(racks=["C"], is_ordered=ordered),
+            },
             timeout_sec=90,
         )
 
@@ -726,8 +890,10 @@ class LeadershipPinningTest(RedpandaTest):
 
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A"], "bar": ["B", "C"]},
-            is_ordered=config.is_ordered,
+            {
+                "foo": RackPreference(racks=["A"], is_ordered=ordered),
+                "bar": RackPreference(racks=["B", "C"], is_ordered=ordered),
+            },
             timeout_sec=60,
         )
 
@@ -739,25 +905,32 @@ class LeadershipPinningTest(RedpandaTest):
         self.logger.info("killing rack B")
 
         for ix, node in enumerate(self.redpanda.nodes):
-            if self.RACK_LAYOUT[ix] == "B":
+            if self.rack_layout[ix] == "B":
                 self.redpanda.stop_node(node)
 
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A"], "bar": ["C"]},
-            is_ordered=config.is_ordered,
+            {
+                "foo": RackPreference(racks=["A"], is_ordered=ordered),
+                "bar": RackPreference(racks=["B", "C"], is_ordered=ordered),
+            },
+            dead_racks=["B"],
             timeout_sec=60,
         )
 
         self.logger.info("explicitly disabling for topic")
         rpk.alter_topic_config("foo", "redpanda.leaders.preference", "none")
 
-        # There is cross-talk between partition counts of foo and bar, so we don't
-        # require balanced counts.
+        # foo's preference is now "none" so it is unordered regardless of test
+        # config. There is cross-talk between partition counts of foo and bar,
+        # so we don't require balanced counts.
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A", "C"], "bar": ["C"]},
-            is_ordered=config.is_ordered,
+            {
+                "foo": RackPreference(racks=all_racks, is_ordered=False),
+                "bar": RackPreference(racks=["B", "C"], is_ordered=ordered),
+            },
+            dead_racks=["B"],
             check_balance=False,
             timeout_sec=60,
         )
@@ -770,23 +943,28 @@ class LeadershipPinningTest(RedpandaTest):
 
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A"], "bar": ["A"]},
-            is_ordered=config.is_ordered,
+            {
+                "foo": RackPreference(racks=["A"], is_ordered=ordered),
+                "bar": RackPreference(racks=["A"], is_ordered=ordered),
+            },
+            dead_racks=["B"],
             timeout_sec=60,
         )
 
         self.logger.info("unset default preference")
 
         for ix, node in enumerate(self.redpanda.nodes):
-            if self.RACK_LAYOUT[ix] == "B":
+            if self.rack_layout[ix] == "B":
                 self.redpanda.start_node(node)
 
         # regardless of test config, no preference is semantically equivalent to unordered with all racks defined, check as such
         self.redpanda.set_cluster_config({"default_leaders_preference": "none"})
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A", "B", "C"], "bar": ["A", "B", "C"]},
-            is_ordered=False,
+            {
+                "foo": RackPreference(racks=all_racks, is_ordered=False),
+                "bar": RackPreference(racks=all_racks, is_ordered=False),
+            },
             check_balance=False,
             timeout_sec=90,
         )
@@ -799,7 +977,7 @@ class LeadershipPinningTest(RedpandaTest):
             self.redpanda.set_extra_node_conf(
                 node,
                 {
-                    "rack": self.RACK_LAYOUT[ix],
+                    "rack": self.rack_layout[ix],
                 },
             )
 
@@ -866,7 +1044,7 @@ class LeadershipPinningTest(RedpandaTest):
             self.redpanda.set_extra_node_conf(
                 node,
                 {
-                    "rack": self.RACK_LAYOUT[ix],
+                    "rack": self.rack_layout[ix],
                 },
             )
         self.redpanda.add_extra_rp_conf(
@@ -876,8 +1054,8 @@ class LeadershipPinningTest(RedpandaTest):
 
         rpk = RpkTool(self.redpanda)
 
-        def get_leaders_preference(topic):
-            config = rpk.describe_topic_configs(topic)
+        def get_leaders_preference(topic: str) -> str:
+            config = cast(dict[str, tuple[str, Any]], rpk.describe_topic_configs(topic))
             return config["redpanda.leaders.preference"][0]
 
         partition_counts = {"foo": 60, "bar": 20}
@@ -895,8 +1073,10 @@ class LeadershipPinningTest(RedpandaTest):
         # bigger timeout to allow balancer to activate, health reports to propagate, etc.
         self.wait_for_racks(
             partition_counts,
-            {"foo": ["A"], "bar": ["C"]},
-            is_ordered=config.is_ordered,
+            {
+                "foo": RackPreference(racks=["A"], is_ordered=config.is_ordered),
+                "bar": RackPreference(racks=["C"], is_ordered=config.is_ordered),
+            },
             timeout_sec=90,
         )
 
@@ -906,7 +1086,8 @@ class LeadershipPinningTest(RedpandaTest):
         self.redpanda.restart_nodes(self.redpanda.nodes)
 
         # validate cluster and topic state
-        cluster_config = rpk.cluster_config_get("default_leaders_preference")
+        cluster_config_get = cast(Any, rpk).cluster_config_get
+        cluster_config = cluster_config_get("default_leaders_preference")
         assert cluster_config == f"{config.preference_str}:A", (
             f"Failed to properly load cluster's config on restart. Got '{cluster_config}')."
         )

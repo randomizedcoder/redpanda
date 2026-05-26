@@ -9,7 +9,7 @@
 
 #include "storage/segment_index.h"
 
-#include "base/vassert.h"
+#include "bytes/iostream.h"
 #include "compaction/utils.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
@@ -21,10 +21,7 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
-
-#include <bits/stdint-uintn.h>
-#include <boost/container/container_fwd.hpp>
-#include <fmt/format.h>
+#include <seastar/coroutine/as_future.hh>
 
 #include <algorithm>
 
@@ -144,18 +141,19 @@ void segment_index::maybe_track(
     _last_batch_max_timestamp = std::max(
       hdr.first_timestamp, hdr.max_timestamp);
 
-    if (_state.maybe_index(
-          _acc,
-          _step,
-          filepos,
-          hdr.base_offset,
-          hdr.last_offset(),
-          hdr.first_timestamp,
-          hdr.max_timestamp,
-          to_optional_model_timestamp(new_broker_ts),
-          path().is_internal_topic()
-            || hdr.type == model::record_batch_type::raft_data,
-          compaction::is_filterable(hdr.type) ? hdr.record_count : 0)) {
+    if (
+      _state.maybe_index(
+        _acc,
+        _step,
+        filepos,
+        hdr.base_offset,
+        hdr.last_offset(),
+        hdr.first_timestamp,
+        hdr.max_timestamp,
+        to_optional_model_timestamp(new_broker_ts),
+        path().is_internal_topic()
+          || hdr.type == model::record_batch_type::raft_data,
+        compaction::is_filterable(hdr.type) ? hdr.record_count : 0)) {
         _acc = 0;
     }
     _needs_persistence = true;
@@ -202,13 +200,23 @@ ss::future<bool> segment_index::materialize_index() {
 
 ss::future<bool> segment_index::materialize_index_from_file(ss::file f) {
     auto size = co_await f.size();
-    auto buf = co_await f.dma_read_bulk<char>(0, size);
     _disk_usage_size = size;
-    if (buf.empty()) {
+
+    auto in = ss::make_file_input_stream(std::move(f));
+    auto fut = co_await ss::coroutine::as_future(read_iobuf_exactly(in, size));
+    co_await in.close();
+    if (fut.failed()) {
+        std::rethrow_exception(fut.get_exception());
+    }
+    auto b = fut.get();
+    if (b.empty()) {
         co_return false;
     }
-    iobuf b;
-    b.append(std::move(buf));
+
+    if (b.size_bytes() != size) {
+        throw std::runtime_error("Short read of segment index file");
+    }
+
     try {
         _state = serde::from_iobuf<index_state>(std::move(b));
         co_return true;
@@ -258,23 +266,32 @@ ss::future<> segment_index::flush_to_file(ss::file backing_file) {
     co_await out.flush();
 }
 
-std::ostream& operator<<(std::ostream& o, const segment_index& i) {
-    return o << "{file:" << i.path() << ", offsets:" << i.base_offset()
-             << ", index:" << i._state << ", step:" << i._step
-             << ", needs_persistence:" << i._needs_persistence << "}";
+fmt::iterator segment_index::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{file:{}, offsets:{}, index:{}, step:{}, needs_persistence:{}}}",
+      path(),
+      base_offset(),
+      _state,
+      _step,
+      _needs_persistence);
 }
 std::ostream& operator<<(std::ostream& o, const segment_index_ptr& i) {
     if (i) {
-        return o << "{ptr=" << *i << "}";
+        fmt::print(o, "{{ptr={}}}", *i);
+    } else {
+        o << "{ptr=nullptr}";
     }
-    return o << "{ptr=nullptr}";
+    return o;
 }
 std::ostream&
 operator<<(std::ostream& o, const std::optional<segment_index::entry>& e) {
     if (e) {
-        return o << *e;
+        fmt::print(o, "{}", *e);
+    } else {
+        o << "{empty segment_index::entry}";
     }
-    return o << "{empty segment_index::entry}";
+    return o;
 }
 
 ss::future<size_t> segment_index::disk_usage() {

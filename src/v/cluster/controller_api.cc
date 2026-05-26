@@ -32,12 +32,10 @@
 #include "ssx/future-util.h"
 
 #include <seastar/core/chunked_fifo.hh>
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include <seastar/util/variant_utils.hh>
 
 namespace cluster {
 
@@ -76,7 +74,7 @@ controller_api::get_reconciliation_state(chunked_vector<model::ntp> ntps) {
 
 ss::future<result<bool>>
 controller_api::all_reconciliations_done(std::deque<model::ntp> ntps) {
-    const size_t batch_size = 4096;
+    const size_t batch_size = 512;
     // For a huge topic with e.g. 100k partitions, this will be a huge loop:
     // that means we need parallelism, but not so much that we totally
     // saturate inter-core queues.
@@ -207,7 +205,8 @@ controller_api::get_reconciliation_state(model::ntp ntp) {
     }
     // query controller backends for in progress operations
     ss::chunked_fifo<backend_operation> ops;
-    const auto shards = boost::irange<ss::shard_id>(0, ss::smp::count);
+    const auto shards = boost::irange<ss::shard_id>(
+      0, ss::this_smp_shard_count());
     for (auto shard : shards) {
         auto shard_op = co_await get_current_op(ntp, shard);
         if (shard_op) {
@@ -437,8 +436,9 @@ controller_api::get_decommission_allocation_failures(model::node_id node) {
       });
 
     cluster::partition_balancer_overview_reply overview;
-    if (std::holds_alternative<cluster::partition_balancer_overview_reply>(
-          result)) {
+    if (
+      std::holds_alternative<cluster::partition_balancer_overview_reply>(
+        result)) {
         overview = std::move(
           std::get<cluster::partition_balancer_overview_reply>(result));
     } else if (std::holds_alternative<model::node_id>(result)) {

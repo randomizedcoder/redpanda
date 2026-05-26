@@ -27,11 +27,9 @@
 #include "pandaproxy/schema_registry/types.h"
 #include "pandaproxy/schema_registry/util.h"
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/coroutine/as_future.hh>
-#include <seastar/coroutine/exception.hh>
 
 #include <fmt/core.h>
 
@@ -47,19 +45,19 @@ ss::shard_id shard_for(const context_subject& sub) {
     auto hasher = incremental_xxhash64{};
     hasher.update(sub.ctx());
     hasher.update(sub.sub());
-    return jump_consistent_hash(hasher.digest(), ss::smp::count);
+    return jump_consistent_hash(hasher.digest(), ss::this_smp_shard_count());
 }
 
 ss::shard_id shard_for(const context_schema_id& id) {
     auto hasher = incremental_xxhash64{};
     hasher.update(id.ctx());
     hasher.update(id.id());
-    return jump_consistent_hash(hasher.digest(), ss::smp::count);
+    return jump_consistent_hash(hasher.digest(), ss::this_smp_shard_count());
 }
 
 ss::shard_id shard_for(const context& ctx) {
     auto hash = xxhash_64(ctx().data(), ctx().length());
-    return jump_consistent_hash(hash, ss::smp::count);
+    return jump_consistent_hash(hash, ss::this_smp_shard_count());
 }
 
 compatibility_result check_compatible(
@@ -609,8 +607,9 @@ ss::future<bool> sharded_store::delete_subject_version(
     co_return result;
 }
 
-ss::future<mode> sharded_store::get_mode(context ctx) {
-    co_return _store.local().get_mode(ctx).value();
+ss::future<mode>
+sharded_store::get_mode(context ctx, default_to_global fallback) {
+    co_return _store.local().get_mode(ctx, fallback).value();
 }
 
 ss::future<mode>
@@ -662,8 +661,9 @@ sharded_store::get_context_mode_written_at(context ctx) {
     co_return _store.local().get_context_mode_written_at(ctx).value();
 }
 
-ss::future<compatibility_level> sharded_store::get_compatibility(context ctx) {
-    co_return _store.local().get_compatibility(ctx).value();
+ss::future<compatibility_level>
+sharded_store::get_compatibility(context ctx, default_to_global fallback) {
+    co_return _store.local().get_compatibility(ctx, fallback).value();
 }
 
 ss::future<compatibility_level> sharded_store::get_compatibility(
