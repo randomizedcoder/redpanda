@@ -5,8 +5,8 @@
 # This override enables static and disables shared, with zlib support
 # (matching the Bazel configure options) and no python/icu/http.
 #
-# Version is tracked from nixpkgs (currently 2.15.1, close to the pinned
-# 2.14.6 in bazel/repositories.bzl — same soname ABI).
+# Version is tracked from nixpkgs (currently 2.15.2, close to the
+# bazel_dep version 2.15.3 in MODULE.bazel — same soname ABI).
 { libxml2 }:
 
 (libxml2.override {

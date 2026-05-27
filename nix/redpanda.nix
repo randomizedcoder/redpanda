@@ -5,7 +5,7 @@
   runCommand,
   writeShellApplication,
   fetchurl,
-  bazel_8,
+  bazel_9,
   bazelisk,
   llvmPackages_20,
   python312,
@@ -86,23 +86,8 @@ let
       ]);
   };
 
-  # Fetch the patched rules_python (nix-local-toolchain branch) and
-  # embed it in the source tree so local_path_override works in the sandbox.
-  rulesPythonSrc = builtins.fetchGit {
-    url = "/home/das/Downloads/rules_python";
-    ref = "nix-local-toolchain";
-    rev = "a9b9c43c62e1fbc14dc162153dc8a5e623f83f3d";
-  };
-
   src = runCommand "redpanda-src-patched" { } ''
     cp -r --no-preserve=mode ${localSrc} $out
-
-    # Embed rules_python in tree
-    mkdir -p $out/third_party
-    cp -r --no-preserve=mode ${rulesPythonSrc} $out/third_party/rules_python
-
-    # Rewrite local_path_override to in-tree copy
-    sed -i 's|path = "/home/das/Downloads/rules_python"|path = "third_party/rules_python"|' $out/MODULE.bazel
 
     # Create stub @python_deps extension (nixpkgs provides the real packages)
     cat > $out/bazel/python_deps.bzl <<'PYEXT'
@@ -119,8 +104,14 @@ def _python_deps_impl(rctx):
         "aioboto3", "boto3", "psutil", "pyyaml", "s3transfer",
     ]
     rctx.file("BUILD.bazel", "")
+    # Bazel 9 removed py_library as a built-in symbol — must load explicitly
+    # from rules_python.
+    build_template = (
+        'load("@rules_python//python:defs.bzl", "py_library")\n'
+        + 'py_library(name = "{}", visibility = ["//visibility:public"])\n'
+    )
     for pkg in packages:
-        rctx.file("{}/BUILD.bazel".format(pkg), 'py_library(name = "{}", visibility = ["//visibility:public"])'.format(pkg))
+        rctx.file("{}/BUILD.bazel".format(pkg), build_template.format(pkg))
 
 _python_deps_repo = repository_rule(implementation = _python_deps_impl)
 
@@ -495,6 +486,14 @@ LKSCTP_BUILD
     # (its http_archive is deleted from repositories.bzl below)
     sed -i '/use_repo(non_module_dependencies, "libpciaccess")/d' $out/MODULE.bazel
 
+    # Remove sysroot use_repo lines (the sysroot()/http_archive() calls in
+    # repositories.bzl that would create them are stripped by REPOS_PATCH
+    # below — nix substitutes the LLVM toolchain via nixpkgs).
+    sed -i '/use_repo(non_module_dependencies, "x86_64_sysroot")/d' $out/MODULE.bazel
+    sed -i '/use_repo(non_module_dependencies, "aarch64_sysroot")/d' $out/MODULE.bazel
+    sed -i '/use_repo(non_module_dependencies, "x86_64_sysroot_runtime")/d' $out/MODULE.bazel
+    sed -i '/use_repo(non_module_dependencies, "aarch64_sysroot_runtime")/d' $out/MODULE.bazel
+
     # Export prebuilt BUILD files and patches so Bazel can resolve labels
     cat >> $out/bazel/thirdparty/BUILD <<'EXPORTS'
 exports_files([
@@ -588,6 +587,28 @@ for name in deletions:
     if match:
         text = text.replace(match.group(0), "")
 
+# Remove the top-level load of @toolchains_llvm//toolchain:sysroot.bzl —
+# nix substitutes the LLVM toolchain entirely and patch-module-bazel.py
+# strips toolchains_llvm from MODULE.bazel, so the load would fail.
+text = re.sub(
+    r"^load\(\"@toolchains_llvm//toolchain:sysroot\.bzl\",[^)]*\)\n",
+    "",
+    text,
+    flags=re.MULTILINE,
+)
+
+# Remove the sysroot + sysroot_runtime block inside data_dependency().
+# Spans from the comment "# The sysroot is consumed two ways." through
+# the end of the for-loop. The loop contains TWO closing `)` lines (one
+# for sysroot(...), one for http_archive(...)) and is the last thing in
+# data_dependency(), so greedy-match to end of file.
+text = re.sub(
+    r"    # The sysroot is consumed two ways\..*\Z",
+    "",
+    text,
+    flags=re.DOTALL,
+)
+
 with open(path, 'w') as f:
     f.write(text)
 REPOS_PATCH
@@ -617,13 +638,13 @@ REPOS_PATCH
 
   registry = callPackage ./bcr.nix { };
 
-  bazel = bazel_8;  # actual binary, used via USE_BAZEL_VERSION
+  bazel = bazel_9;  # actual binary, used via USE_BAZEL_VERSION
   # Platform-specific wrapper (avoids the generic `bazel` wrapper which
   # re-reads USE_BAZEL_VERSION and double-resolves).
   bazelPlatformBin = let
     os = if stdenv.isLinux then "linux" else "darwin";
     arch = stdenv.hostPlatform.uname.processor;
-  in "${bazel}/bin/bazel-8.5.0-${os}-${arch}";
+  in "${bazel}/bin/bazel-9.1.0-${os}-${arch}";
   targets = [ "//src/v/redpanda:redpanda" ];
 
   # ── Nixify pipeline configuration ──
@@ -669,8 +690,8 @@ REPOS_PATCH
   } ''
     mkdir -p $out/bin
     cp ${fetchurl {
-      url = "https://github.com/bazelbuild/rules_rust/releases/download/0.60.0/cargo-bazel-x86_64-unknown-linux-gnu";
-      sha256 = "e4f70e4fccedb95cab5efd95ac54953d0e693c05c0552376d542c44df6df6977";
+      url = "https://github.com/bazelbuild/rules_rust/releases/download/0.70.0/cargo-bazel-x86_64-unknown-linux-gnu";
+      sha256 = "56bb13f6e0320ebd6e3e3bd340c159877b9f8b28294fca341752239b45073f86";
     }} $out/bin/cargo-bazel
     chmod u+wx $out/bin/cargo-bazel
     patchelf --set-interpreter ${nixInterp} --set-rpath ${nixRpath} $out/bin/cargo-bazel
@@ -985,7 +1006,7 @@ stdenv.mkDerivation {
     export CC=clang
     export CXX=clang++
 
-    # Point bazelisk at the nixpkgs bazel_8 platform wrapper (no runtime
+    # Point bazelisk at the nixpkgs bazel_9 platform wrapper (no runtime
     # download). Must NOT point to the generic `bazel` wrapper — it re-reads
     # USE_BAZEL_VERSION and double-resolves.
     export USE_BAZEL_VERSION=${bazelPlatformBin}

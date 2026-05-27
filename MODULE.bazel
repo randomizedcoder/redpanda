@@ -64,10 +64,6 @@ bazel_dep(name = "rules_go", version = "0.59.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_python", version = "1.7.0")
-local_path_override(
-    module_name = "rules_python",
-    path = "/home/das/Downloads/rules_python",
-)
 bazel_dep(name = "rules_rust", version = "0.70.0")
 bazel_dep(name = "snappy", version = "1.2.1")
 bazel_dep(name = "utf8proc", version = "2.11.0")
@@ -97,12 +93,10 @@ python.toolchain(
     is_default = True,
     python_version = "3.12",
 )
-python.local_toolchain(
-    python_version = "3.12",
-    interpreter_path = "python3",
-)
-use_repo(python, "local_python_3_12", "local_python_3_12_toolchains")
-register_toolchains("@local_python_3_12_toolchains//:all")
+# Previously used a local rules_python fork that added a `local_toolchain`
+# tag class to wrap the system python3 binary. Upstream rules_python 1.7.0
+# doesn't have that tag class; we rely on the hermetic python toolchain
+# above (downloaded archives are pre-fetched via nix/bazel-deps.nix).
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
