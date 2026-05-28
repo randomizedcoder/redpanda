@@ -685,16 +685,45 @@ REPOS_PATCH
   # ── Pre-built cargo-bazel for crate_universe extension ──
   # module_ctx.download() does NOT use --repository_cache, so we must
   # provide the binary locally via CARGO_BAZEL_GENERATOR_URL.
+  #
+  # cargo-bazel splice in 0.70 invokes cargo with --offline. cargo can't
+  # find crates via crates.io (no network) so we wrap cargo-bazel in a
+  # shell script that injects --cargo-config pointing at the vendor
+  # config built from bazel-deps.nix (see cargoVendor below). The wrapper
+  # is needed because rules_rust's splicing_utils.bzl doesn't pass
+  # --cargo-config and explicitly REJECTS a parent .cargo/config.toml as
+  # a reproducibility safeguard.
   cargoBazel = runCommand "cargo-bazel-patched" {
     nativeBuildInputs = [ patchelf ];
   } ''
-    mkdir -p $out/bin
+    mkdir -p $out/bin $out/libexec
     cp ${fetchurl {
       url = "https://github.com/bazelbuild/rules_rust/releases/download/0.70.0/cargo-bazel-x86_64-unknown-linux-gnu";
       sha256 = "56bb13f6e0320ebd6e3e3bd340c159877b9f8b28294fca341752239b45073f86";
-    }} $out/bin/cargo-bazel
-    chmod u+wx $out/bin/cargo-bazel
-    patchelf --set-interpreter ${nixInterp} --set-rpath ${nixRpath} $out/bin/cargo-bazel
+    }} $out/libexec/cargo-bazel
+    chmod u+wx $out/libexec/cargo-bazel
+    patchelf --set-interpreter ${nixInterp} --set-rpath ${nixRpath} $out/libexec/cargo-bazel
+
+    # Heredoc body is single-quoted so $1, $@ etc. survive verbatim into
+    # the script. The two interpolated values (bash and cargoVendor) are
+    # baked in via sed afterwards.
+    cat > $out/bin/cargo-bazel <<'WRAPPER'
+    #!__BASH__
+    # Wrapper: inject --cargo-config when running the 'splice' subcommand
+    # so cargo can find vendored crates instead of hitting crates.io.
+    REAL=__REAL__
+    if [ "$1" = "splice" ]; then
+      shift
+      exec "$REAL" splice --cargo-config __CARGO_CONFIG__ "$@"
+    fi
+    exec "$REAL" "$@"
+    WRAPPER
+    sed -i \
+      -e "s|__BASH__|${bash}/bin/bash|" \
+      -e "s|__REAL__|$out/libexec/cargo-bazel|" \
+      -e "s|__CARGO_CONFIG__|${cargoVendor}/cargo-home/config.toml|" \
+      $out/bin/cargo-bazel
+    chmod +x $out/bin/cargo-bazel
   '';
 
   # ── Go module proxy cache ──
@@ -725,6 +754,46 @@ REPOS_PATCH
   repoCache = callPackage ./bazel-repo-cache.nix { } {
     archives = import ./bazel-deps.nix;
   };
+
+  # ── Cargo vendor directory ──
+  # rules_rust 0.70 calls cargo update --offline inside cargo-bazel splice.
+  # Cargo needs all crates in its standard vendor layout — bazel's repo
+  # cache layout isn't compatible. Extract each .crate archive (already
+  # cached via bazel-deps.nix) into vendor/<name>-<version>/ and write a
+  # minimal .cargo-checksum.json. config.toml redirects crates.io →
+  # vendored-sources.
+  cargoVendor = let
+    crateRegex = "https://static\\.crates\\.io/crates/([^/]+)/([^/]+)/download";
+    allArchives = import ./bazel-deps.nix;
+    crateInfos = builtins.filter
+      (e: builtins.match crateRegex e.url != null)
+      allArchives;
+    extract = e: let
+      m = builtins.match crateRegex e.url;
+      cname = builtins.elemAt m 0;
+      cversion = builtins.elemAt m 1;
+      crateFile = fetchurl {
+        url = e.url;
+        sha256 = e.sha256;
+        name = "${cname}-${cversion}.crate";
+      };
+    in ''
+      mkdir -p $out/vendor/${cname}-${cversion}
+      tar -xzf ${crateFile} -C $out/vendor/${cname}-${cversion} --strip-components=1
+      printf '{"package":"%s","files":{}}' "${e.sha256}" \
+        > $out/vendor/${cname}-${cversion}/.cargo-checksum.json
+    '';
+  in runCommand "cargo-vendor" { } ''
+    mkdir -p $out/vendor $out/cargo-home
+    ${lib.concatStrings (map extract crateInfos)}
+    cat > $out/cargo-home/config.toml <<CONFIG
+    [source.crates-io]
+    replace-with = "vendored-sources"
+
+    [source.vendored-sources]
+    directory = "$out/vendor"
+    CONFIG
+  '';
 
   nativeBuildInputsDeps = [
     bazelisk
@@ -1031,6 +1100,12 @@ stdenv.mkDerivation {
     # Tell cargo not to access the network (crate sources are in repo cache,
     # cargo-bazel splice only needs the lockfile metadata).
     export CARGO_NET_OFFLINE=true
+
+    # rules_rust 0.70 runs cargo update --offline inside cargo-bazel splice.
+    # The cargoBazel wrapper injects --cargo-config pointing at the vendor
+    # config (built from bazel-deps.nix); we don't need CARGO_HOME or a
+    # /build/.cargo file here. (In fact, cargo-bazel actively rejects a
+    # parent .cargo/config.toml as non-reproducible.)
 
     # Go module proxy cache for gazelle's go_repository rules.
     # fetch_repo uses GOPROXY, not Bazel's --repository_cache.

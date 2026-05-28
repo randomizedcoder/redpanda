@@ -1175,5 +1175,15 @@
     sha256 = "87c99089a8111888532865857dbcc1ebcf72668010ed042e3971736fd1a1340b";
     name = "rustfmt-nightly-x86_64-unknown-linux-gnu.tar.xz";
   }
+  # Hermetic Python (python-build-standalone) — pulled by rules_python 1.7.0
+  # for the default python.toolchain(python_version = "3.12") declaration.
+  # We previously relied on a local rules_python fork's local_toolchain
+  # mechanism (system Python from nixpkgs); upstream 1.7.0 doesn't expose
+  # that, so we use the hermetic archive instead.
+  {
+    url = "https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only.tar.gz";
+    sha256 = "1ab2b6594d1c3d76cbebea09d6bc3e6ba68d8eb3b6322080375c4cc3dd188f34";
+    name = "cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only.tar.gz";
+  }
 ]
 
