@@ -134,6 +134,31 @@ proto_toolchain(
 )
 PROTOC_BUILD
 
+    # Create nix_wasmtime/ — pre-built wasmtime C API from upstream
+    # release. Avoids needing the rust toolchain, cargo-bazel, and 80+
+    # crates from crates.io (which can't be resolved offline).
+    mkdir -p $out/nix_wasmtime/{include,lib}
+    cp -r --no-preserve=mode ${wasmtimePrebuilt}/include/. $out/nix_wasmtime/include/
+    ln -s ${wasmtimePrebuilt}/lib/libwasmtime.a $out/nix_wasmtime/lib/
+
+    cat > $out/bazel/thirdparty/wasmtime-prebuilt.BUILD <<'WASMTIME_BUILD'
+cc_import(
+    name = "libwasmtime",
+    static_library = "lib/libwasmtime.a",
+    # The static lib pulls in libstdc++/libgcc symbols and system libs
+    # like pthread, dl, m. We don't need to link rust's allocator shim
+    # — libwasmtime.a is self-contained for those.
+)
+cc_library(
+    name = "wasmtime_c",
+    hdrs = glob(["include/**/*.h"]) + glob(["include/**/*.hh"]),
+    strip_include_prefix = "include",
+    deps = [":libwasmtime"],
+    linkopts = ["-lm", "-lpthread", "-ldl"],
+    visibility = ["//visibility:public"],
+)
+WASMTIME_BUILD
+
     # Create nix_cares/ — pre-built c-ares from nixpkgs.
     # Avoids running cmake build (~51s wall time).
     mkdir -p $out/nix_cares/{include,lib}
@@ -494,6 +519,11 @@ LKSCTP_BUILD
     sed -i '/use_repo(non_module_dependencies, "x86_64_sysroot_runtime")/d' $out/MODULE.bazel
     sed -i '/use_repo(non_module_dependencies, "aarch64_sysroot_runtime")/d' $out/MODULE.bazel
 
+    # Expose @crates via non_module_dependencies (the original crate.from_cargo
+    # extension is stripped by patch-module-bazel.py; data_dependency()
+    # gets a new_local_repository for "crates" appended by REPOS_PATCH).
+    sed -i '/use_repo(non_module_dependencies, "xxhash")/a\use_repo(non_module_dependencies, "crates")' $out/MODULE.bazel
+
     # Export prebuilt BUILD files and patches so Bazel can resolve labels
     cat >> $out/bazel/thirdparty/BUILD <<'EXPORTS'
 exports_files([
@@ -511,6 +541,7 @@ exports_files([
     "ada-prebuilt.BUILD",
     "roaring-prebuilt.BUILD",
     "lksctp-prebuilt.BUILD",
+    "wasmtime-prebuilt.BUILD",
 ])
 EXPORTS
 
@@ -601,13 +632,29 @@ text = re.sub(
 # Spans from the comment "# The sysroot is consumed two ways." through
 # the end of the for-loop. The loop contains TWO closing `)` lines (one
 # for sysroot(...), one for http_archive(...)) and is the last thing in
-# data_dependency(), so greedy-match to end of file.
+# data_dependency(), so greedy-match to end of file. MUST run before
+# the crates new_local_repository append below, which sits at the end.
 text = re.sub(
     r"    # The sysroot is consumed two ways\..*\Z",
     "",
     text,
     flags=re.DOTALL,
 )
+
+# Append a new_local_repository for @crates. The dev branch declares
+# @crates via rules_rust's crate_universe (which calls cargo internally
+# — impossible offline). Our substitute exposes a single :wasmtime_c
+# cc_library backed by the pre-built wasmtime C API tarball. patch-
+# module-bazel.py strips the crate_universe extension and adds
+# "crates" to use_repo(non_module_dependencies, ...).
+text = text.rstrip() + """
+
+    new_local_repository(
+        name = "crates",
+        path = "nix_wasmtime",
+        build_file = "//bazel/thirdparty:wasmtime-prebuilt.BUILD",
+    )
+"""
 
 with open(path, 'w') as f:
     f.write(text)
@@ -681,6 +728,21 @@ REPOS_PATCH
       "/^#!.*${name}/{s|^#!.*|#!${interpreterMap.${name}}|;}"
     ) orderedNames
   );
+
+  # ── Pre-built wasmtime C API ──
+  # Substitutes @crates//:wasmtime_c (which the dev branch builds by
+  # invoking cargo-bazel + rustc against ~80 crates from crates.io —
+  # impossible offline in the Nix sandbox). The upstream wasmtime
+  # release ships a self-contained C API tarball (static + shared libs,
+  # headers, conf.h already expanded). libwasmtime.a has no __rustc::*
+  # undefined symbols, so we don't need the rules_rust allocator shim.
+  wasmtimePrebuilt = runCommand "wasmtime-c-api-prebuilt" { } ''
+    mkdir -p $out
+    tar -xJf ${fetchurl {
+      url = "https://github.com/bytecodealliance/wasmtime/releases/download/v42.0.2/wasmtime-v42.0.2-x86_64-linux-c-api.tar.xz";
+      sha256 = "041f7753a894af41e01abffb2c62dc8d7226bc557ed04337fde2ddf181fae467";
+    }} -C $out --strip-components=1
+  '';
 
   # ── Pre-built cargo-bazel for crate_universe extension ──
   # module_ctx.download() does NOT use --repository_cache, so we must
@@ -955,6 +1017,14 @@ REPOS_PATCH
   bazelrcNix = ''
     build --config=system-clang
     build --shell_executable=${bash}/bin/bash
+
+    # nixpkgs libcxx 20.1.8 bakes in a pre-define of _LIBCPP_HARDENING_MODE
+    # (to _LIBCPP_HARDENING_MODE_FAST) via clang's predefined macros. The
+    # upstream .bazelrc then re-defines it to _LIBCPP_HARDENING_MODE_EXTENSIVE,
+    # producing a -Wmacro-redefined warning that -Werror turns fatal. Undef
+    # first so the upstream -D is the sole definition.
+    build --cxxopt=-U_LIBCPP_HARDENING_MODE
+    build --host_cxxopt=-U_LIBCPP_HARDENING_MODE
     build --action_env=PATH=${nixPath}
     build --host_action_env=PATH=${nixPath}
     build --action_env=NIX_LDFLAGS

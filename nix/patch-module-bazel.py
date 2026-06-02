@@ -208,6 +208,44 @@ def main():
                 i = j
                 continue
 
+        # ── Remove rust toolchain + crate_universe extensions ──
+        # The nix branch substitutes @crates//:wasmtime_c with a pre-built
+        # wasmtime C API tarball (see nix_wasmtime/). No rust code in
+        # redpanda needs to compile, so rust toolchain + crate fetching
+        # can be skipped entirely.
+        if 'rust = use_extension(' in line:
+            i = skip_block(i)
+            continue
+        if line.strip().startswith('rust.'):
+            i = skip_block(i)
+            continue
+        if 'crate = use_extension(' in line:
+            i = skip_block(i)
+            continue
+        if line.strip().startswith('crate.'):
+            i = skip_block(i)
+            continue
+        # Strip section header comments for rust/crate sections
+        if is_section_header(i, 'rust toolchain'):
+            i += 2
+            if i < len(lines) and lines[i].strip().startswith('# ===='):
+                i += 1
+            while i < len(lines) and lines[i].strip() == '':
+                i += 1
+            while i < len(lines):
+                if is_section_header(i, ''):
+                    break
+                i += 1
+            continue
+        if 'use_repo(' in line:
+            block_text, j = peek_block(i)
+            if re.search(r'\b(rust|crate)\b', block_text) and 'rules_rust' not in block_text:
+                i = j
+                continue
+        if 'register_toolchains(' in line and 'rust_toolchains' in line:
+            i = skip_block(i)
+            continue
+
         output.append(line)
         i += 1
 
