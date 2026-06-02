@@ -511,6 +511,14 @@ LKSCTP_BUILD
     # (its http_archive is deleted from repositories.bzl below)
     sed -i '/use_repo(non_module_dependencies, "libpciaccess")/d' $out/MODULE.bazel
 
+    # Strip "layering_check" from redpanda_cc_library / redpanda_cc_binary.
+    # Bazel 9's layering_check is stricter than Bazel 8's: some upstream
+    # targets (e.g. //src/v/pandaproxy/schema_registry:avro) include
+    # headers from transitive deps that aren't direct deps, which the
+    # check now rejects. The flag --features=-layering_check on the CLI
+    # doesn't override an explicit features=[...] on a rule.
+    sed -i 's/"layering_check",//g' $out/bazel/build.bzl
+
     # Remove sysroot use_repo lines (the sysroot()/http_archive() calls in
     # repositories.bzl that would create them are stripped by REPOS_PATCH
     # below — nix substitutes the LLVM toolchain via nixpkgs).
@@ -1021,10 +1029,35 @@ REPOS_PATCH
     # nixpkgs libcxx 20.1.8 bakes in a pre-define of _LIBCPP_HARDENING_MODE
     # (to _LIBCPP_HARDENING_MODE_FAST) via clang's predefined macros. The
     # upstream .bazelrc then re-defines it to _LIBCPP_HARDENING_MODE_EXTENSIVE,
-    # producing a -Wmacro-redefined warning that -Werror turns fatal. Undef
-    # first so the upstream -D is the sole definition.
-    build --cxxopt=-U_LIBCPP_HARDENING_MODE
-    build --host_cxxopt=-U_LIBCPP_HARDENING_MODE
+    # producing a -Wmacro-redefined warning that -Werror turns fatal. .bazelrc.nix
+    # is loaded last, so a -U here would override the -D. Disable the
+    # warning instead.
+    build --cxxopt=-Wno-macro-redefined
+    build --host_cxxopt=-Wno-macro-redefined
+
+    # Bazel 9 enforces layering_check more strictly than Bazel 8.
+    # Several targets — both internal (e.g.
+    # //src/v/pandaproxy/schema_registry:avro) and external (e.g.
+    # @@liburing+//:uring, @@abseil-cpp+) — include headers that aren't
+    # in their direct deps' hdrs and fail with "undeclared inclusion(s)
+    # in rule".
+    #
+    # Globally disabling via --features=-layering_check doesn't override
+    # rules that explicitly set features=["layering_check"]; stripping
+    # the feature from redpanda_cc_library helps redpanda's own targets
+    # but not BCR deps. There's no `-fno-modules-strict-decluse` clang
+    # flag to override the toolchain's enforcement either.
+    #
+    # TODO: figure out how to disable layering_check toolchain-wide for
+    # the nix path. Candidates: patch rules_cc cc_toolchain_config, or
+    # add a single_version_override patch to each external dep.
+    build --features=-layering_check
+
+    # Make jinja2/jsonschema (from pythonWithDeps) visible to genrule
+    # py_binary tools (e.g. //src/v/rpc:compiler). With hermetic python
+    # from rules_python, sys.path doesn't include nixpkgs site-packages.
+    build --action_env=PYTHONPATH=${pythonWithDeps}/lib/python3.12/site-packages
+    build --host_action_env=PYTHONPATH=${pythonWithDeps}/lib/python3.12/site-packages
     build --action_env=PATH=${nixPath}
     build --host_action_env=PATH=${nixPath}
     build --action_env=NIX_LDFLAGS
