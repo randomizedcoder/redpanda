@@ -134,12 +134,14 @@ proto_toolchain(
 )
 PROTOC_BUILD
 
-    # Create nix_wasmtime/ — pre-built wasmtime C API from upstream
-    # release. Avoids needing the rust toolchain, cargo-bazel, and 80+
-    # crates from crates.io (which can't be resolved offline).
+    # Create nix_wasmtime/ — wasmtime C API built by ./wasmtime-c-api.nix
+    # (rustPlatform.buildRustPackage at v42.0.2 with enableStatic=true).
+    # Avoids needing the rust toolchain, cargo-bazel, and ~80 crates
+    # from crates.io inside the Bazel sandbox (cargo handles its own
+    # offline resolution via cargoHash in the nix derivation phase).
     mkdir -p $out/nix_wasmtime/{include,lib}
-    cp -r --no-preserve=mode ${wasmtimePrebuilt}/include/. $out/nix_wasmtime/include/
-    ln -s ${wasmtimePrebuilt}/lib/libwasmtime.a $out/nix_wasmtime/lib/
+    cp -r --no-preserve=mode ${wasmtimeBuilt.dev}/include/. $out/nix_wasmtime/include/
+    ln -s ${wasmtimeBuilt.lib}/lib/libwasmtime.a $out/nix_wasmtime/lib/
 
     cat > $out/bazel/thirdparty/wasmtime-prebuilt.BUILD <<'WASMTIME_BUILD'
 cc_import(
@@ -511,13 +513,15 @@ LKSCTP_BUILD
     # (its http_archive is deleted from repositories.bzl below)
     sed -i '/use_repo(non_module_dependencies, "libpciaccess")/d' $out/MODULE.bazel
 
-    # Strip "layering_check" from redpanda_cc_library / redpanda_cc_binary.
-    # Bazel 9's layering_check is stricter than Bazel 8's: some upstream
-    # targets (e.g. //src/v/pandaproxy/schema_registry:avro) include
-    # headers from transitive deps that aren't direct deps, which the
-    # check now rejects. The flag --features=-layering_check on the CLI
-    # doesn't override an explicit features=[...] on a rule.
-    sed -i 's/"layering_check",//g' $out/bazel/build.bzl
+    # Replace "layering_check" with "-layering_check" in redpanda_cc_library
+    # / redpanda_cc_binary. Bazel 9's layering_check is stricter than 8's:
+    # some upstream targets (e.g. //src/v/pandaproxy/schema_registry:avro)
+    # include headers from transitive deps that aren't direct deps.
+    #
+    # Just removing the entry (leaving features = []) doesn't help — the
+    # toolchain default still includes layering_check. We need to actively
+    # opt OUT with a "-layering_check" entry.
+    sed -i 's/"layering_check"/"-layering_check"/g' $out/bazel/build.bzl
 
     # Remove sysroot use_repo lines (the sysroot()/http_archive() calls in
     # repositories.bzl that would create them are stripped by REPOS_PATCH
@@ -737,20 +741,15 @@ REPOS_PATCH
     ) orderedNames
   );
 
-  # ── Pre-built wasmtime C API ──
+  # ── Built-from-source wasmtime C API ──
   # Substitutes @crates//:wasmtime_c (which the dev branch builds by
   # invoking cargo-bazel + rustc against ~80 crates from crates.io —
-  # impossible offline in the Nix sandbox). The upstream wasmtime
-  # release ships a self-contained C API tarball (static + shared libs,
-  # headers, conf.h already expanded). libwasmtime.a has no __rustc::*
-  # undefined symbols, so we don't need the rules_rust allocator shim.
-  wasmtimePrebuilt = runCommand "wasmtime-c-api-prebuilt" { } ''
-    mkdir -p $out
-    tar -xJf ${fetchurl {
-      url = "https://github.com/bytecodealliance/wasmtime/releases/download/v42.0.2/wasmtime-v42.0.2-x86_64-linux-c-api.tar.xz";
-      sha256 = "041f7753a894af41e01abffb2c62dc8d7226bc557ed04337fde2ddf181fae467";
-    }} -C $out --strip-components=1
-  '';
+  # impossible offline in the Nix sandbox). We build wasmtime ourselves
+  # via rustPlatform.buildRustPackage (which handles cargo offline via
+  # cargoHash). See nix/wasmtime-c-api.nix for the recipe; the design is
+  # a fork of nixpkgs's wasmtime package at the commit when it shipped
+  # 42.0.1, bumped to 42.0.2 to match upstream MODULE.bazel.
+  wasmtimeBuilt = callPackage ./wasmtime-c-api.nix { };
 
   # ── Pre-built cargo-bazel for crate_universe extension ──
   # module_ctx.download() does NOT use --repository_cache, so we must
@@ -1035,23 +1034,17 @@ REPOS_PATCH
     build --cxxopt=-Wno-macro-redefined
     build --host_cxxopt=-Wno-macro-redefined
 
-    # Bazel 9 enforces layering_check more strictly than Bazel 8.
-    # Several targets — both internal (e.g.
-    # //src/v/pandaproxy/schema_registry:avro) and external (e.g.
-    # @@liburing+//:uring, @@abseil-cpp+) — include headers that aren't
-    # in their direct deps' hdrs and fail with "undeclared inclusion(s)
-    # in rule".
-    #
-    # Globally disabling via --features=-layering_check doesn't override
-    # rules that explicitly set features=["layering_check"]; stripping
-    # the feature from redpanda_cc_library helps redpanda's own targets
-    # but not BCR deps. There's no `-fno-modules-strict-decluse` clang
-    # flag to override the toolchain's enforcement either.
-    #
-    # TODO: figure out how to disable layering_check toolchain-wide for
-    # the nix path. Candidates: patch rules_cc cc_toolchain_config, or
-    # add a single_version_override patch to each external dep.
+    # Disable Bazel 9's stricter header-dependency checks. The
+    # "undeclared inclusion(s) in rule" diagnostic comes from
+    # CppCompileAction's input-deps verification — turned on by default
+    # via --incompatible_validate_top_level_header_inclusions=true.
+    # Combined with feature negations for layering_check and friends so
+    # nothing else re-enables the check.
+    build --noincompatible_validate_top_level_header_inclusions
     build --features=-layering_check
+    build --features=-parse_headers
+    build --host_features=-layering_check
+    build --host_features=-parse_headers
 
     # Make jinja2/jsonschema (from pythonWithDeps) visible to genrule
     # py_binary tools (e.g. //src/v/rpc:compiler). With hermetic python
