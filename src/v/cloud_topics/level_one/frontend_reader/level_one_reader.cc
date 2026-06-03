@@ -14,6 +14,7 @@
 #include "cloud_topics/logger.h"
 #include "model/fundamental.h"
 #include "model/timeout_clock.h"
+#include "ssx/future-util.h"
 #include "utils/retry_chain_node.h"
 
 #include <seastar/coroutine/as_future.hh>
@@ -64,10 +65,15 @@ ss::future<model::record_batch_reader::storage_t>
 level_one_log_reader_impl::do_load_slice(
   model::timeout_clock::time_point deadline) {
     try {
-        return read_some(deadline);
+        co_return co_await read_some(deadline);
     } catch (...) {
-        vlog(
-          _log.error, "Reader caught exception: {}", std::current_exception());
+        auto ex = std::current_exception();
+        vlogl(
+          _log,
+          ssx::is_shutdown_exception(ex) ? ss::log_level::debug
+                                         : ss::log_level::warn,
+          "Reader caught exception: {}",
+          ex);
         set_end_of_stream();
         throw;
     }
@@ -89,7 +95,7 @@ level_one_log_reader_impl::open_reader_at(
                            ? &_config.abort_source.value().get()
                            : &default_abort_source;
     auto stream_fut = co_await ss::coroutine::as_future(
-      _io->read_object(extent, abort_source));
+      _io->read_object(extent, abort_source, _config.group));
     if (stream_fut.failed()) {
         auto ex = stream_fut.get_exception();
         vlog(
@@ -308,7 +314,7 @@ ss::future<l1::footer> level_one_log_reader_impl::read_footer(
                            ? &_config.abort_source.value().get()
                            : &default_abort_source;
     auto read_fut = co_await ss::coroutine::as_future(
-      _io->read_object_as_iobuf(extent, abort_source));
+      _io->read_object_as_iobuf(extent, abort_source, _config.group));
     if (read_fut.failed()) {
         auto ex = read_fut.get_exception();
         vlog(

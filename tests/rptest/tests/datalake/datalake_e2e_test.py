@@ -45,7 +45,10 @@ from rptest.tests.datalake.catalog_service_factory import (
 )
 from rptest.tests.datalake.datalake_services import DatalakeServices
 from rptest.tests.datalake.query_engine_base import QueryEngineType
-from rptest.tests.datalake.utils import supported_storage_types
+from rptest.tests.datalake.utils import (
+    duckdb_supported_storage_types,
+    supported_storage_types,
+)
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.utils.mode_checks import skip_debug_mode
 
@@ -771,7 +774,7 @@ class DatalakeE2ETests(RedpandaTest):
     # split keeps `--fail-bad-cluster-utilization` happy.
     @cluster(num_nodes=2)
     @matrix(
-        cloud_storage_type=[CloudStorageType.S3],
+        cloud_storage_type=duckdb_supported_storage_types(),
         catalog_type=[CatalogType.REST_JDBC],
     )
     def test_avro_all_iceberg_types_duckdb(self, cloud_storage_type, catalog_type):
@@ -1845,6 +1848,57 @@ class DatalakeMetricsTest(RedpandaTest):
                 > 0,
                 timeout_sec=30,
                 backoff_sec=1,
+            )
+
+    def _probe_metric_series(self) -> list:
+        # The lag gauge is owned by the per-partition translation_probe, so its
+        # presence tracks the probe's lifetime. Partition/shard labels are
+        # aggregated away, leaving one series per (node, topic).
+        samples = self.redpanda.metrics_sample(
+            DatalakeMetricsTest.translation_lag,
+            self.redpanda.nodes,
+            MetricsEndpoint.PUBLIC_METRICS,
+        )
+        if samples is None:
+            return []
+        return samples.label_filter({"redpanda_topic": self.topic_name}).samples
+
+    @cluster(num_nodes=5)
+    @matrix(cloud_storage_type=supported_storage_types())
+    def test_probe_removed_on_topic_deletion(self, cloud_storage_type):
+        """The per-partition translation_probe must be destroyed whenever the
+        partition no longer requires an active translator (lost leadership,
+        iceberg disabled, replica moved off the shard), otherwise the probe and
+        the metric series it owns leak for the lifetime of the process. This
+        test uses topic deletion as a deterministic way to trigger probe
+        cleanup."""
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[],
+            catalog_type=supported_catalog_types()[0],
+        ) as dl:
+            dl.create_iceberg_enabled_topic(self.topic_name, partitions=1, replicas=3)
+            dl.produce_to_topic(self.topic_name, 1, msg_count=randint(12, 21))
+
+            # The probe is created lazily when the partition gets an active
+            # translator (leader + iceberg enabled).
+            wait_until(
+                lambda: len(self._probe_metric_series()) > 0,
+                timeout_sec=30,
+                backoff_sec=1,
+                err_msg="Timed out waiting for translation probe metrics to appear",
+            )
+
+            RpkTool(self.redpanda).delete_topic(self.topic_name)
+
+            # Once the partition is unassigned from every shard the probe, and
+            # thus its metric series, must be gone.
+            wait_until(
+                lambda: len(self._probe_metric_series()) == 0,
+                timeout_sec=30,
+                backoff_sec=1,
+                err_msg="translation probe metrics leaked after topic deletion",
             )
 
 

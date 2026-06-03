@@ -19,7 +19,6 @@
 #include "cluster/partition.h"
 #include "config/configuration.h"
 #include "model/timeout_clock.h"
-#include "ssx/future-util.h"
 
 #include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -50,13 +49,13 @@ ss::future<model::record_batch_reader::storage_t>
 level_zero_log_reader_impl::do_load_slice(
   model::timeout_clock::time_point deadline) {
     try {
-        return read_some(deadline);
+        co_return co_await read_some(deadline);
     } catch (...) {
         auto ex = std::current_exception();
         vlogl(
           _log,
           ssx::is_shutdown_exception(ex) ? ss::log_level::debug
-                                         : ss::log_level::error,
+                                         : ss::log_level::warn,
           "Reader caught exception: {}",
           ex);
         set_end_of_stream();
@@ -402,7 +401,8 @@ level_zero_log_reader_impl::materialize_batches(
           std::move(to_materialize),
           deadline,
           _config.abort_source,
-          _config.allow_mat_failure);
+          _config.allow_mat_failure,
+          _config.group);
         if (!mat_res.has_value()) {
             if (mat_res.error() == errc::shutting_down) {
                 vlog(_log.debug, "Materialize aborted due to shutdown");

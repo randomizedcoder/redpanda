@@ -126,6 +126,48 @@ public:
     /// \c backend_shard.
     ss::future<finalize_status> submit_manual_finalize_request();
 
+    /// Observability snapshot of the upgrade-finalization lifecycle,
+    /// returned by \ref get_upgrade_status.
+    struct upgrade_status {
+        enum class finalization_state {
+            /// active_version already equals the version uniformly
+            /// supported by all members; nothing to finalize.
+            finalized,
+            /// All members report the same version > active_version and
+            /// are alive: finalizable now.
+            ready_to_finalize,
+            /// Members differ, or a member's version is unknown, or a
+            /// member is not alive: not finalizable yet.
+            upgrade_in_progress,
+        };
+
+        /// One member's reported version state.
+        struct member {
+            model::node_id id;
+            cluster_version logical_version{invalid_version};
+            bool version_known{false};
+            bool alive{false};
+            ss::sstring release_version;
+        };
+
+        finalization_state state{finalization_state::finalized};
+        cluster_version active_version{invalid_version};
+        cluster_version version_after_finalization{invalid_version};
+        bool auto_finalization_enabled{false};
+        std::vector<member> members;
+    };
+
+    /// Snapshot the cluster's upgrade-finalization state for
+    /// observability: per-member logical versions (from health reports)
+    /// and liveness, the active version, and the version a finalize
+    /// would advance to. The per-member preconditions mirror those
+    /// \ref do_maybe_update_active_version applies; the raw per-member
+    /// fields are authoritative even if the rolled-up \c state lags a
+    /// change to that loop. Reflects the controller leader's view, so
+    /// callers should invoke this on the leader. Must run on
+    /// \c backend_shard.
+    ss::future<upgrade_status> get_upgrade_status();
+
     features::enterprise_feature_report report_enterprise_features() const;
 
     /**
@@ -151,7 +193,7 @@ private:
     ss::future<> maybe_update_feature_table();
 
     /// Consume _updates and evaluate whether the cluster version may advance
-    ss::future<> do_maybe_update_active_version();
+    ss::future<> do_maybe_update_active_version(bool&);
 
     /// Check _feature_table for any features that are elegible to auto
     /// activate but not yet active.
@@ -159,10 +201,10 @@ private:
 
     /// Whether there is work to do in maybe_update_feature_table
     bool updates_pending() {
-        if (!_am_controller_leader) {
+        if (!_is_leader_of.has_value()) {
             return false;
         }
-        if (!_updates.empty() || _manual_finalize_pending) {
+        if (!_updates.empty() || _manual_finalize_pending || _members_changed) {
             return true;
         }
         return !auto_activate_features(
@@ -178,7 +220,9 @@ private:
 
     // Compose a command struct, replicate it via raft and wait for apply.
     // Silently swallow not_leader errors, raise on other errors;
-    ss::future<> replicate_feature_update_cmd(feature_update_cmd_data data);
+    ss::future<> replicate_feature_update_cmd(
+      feature_update_cmd_data data,
+      std::optional<model::term_id> term = std::nullopt);
 
     // Discover features that may now be auto-activated: usually this happens
     // when we activate a new logical version, but it may also happen if we
@@ -207,6 +251,8 @@ private:
       notification_id_type_invalid};
     cluster::notification_id_type _health_notify_handle{
       notification_id_type_invalid};
+    cluster::notification_id_type _members_notify_handle{
+      notification_id_type_invalid};
 
     // Barriers are only populated on shard 0
     feature_barrier_state<ss::lowres_clock> _barrier_state;
@@ -217,9 +263,20 @@ private:
     // the controller leader.
     version_map _node_versions;
 
-    // Keep track of whether this node is the controller leader
-    // via leadership notifications
-    bool _am_controller_leader{false};
+    // The raft0 term this node currently believes itself to be the
+    // controller leader for, or nullopt if it isn't. Updated from
+    // the leadership notification handler; has_value() is the
+    // canonical "am I the controller leader" check.
+    std::optional<model::term_id> _is_leader_of;
+
+    // The most recent term for which we have completed a linearizable
+    // barrier against raft0 and waited for the controller STM to apply
+    // through the barrier offset. Until this matches _is_leader_of, the
+    // background loop must not consult cluster-config values whose
+    // intermediate replay state could cause incorrect decisions (e.g.
+    // features_auto_finalization racing a freshly-elected leader's
+    // controller log replay).
+    std::optional<model::term_id> _caught_up_for_term;
 
     // Whether an operator has issued a manual finalization request that
     // has not yet been honored by the background loop. In-memory only:
@@ -227,6 +284,18 @@ private:
     // before the loop replicates the advance loses the request. Cleared
     // on leadership change and consumed (one-shot) by the loop body.
     bool _manual_finalize_pending{false};
+
+    // Whether the cluster's membership has changed since the loop last
+    // evaluated the active version. Set from the members_table
+    // notification and consumed (one-shot) by the loop body. Required
+    // because do_maybe_update_active_version reads
+    // members_table::node_ids() to decide whether all members are at the
+    // candidate version: when a node is fully removed (e.g. its
+    // decommission completes), health reports cease and no leader
+    // change fires, so without this signal the loop never re-evaluates
+    // and the active version stays pinned to the just-removed node's
+    // version.
+    bool _members_changed{false};
 
     // Blocks cluster upgrades until the enterprise license has been verified
     ssx::semaphore _verified_enterprise_license{

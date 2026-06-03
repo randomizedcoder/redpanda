@@ -4411,6 +4411,9 @@ class RedpandaService(Service, RedpandaServiceABC):
             # not-running processes
             def check_pid(node: ClusterNode) -> tuple[ClusterNode, str] | None:
                 if not self.redpanda_pid(node):
+                    dmesg = self._capture_dmesg(node)
+                    if dmesg:
+                        self._save_dmesg_artifact(node, dmesg)
                     return (node, "Redpanda process unexpectedly stopped")
                 return None
 
@@ -4424,6 +4427,43 @@ class RedpandaService(Service, RedpandaServiceABC):
                 )
             else:
                 raise NodeCrash(crashes)
+
+    def _capture_dmesg(self, node: ClusterNode) -> str | None:
+        """Capture recent dmesg output from ``node`` for crash diagnostics."""
+        try:
+            slack_secs = 300
+            seconds_ago = int(time.time() - self._start_time) + slack_secs
+            lines: list[str] = []
+            max_lines = 1000
+            cmd = (
+                f"sudo dmesg -T --since '{seconds_ago} seconds ago' | tail -{max_lines}"
+            )
+            for line in node.account.ssh_capture(cmd, timeout_sec=10):
+                line = line.strip()
+                if line:
+                    lines.append(line)
+            return "\n".join(lines) if lines else None
+        except Exception as e:
+            self.logger.debug(
+                f"Failed to collect dmesg from {node.account.hostname}: {e}"
+            )
+            return None
+
+    def _save_dmesg_artifact(self, node: ClusterNode, dmesg: str) -> None:
+        node_dir = os.path.join(
+            TestContext.results_dir(self._context, self._context.test_index),
+            self.service_id,
+            node.account.hostname,
+        )
+        artifact_path = os.path.join(node_dir, "dmesg.txt")
+        try:
+            if not os.path.isdir(node_dir):
+                mkdir_p(node_dir)
+            self.logger.info(f"writing dmesg output to {artifact_path}")
+            with open(artifact_path, "w") as f:
+                f.write(dmesg)
+        except Exception as e:
+            self.logger.debug(f"Failed to write dmesg to {artifact_path}: {e}")
 
     def raw_metrics(
         self,
@@ -6081,66 +6121,83 @@ class RedpandaService(Service, RedpandaServiceABC):
         check_object_metadata: bool = True,
         check_object_storage: bool = True,
         max_extents_per_call: int = 1000,
+        max_concurrent_partitions: int = 16,
     ):
         """
         Validate metastore state for all cloud topic partitions.
 
         Discovers cloud topics and calls ValidatePartition for each cloud topic
-        partition, paginating to bound the work per call.
+        partition, paginating to bound the work per call. Partitions are
+        validated concurrently (bounded by `max_concurrent_partitions`) so the
+        wall-clock cost scales with the slowest partition rather than the sum
+        across partitions; at fleet scale (thousands of partitions) the
+        sequential variant overran ducktape timeouts.
         """
         if not self.started_nodes():
             return
 
         admin = AdminV2(self, auth=(self._superuser.username, self._superuser.password))
         all_anomalies: list[str] = []
+        anomalies_lock = threading.Lock()
         max_retries = 5
 
-        def validate_topic(topic: metastore_pb.CloudTopicInfo):
-            for pid in range(topic.partition_count):
-                resume: int | None = None
-                total_extents = 0
-                retries = 0
-                while True:
-                    req = metastore_pb.ValidatePartitionRequest(
-                        topic_id=topic.topic_id,
-                        partition_id=pid,
-                        check_object_metadata=check_object_metadata,
-                        check_object_storage=check_object_storage,
-                        max_extents=max_extents_per_call,
-                    )
-                    if resume is not None:
-                        req.resume_at_offset = resume
-                    try:
-                        resp = admin.metastore().validate_partition(req=req)
-                        retries = 0
-                    except ConnectError as e:
-                        if (
-                            e.code == ConnectErrorCode.UNAVAILABLE
-                            and retries < max_retries
-                        ):
-                            retries += 1
-                            self.logger.warning(
-                                f"validate_partition unavailable for "
-                                f"{topic.topic_name}/{pid}, "
-                                f"retry {retries}/{max_retries}..."
-                            )
-                            time.sleep(1)
-                            continue
-                        raise
-                    total_extents += resp.extents_validated
-                    for a in resp.anomalies:
-                        all_anomalies.append(
-                            f"{topic.topic_name}/{pid}: "
-                            f"[{metastore_pb.AnomalyType.Name(a.anomaly_type)}]"
-                            f" {a.description}"
-                        )
-                    if not resp.HasField("resume_at_offset"):
-                        break
-                    resume = resp.resume_at_offset
-
-                self.logger.debug(
-                    f"Validated {total_extents} extents for {topic.topic_name}/{pid}"
+        def validate_partition(topic: metastore_pb.CloudTopicInfo, pid: int) -> None:
+            resume: int | None = None
+            total_extents = 0
+            retries = 0
+            while True:
+                req = metastore_pb.ValidatePartitionRequest(
+                    topic_id=topic.topic_id,
+                    partition_id=pid,
+                    check_object_metadata=check_object_metadata,
+                    check_object_storage=check_object_storage,
+                    max_extents=max_extents_per_call,
                 )
+                if resume is not None:
+                    req.resume_at_offset = resume
+                try:
+                    resp = admin.metastore().validate_partition(req=req)
+                    retries = 0
+                except ConnectError as e:
+                    if e.code == ConnectErrorCode.UNAVAILABLE and retries < max_retries:
+                        retries += 1
+                        self.logger.warning(
+                            f"validate_partition unavailable for "
+                            f"{topic.topic_name}/{pid}, "
+                            f"retry {retries}/{max_retries}..."
+                        )
+                        time.sleep(1)
+                        continue
+                    raise
+                total_extents += resp.extents_validated
+                if resp.anomalies:
+                    formatted = [
+                        f"{topic.topic_name}/{pid}: "
+                        f"[{metastore_pb.AnomalyType.Name(a.anomaly_type)}]"
+                        f" {a.description}"
+                        for a in resp.anomalies
+                    ]
+                    with anomalies_lock:
+                        all_anomalies.extend(formatted)
+                if not resp.HasField("resume_at_offset"):
+                    break
+                resume = resp.resume_at_offset
+
+            self.logger.debug(
+                f"Validated {total_extents} extents for {topic.topic_name}/{pid}"
+            )
+
+        def validate_topic(topic: metastore_pb.CloudTopicInfo):
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_concurrent_partitions
+            ) as executor:
+                futures = [
+                    executor.submit(validate_partition, topic, pid)
+                    for pid in range(topic.partition_count)
+                ]
+                # Surface the first exception (if any) once all have settled.
+                for f in concurrent.futures.as_completed(futures):
+                    f.result()
 
         after_name = ""
         while True:
@@ -6280,23 +6337,60 @@ class RedpandaService(Service, RedpandaServiceABC):
                 # Leadership moves may perturb the scrub, so disable it to
                 # streamline the actions below.
                 "enable_leader_balancer": False,
+                # Replica-set reassignments by the partition autobalancer
+                # (triggered by e.g. a recent decommission) can move a
+                # partition off the leader that just completed a full
+                # scrub, dropping `last_complete_scrub` from the new
+                # leader's manifest view and causing the polling loop
+                # below to time out. Disable replica autobalancing for
+                # the duration of the scrub. See CORE-15146.
+                "partition_autobalancing_mode": "off",
             },
             tolerate_stopped_nodes=True,
         )
 
+        # Per-partition: the leader we last reset scrubbing metadata on.
+        # Populated by the initial setup loop below and updated whenever
+        # the polling loop notices leadership has moved (via a 307 redirect
+        # from the anomalies endpoint) and rediscovers + resets on the new
+        # leader.
+        last_leader: dict[CloudStoragePartition, ClusterNode] = {}
         unavailable: set[CloudStoragePartition] = set()
+        scrubbed: set[CloudStoragePartition] = set()
+        all_anomalies: list[dict[str, Any]] = []
+
+        # Initial setup: find a leader and reset scrubbing metadata for
+        # every partition. Done outside wait_until so its time (up to
+        # ~10s per partition for await_stable_leader) doesn't count
+        # against the scrub-completion polling budget below. Partitions
+        # where we can't get this far are logged and added to
+        # `unavailable` so the polling loop just skips them.
         for p in cloud_storage_partitions:
             try:
                 leader_id = self._admin.await_stable_leader(
                     topic=p.topic, partition=p.index
                 )
-
+                leader = self.get_node_by_id(leader_id)
+                if leader is None:
+                    self.logger.warning(
+                        f"kafka/{p.topic}/{p.index}: leader id {leader_id} "
+                        f"not in started nodes, skipping scrub for this partition"
+                    )
+                    unavailable.add(p)
+                    continue
                 self._admin.reset_scrubbing_metadata(
                     namespace="kafka",
                     topic=p.topic,
                     partition=p.index,
-                    node=self.get_node_by_id(leader_id),
+                    node=leader,
                 )
+                last_leader[p] = leader
+            except TimeoutError as e:
+                self.logger.warning(
+                    f"kafka/{p.topic}/{p.index}: could not find stable "
+                    f"leader during scrub setup ({e}); skipping this partition"
+                )
+                unavailable.add(p)
             except HTTPError as he:
                 if he.response.status_code == 404:
                     # Old redpanda, doesn't have this endpoint.  We can't
@@ -6305,10 +6399,6 @@ class RedpandaService(Service, RedpandaServiceABC):
                     continue
                 else:
                     raise
-
-        cloud_storage_partitions -= unavailable
-        scrubbed: set[CloudStoragePartition] = set()
-        all_anomalies: list[dict[str, Any]] = []
 
         allowed_keys = set(
             ["ns", "topic", "partition", "revision_id", "last_complete_scrub_at"]
@@ -6351,14 +6441,55 @@ class RedpandaService(Service, RedpandaServiceABC):
                             detected.pop("segment_metadata_anomalies", None)
 
         def all_partitions_scrubbed():
-            waiting_for = cloud_storage_partitions - scrubbed
+            waiting_for = cloud_storage_partitions - scrubbed - unavailable
             self.logger.info(
                 f"Waiting for {len(waiting_for)} partitions to be scrubbed"
             )
             for p in waiting_for:
-                result = self._admin.get_cloud_storage_anomalies(
-                    namespace="kafka", topic=p.topic, partition=p.index
+                # Recovery branch: the polling loop previously cleared
+                # last_leader[p] because the anomalies endpoint returned
+                # a 307 (leader moved). Rediscover a stable leader and
+                # re-issue the reset on it. By the time we're polling
+                # the partition was already healthy enough to set up
+                # initially, so failures here are real (not just a
+                # transient setup race) and we let them propagate -
+                # wait_until's retry_on_exc=True will retry within the
+                # overall timeout and the assert message is preserved
+                # as the cause of the eventual TimeoutError.
+                if p not in last_leader:
+                    leader_id = self._admin.await_stable_leader(
+                        topic=p.topic, partition=p.index
+                    )
+                    leader = self.get_node_by_id(leader_id)
+                    assert leader is not None, (
+                        f"kafka/{p.topic}/{p.index}: stable leader id "
+                        f"{leader_id} did not map to a started node"
+                    )
+                    self._admin.reset_scrubbing_metadata(
+                        namespace="kafka",
+                        topic=p.topic,
+                        partition=p.index,
+                        node=leader,
+                    )
+                    last_leader[p] = leader
+                    continue
+
+                # Query anomalies on the known leader. Target it directly
+                # and disable redirect-following so a 307 (leader moved)
+                # surfaces as is_redirect == True instead of being
+                # transparently followed - which is our cue to forget the
+                # leader and rediscover next round. See CORE-15146.
+                r = self._admin._request(
+                    "GET",
+                    f"cloud_storage/anomalies/kafka/{p.topic}/{p.index}",
+                    node=last_leader[p],
+                    allow_redirects=False,
                 )
+                if r.is_redirect:
+                    last_leader.pop(p, None)
+                    continue
+
+                result = r.json()
                 if "last_complete_scrub_at" in result:
                     scrubbed.add(p)
 
