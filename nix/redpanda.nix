@@ -1091,7 +1091,7 @@ REPOS_PATCH
   '';
 
   commonArgs = [
-    "--repository_cache=repo_cache"
+    "--repository_cache=/tmp/repo_cache"
     "--shell_executable=${bash}/bin/bash"
     "--action_env=PATH=${nixPath}"
     "--repo_env=PATH=${nixPath}"
@@ -1214,8 +1214,12 @@ stdenv.mkDerivation {
     # read-only Nix store, but Bazel needs to write to the cache dir
     # (e.g. caching registry file lookups). lndir creates a writable
     # directory tree with symlinks to the actual archive files.
-    mkdir -p repo_cache
-    ${lndir}/bin/lndir -silent ${repoCache} repo_cache
+    #
+    # Bazel 9 rejects a repo_contents_cache inside the workspace, so
+    # place this at /tmp/repo_cache (outside /build/redpanda-src-patched
+    # which is the bazel workspace).
+    mkdir -p /tmp/repo_cache
+    ${lndir}/bin/lndir -silent ${repoCache} /tmp/repo_cache
 
     # ── Phase A: Initial fetch ──
     # Extracts archives from the pre-populated repo cache.
