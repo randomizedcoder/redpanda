@@ -7,7 +7,7 @@
   fetchurl,
   bazel_9,
   bazelisk,
-  llvmPackages_20,
+  llvmPackages_22,
   python312,
   go,
   jdk_headless,
@@ -980,10 +980,10 @@ REPOS_PATCH
 
   nativeBuildInputsDeps = [
     bazelisk
-    llvmPackages_20.libcxxClang
-    llvmPackages_20.lld
-    llvmPackages_20.llvm
-    llvmPackages_20.libcxx
+    llvmPackages_22.libcxxClang
+    llvmPackages_22.lld
+    llvmPackages_22.llvm
+    llvmPackages_22.libcxx
     pythonWithDeps
     go
     jdk_headless
@@ -1193,13 +1193,13 @@ REPOS_PATCH
       "${libtool}/share/aclocal"
       "${pkg-config}/share/aclocal"
     ]}
-    build --action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-    build --host_action_env=LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib
-    build --action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib:${zlib}/lib
-    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_20.libcxx}/lib:${gccLib}/lib:${zlib}/lib
-    build --linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
+    build --action_env=LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib
+    build --host_action_env=LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib
+    build --action_env=LD_LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
     build --linkopt=-Wl,-rpath,${gccLib}/lib
-    build --host_linkopt=-Wl,-rpath,${llvmPackages_20.libcxx}/lib
+    build --host_linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
     build --host_linkopt=-Wl,-rpath,${gccLib}/lib
     build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
   '';
