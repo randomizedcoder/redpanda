@@ -536,6 +536,120 @@ LKSCTP_BUILD
     # gets a new_local_repository for "crates" appended by REPOS_PATCH).
     sed -i '/use_repo(non_module_dependencies, "xxhash")/a\use_repo(non_module_dependencies, "crates")' $out/MODULE.bazel
 
+    # ── BUILD-file layering_check patches ──
+    # Bazel 9's layering_check, combined with redpanda_cc_library's
+    # default include_prefix (= package path under src/v/), produces
+    # a confusing class of failures. When :A is a `redpanda_cc_library`
+    # and depends on :B (another rule in the same package, with the
+    # same include_prefix), :B's hdrs get merged into :A's
+    # `_virtual_includes/A/<prefix>/` path. Bazel's check then sees
+    # those headers as belonging-to-:A (by file path) but missing
+    # from :A's own `hdrs`, and rejects compilation.
+    #
+    # Fix: explicitly re-export the headers that come transitively
+    # through such intra-package deps from :A's own hdrs. This makes
+    # :A own the file path that Bazel sees.
+    #
+    # Each patch is intentionally minimal: only add the headers that
+    # were reported as undeclared in the most recent build log.
+    ${pythonWithDeps}/bin/python3 - "$out" << 'BUILD_FILE_PATCHES'
+import re, sys
+from pathlib import Path
+
+OUT = sys.argv[1]
+
+PATCHES = [
+        {
+            "file": f"{OUT}/src/v/pandaproxy/schema_registry/BUILD",
+            "target": "types",
+            "add_hdrs": ["exceptions.h"],
+            "why": (
+                "error.cc and types.cc (srcs of :types) include "
+                "errors.h, which then includes exceptions.h. "
+                ":exceptions IS in :types' deps, so the header reaches "
+                "the compile via merged virtual_includes, but Bazel 9 "
+                "layering_check rejects it as 'missing dependency "
+                "declaration' because the file appears at "
+                "_virtual_includes/types/pandaproxy/schema_registry/"
+                "exceptions.h yet exceptions.h is not in :types' hdrs."
+            ),
+        },
+        {
+            "file": f"{OUT}/src/v/cluster/BUILD",
+            "target": "cluster",
+            "add_hdrs": [
+                # All headers reported as undeclared inclusions while
+                # compiling the various archival/*.cc, cloud_metadata/*.cc,
+                # and miscellaneous .cc files that are srcs of :cluster.
+                # Their providing sub-targets (:version, :fwd, :errc, etc.)
+                # ARE already in :cluster's deps, but the headers appear
+                # in _virtual_includes/cluster/cluster/<file>.h and the
+                # layering_check rejects.
+                "version.h", "fwd.h", "errc.h", "tx_errc.h",
+                "notification.h", "commands.h", "types.h",
+                "members_table.h", "client_quota_serde.h",
+                "data_migration_types.h", "offsets_snapshot.h",
+                "simple_batch_builder.h",
+                "cloud_metadata/cluster_manifest.h",
+                "cloud_metadata/error_outcome.h",
+                "cloud_metadata/types.h",
+                "cluster_link/errc.h",
+                "partition_balancer_types.h",
+                "topic_configuration.h",
+                "topic_properties.h",
+                "remote_topic_properties.h",
+                "partition_leaders_table.h",
+                "health_monitor_types.h",
+                "node/types.h",
+                "ntp_callbacks.h",
+                "topic_table.h",
+                "logger.h",
+                "topic_table_probe.h",
+            ],
+            "why": (
+                "Many archival/*.cc and other srcs of :cluster include "
+                "intra-package headers (cluster/version.h, cluster/fwd.h, "
+                "etc.) whose providing sub-targets ARE in :cluster' deps. "
+                "Same _virtual_includes path-collision issue as :types."
+            ),
+        },
+]
+
+def add_hdrs_to_target(path, target_name, new_hdrs):
+    text = Path(path).read_text()
+    # Match: name = "TARGET", ... hdrs = [ existing_entries ]
+    # Use a relaxed pattern: find the rule by name, then its hdrs block.
+    pattern = re.compile(
+        r'(name = "' + re.escape(target_name) + r'",\s*'
+        r'(?:[^\n]*\n)*?'                # any number of intervening lines
+        r'    hdrs = \[\n)'              # opening of hdrs list
+        r'((?:        "[^"]+",\n)*)'    # existing entries
+        r'(    \])',                     # closing bracket
+        re.MULTILINE,
+    )
+    m = pattern.search(text)
+    if not m:
+        print(f"WARNING: could not find :{target_name} in {path}")
+        return False
+    head, existing, tail = m.group(1), m.group(2), m.group(3)
+    have = set(re.findall(r'"([^"]+)"', existing))
+    added = []
+    for h in new_hdrs:
+        if h not in have:
+            existing += f'        "{h}",\n'
+            added.append(h)
+    if not added:
+        print(f"OK :{target_name}: all headers already present")
+        return False
+    new_text = text[:m.start()] + head + existing + tail + text[m.end():]
+    Path(path).write_text(new_text)
+    print(f"PATCHED :{target_name} ({path}): added {added}")
+    return True
+
+for p in PATCHES:
+    add_hdrs_to_target(p["file"], p["target"], p["add_hdrs"])
+BUILD_FILE_PATCHES
+
     # Export prebuilt BUILD files and patches so Bazel can resolve labels
     cat >> $out/bazel/thirdparty/BUILD <<'EXPORTS'
 exports_files([
