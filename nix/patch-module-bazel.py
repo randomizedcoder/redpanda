@@ -265,6 +265,51 @@ single_version_override(
 )
 '''
 
+    # ── py_binary launcher shebang ──
+    # rules_python emits py_binary launchers with a `#!/usr/bin/env python3`
+    # shebang (DEFAULT_STUB_SHEBANG, plus a hardcoded prelude). The Nix build
+    # sandbox has no /usr/bin/env, so every py_binary used as a build tool
+    # (seastar-json2code, the rpc compiler, the schemata generator, the version
+    # stamper, ...) fails with "bad interpreter". These launchers are written by
+    # build actions in bazel-out, after the nixify shebang-fix pass runs over
+    # external/, so nixify can't reach them. Instead rewrite the shebang default
+    # in rules_python itself at repo-setup time. @NIX_STUB_PYTHON@ is replaced
+    # with the nixpkgs python store path by redpanda.nix.
+    if 'module_name = "rules_python"' not in text:
+        text += '''
+single_version_override(
+    module_name = "rules_python",
+    patch_cmds = [
+        "find python -name '*.bzl' -exec sed -i 's|#!/usr/bin/env python3|#!@NIX_STUB_PYTHON@/bin/python3|g' {} +",
+    ],
+)
+'''
+
+    # ── Local (nixpkgs) python toolchain ──
+    # The hermetic python.toolchain() interpreter lives in each py_binary's
+    # runfiles (rules_python++python+.../bin/python3). Those runfiles are not
+    # materialized when a py_binary runs as a genrule *tool* under
+    # --spawn_strategy=local, so the launcher's re-exec fails with
+    # FileNotFoundError. Register a local runtime pointing at the nixpkgs python
+    # (absolute store path, substituted by redpanda.nix) — its interpreter is an
+    # absolute path, needing no runfiles — and give it toolchain priority via a
+    # root-module register_toolchains().
+    if 'local_runtime_repo' not in text:
+        text += '''
+local_runtime_repo = use_repo_rule("@rules_python//python/private:local_runtime_repo.bzl", "local_runtime_repo")
+local_runtime_toolchains_repo = use_repo_rule("@rules_python//python/private:local_runtime_toolchains_repo.bzl", "local_runtime_toolchains_repo")
+local_runtime_repo(
+    name = "nix_python3",
+    interpreter_path = "@NIX_STUB_PYTHON@/bin/python3",
+    on_failure = "fail",
+)
+local_runtime_toolchains_repo(
+    name = "nix_python_toolchains",
+    runtimes = ["nix_python3"],
+)
+register_toolchains("@nix_python_toolchains//:all")
+'''
+
     # ── Replace pip with stub python_deps extension ──
     # nixpkgs provides jinja2/jsonschema via python312.withPackages.
     # The stub extension creates empty py_library targets so Bazel can
@@ -327,23 +372,31 @@ single_version_override(
             1,
         )
 
-    # Fix liburing: with --spawn_strategy=local, the generate_headers genrule
-    # runs ./configure in the source tree, creating config-host.h there. The
-    # cc_library then sees both the genrule output AND the source-tree copy.
-    # Bazel flags the source-tree copy as "undeclared inclusion". Fix by
-    # cleaning up the source-tree copies after the genrule copies to output.
-    if 'module_name = "liburing"' not in text:
-        text += '''
-# Nix: fix liburing undeclared inclusion of config-host.h.
-# With --spawn_strategy=local, ./configure creates files in source tree.
-# Clean them up after copying to Bazel output to avoid include validation errors.
-single_version_override(
-    module_name = "liburing",
-    patch_cmds = [
-        "sed -i '/^            done$/a\\\\            pushd $$(dirname $(location configure))\\\\n              rm -f config-host.h config-host.mak src/include/liburing/compat.h src/include/liburing/io_uring_version.h\\\\n            popd' BUILD.bazel",
+    # Fix liburing undeclared inclusion of config-host.h.
+    # Upstream's liburing.patch switched the generate_headers genrule to an
+    # out-of-source build: `configure` now writes config-host.h into the genrule
+    # CWD (the exec root), not the package dir. With --spawn_strategy=local that
+    # file persists in the workspace, and the `uring` library's
+    # `-include config-host.h` picks up the leaked copy instead of the declared
+    # genrule output, tripping Bazel's undeclared-inclusion check. Clean it up
+    # right after the "collect the outputs" loop (CWD is the exec root there).
+    #
+    # Upstream now ships its own single_version_override for liburing
+    # (patches = [liburing.patch]); Bazel forbids a second override for the same
+    # module, so inject patch_cmds into the existing one rather than appending.
+    liburing_patch_cmds = '''    patch_cmds = [
+        "sed -i '/^            done$/a\\\\            rm -f config-host.h config-host.mak' BUILD.bazel",
     ],
-)
 '''
+    if 'config-host.h' not in text:
+        if 'module_name = "liburing"' in text:
+            idx = text.index('module_name = "liburing"')
+            close = text.index('\n)', idx)
+            text = text[:close + 1] + liburing_patch_cmds + text[close + 1:]
+        else:
+            text += ('\nsingle_version_override(\n'
+                     '    module_name = "liburing",\n'
+                     + liburing_patch_cmds + ')\n')
 
     with open(path, 'w') as f:
         f.write(text)

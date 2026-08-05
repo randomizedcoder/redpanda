@@ -1,7 +1,7 @@
 {
   mkShell,
   bazelisk,
-  llvmPackages_22,
+  llvmPackages_23,
   stdenv,
   python312,
   jdk_headless,
@@ -21,21 +21,21 @@ let
   # GCC runtime lib (libstdc++.so.6) — needed by exec-config binaries
   # like protoc_minimal that are built with the auto-detected CC toolchain.
   gccLib = stdenv.cc.cc.lib;
-  libPath = "${llvmPackages_22.libcxx}/lib:${gccLib}/lib";
+  libPath = "${llvmPackages_23.libcxx}/lib:${gccLib}/lib";
   pythonEnv = python312.withPackages (ps: [
     ps.jinja2
     ps.jsonschema
-    ps.kafka-python-ng
+    ps.kafka-python
   ]);
 in
 
 mkShell {
   packages = [
     bazelisk
-    llvmPackages_22.libcxxClang
-    llvmPackages_22.lld
-    llvmPackages_22.llvm
-    llvmPackages_22.libcxx
+    llvmPackages_23.libcxxClang
+    llvmPackages_23.lld
+    llvmPackages_23.llvm
+    llvmPackages_23.libcxx
     pythonEnv
     jdk_headless
     autoconf
@@ -89,9 +89,9 @@ build --action_env=LIBRARY_PATH=${libPath}
 build --host_action_env=LIBRARY_PATH=${libPath}
 build --action_env=LD_LIBRARY_PATH=${libPath}
 build --host_action_env=LD_LIBRARY_PATH=${libPath}
-build --linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
+build --linkopt=-Wl,-rpath,${llvmPackages_23.libcxx}/lib
 build --linkopt=-Wl,-rpath,${gccLib}/lib
-build --host_linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
+build --host_linkopt=-Wl,-rpath,${llvmPackages_23.libcxx}/lib
 build --host_linkopt=-Wl,-rpath,${gccLib}/lib
 build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
 RCEOF

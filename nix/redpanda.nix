@@ -7,7 +7,7 @@
   fetchurl,
   bazel_9,
   bazelisk,
-  llvmPackages_22,
+  llvmPackages_23,
   python312,
   go,
   jdk_headless,
@@ -42,7 +42,7 @@
   krb5,
   libxml2,
   ragel,
-  xxHash,
+  xxhash,
   hdrhistogram_c,
   croaring,
   lksctp-tools,
@@ -509,6 +509,11 @@ LKSCTP_BUILD
     # - Add rules_buf and rules_cc overrides (fix shebangs, stub downloads)
     ${pythonWithDeps}/bin/python3 ${./patch-module-bazel.py} $out/MODULE.bazel
 
+    # Substitute the nixpkgs python store path into the rules_python
+    # stub-shebang override added by patch-module-bazel.py (the sandbox has no
+    # /usr/bin/env, so py_binary launchers must use an absolute interpreter).
+    sed -i 's|@NIX_STUB_PYTHON@|${pythonWithDeps}|g' $out/MODULE.bazel
+
     # Remove dead libpciaccess use_repo line from MODULE.bazel
     # (its http_archive is deleted from repositories.bzl below)
     sed -i '/use_repo(non_module_dependencies, "libpciaccess")/d' $out/MODULE.bazel
@@ -817,7 +822,7 @@ REPOS_PATCH
   bazelPlatformBin = let
     os = if stdenv.isLinux then "linux" else "darwin";
     arch = stdenv.hostPlatform.uname.processor;
-  in "${bazel}/bin/bazel-9.1.0-${os}-${arch}";
+  in "${bazel}/bin/bazel-${bazel.version}-${os}-${arch}";
   targets = [ "//src/v/redpanda:redpanda" ];
 
   # ── Nixify pipeline configuration ──
@@ -980,10 +985,10 @@ REPOS_PATCH
 
   nativeBuildInputsDeps = [
     bazelisk
-    llvmPackages_22.libcxxClang
-    llvmPackages_22.lld
-    llvmPackages_22.llvm
-    llvmPackages_22.libcxx
+    llvmPackages_23.libcxxClang
+    llvmPackages_23.lld
+    llvmPackages_23.llvm
+    llvmPackages_23.libcxx
     pythonWithDeps
     go
     jdk_headless
@@ -1173,6 +1178,17 @@ REPOS_PATCH
     build --host_features=-module_maps
     build --host_features=-parse_headers
 
+    # Upstream's .bazelrc sets bootstrap_impl=script, which wraps every
+    # py_binary in a venv launcher (_<name>.venv/bin/python3). When such a
+    # py_binary is used as a genrule *tool* under --spawn_strategy=local, that
+    # venv interpreter symlink isn't materialized, so the tool fails with
+    # "env: '..._<name>.venv/bin/python3': No such file or directory" (breaks
+    # the seastar-json2code / schemata / swagger genrules). The classic
+    # system_python bootstrap runs the (nixified) toolchain interpreter directly
+    # with no venv, which works in the sandbox. .bazelrc.nix is loaded last so
+    # this overrides the upstream setting.
+    build --@rules_python//python/config_settings:bootstrap_impl=system_python
+
     # Make jinja2/jsonschema (from pythonWithDeps) visible to genrule
     # py_binary tools (e.g. //src/v/rpc:compiler). With hermetic python
     # from rules_python, sys.path doesn't include nixpkgs site-packages.
@@ -1206,13 +1222,13 @@ REPOS_PATCH
       "${libtool}/share/aclocal"
       "${pkg-config}/share/aclocal"
     ]}
-    build --action_env=LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib
-    build --host_action_env=LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib
-    build --action_env=LD_LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib:${zlib}/lib
-    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib:${zlib}/lib
-    build --linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
+    build --action_env=LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib
+    build --host_action_env=LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib
+    build --action_env=LD_LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --linkopt=-Wl,-rpath,${llvmPackages_23.libcxx}/lib
     build --linkopt=-Wl,-rpath,${gccLib}/lib
-    build --host_linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
+    build --host_linkopt=-Wl,-rpath,${llvmPackages_23.libcxx}/lib
     build --host_linkopt=-Wl,-rpath,${gccLib}/lib
     build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
   '';

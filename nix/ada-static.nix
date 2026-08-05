@@ -5,10 +5,10 @@
 # a different build structure, so we build from the same tarball Bazel uses.
 #
 # Must be built with clang/libc++ to match the Bazel build toolchain.
-{ stdenv, fetchurl, llvmPackages_22, unzip }:
+{ stdenv, fetchurl, llvmPackages_23, unzip }:
 
 let
-  clangStdenv = llvmPackages_22.libcxxStdenv;
+  clangStdenv = llvmPackages_23.libcxxStdenv;
 in
 clangStdenv.mkDerivation rec {
   pname = "ada";

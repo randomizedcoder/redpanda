@@ -5,7 +5,7 @@
 #     --bcr $(nix-build --no-out-link -E 'with import <nixpkgs> {}; callPackage ./nix/bcr.nix {}') \
 #     --module-bazel MODULE.bazel \
 #     > nix/bazel-deps.nix
-# 225 archives
+# 89 archives
 [
   {
     url = "https://dl.grafana.com/grafana/release/12.3.1/grafana_12.3.1_20271043721_linux_amd64.tar.gz";
@@ -108,21 +108,6 @@
     name = "installer-0.7.0-py3-none-any.whl";
   }
   {
-    url = "https://ftp.gnu.org/gnu/gawk/gawk-5.3.2.tar.xz";
-    sha256 = "f8c3486509de705192138b00ef2c00bbbdd0e84c30d5c07d23fc73a9dc4cc9cc";
-    name = "gawk-5.3.2.tar.xz";
-  }
-  {
-    url = "https://github.com/Cyan4973/xxHash/archive/bbb27a5efb85b92a0486cf361a8635715a53f6ba.tar.gz";
-    sha256 = "716fbe4fc85ecd36488afbbc635b59b5ab6aba5ed3b69d4a32a46eae5a453d38";
-    name = "bbb27a5efb85b92a0486cf361a8635715a53f6ba.tar.gz";
-  }
-  {
-    url = "https://github.com/HdrHistogram/HdrHistogram_c/archive/refs/tags/0.11.8.tar.gz";
-    sha256 = "bb95351a6a8b242dc9be1f28562761a84d4cf0a874ffc90a9b630770a6468e94";
-    name = "0.11.8.tar.gz";
-  }
-  {
     url = "https://github.com/JetBrains/kotlin/releases/download/v1.9.23/kotlin-compiler-1.9.23.zip";
     sha256 = "93137d3aab9afa9b27cb06a824c2324195c6b6f6179d8a8653f440f5bd58be88";
     name = "kotlin-compiler-1.9.23.zip";
@@ -168,24 +153,9 @@
     name = "bazel-gazelle-v0.45.0.tar.gz";
   }
   {
-    url = "https://github.com/bazel-contrib/bazel-lib/releases/download/v2.21.1/bazel-lib-v2.21.1.tar.gz";
-    sha256 = "f525668442e4b19ae10d77e0b5ad15de5807025f321954dfb7065c0fe2429ec1";
-    name = "bazel-lib-v2.21.1.tar.gz";
-  }
-  {
-    url = "https://github.com/bazel-contrib/bazel-lib/releases/download/v3.0.0/bazel-lib-v3.0.0.tar.gz";
-    sha256 = "6fd3b1e1a38ca744f9664be4627ced80895c7d2ee353891c172f1ab61309c933";
-    name = "bazel-lib-v3.0.0.tar.gz";
-  }
-  {
     url = "https://github.com/bazel-contrib/bazel_features/releases/download/v1.42.1/bazel_features-v1.42.1.tar.gz";
     sha256 = "8189bac9a6bf9cc155a854c4cbebfebf58b9ca7a2d0a67645f7d0c1f83c523ac";
     name = "bazel_features-v1.42.1.tar.gz";
-  }
-  {
-    url = "https://github.com/bazel-contrib/jq.bzl/releases/download/v0.1.0/jq.bzl-v0.1.0.tar.gz";
-    sha256 = "7b63435aa19cc6a0cfd1a82fbdf2c7a2f0a94db1a79ff7a4469ffa94286261ab";
-    name = "jq.bzl-v0.1.0.tar.gz";
   }
   {
     url = "https://github.com/bazel-contrib/rules_foreign_cc/releases/download/0.15.1/rules_foreign_cc-0.15.1.tar.gz";
@@ -203,34 +173,14 @@
     name = "rules_jvm_external-6.7.tar.gz";
   }
   {
-    url = "https://github.com/bazel-contrib/rules_oci/releases/download/v2.3.0/rules_oci-v2.3.0.tar.gz";
-    sha256 = "e987cab7a35475cb9c9060fc3f338a1fc8896c240295a3272968b217acefd0cb";
-    name = "rules_oci-v2.3.0.tar.gz";
-  }
-  {
     url = "https://github.com/bazel-contrib/rules_python/releases/download/1.7.0/rules_python-1.7.0.tar.gz";
     sha256 = "f609f341d6e9090b981b3f45324d05a819fd7a5a56434f849c761971ce2c47da";
     name = "rules_python-1.7.0.tar.gz";
   }
   {
-    url = "https://github.com/bazel-contrib/supply-chain/releases/download/v0.0.6/supply-chain-v0.0.6.tar.gz";
-    sha256 = "5bd0cc7594ea528fd28f98d82457f157827d48cc20e07bcfdbb56072f35c8f67";
-    name = "supply-chain-v0.0.6.tar.gz";
-  }
-  {
-    url = "https://github.com/bazel-contrib/tar.bzl/releases/download/v0.7.0/tar.bzl-v0.7.0.tar.gz";
-    sha256 = "a0d64064a598d7a1e58196d17de0deed6d3d2d8bfe1407ed9e68b24c31c38e8d";
-    name = "tar.bzl-v0.7.0.tar.gz";
-  }
-  {
-    url = "https://github.com/bazel-contrib/toolchains_llvm/archive/98414f360d37e4fc9fb308b357d1bd8df9f92428.tar.gz";
-    sha256 = "9a8a3d9d9126eaff11fe0ab86ae768b6727214ba7cf69732e0873decf50268dd";
-    name = "98414f360d37e4fc9fb308b357d1bd8df9f92428.tar.gz";
-  }
-  {
-    url = "https://github.com/bazel-contrib/yq.bzl/releases/download/v0.1.1/yq.bzl-v0.1.1.tar.gz";
-    sha256 = "b51d82b561a78ab21d265107b0edbf98d68a390b4103992d0b03258bb3819601";
-    name = "yq.bzl-v0.1.1.tar.gz";
+    url = "https://github.com/bazel-contrib/supply-chain/releases/download/v0.0.5/supply-chain-v0.0.5.tar.gz";
+    sha256 = "49ed11e5d6b752c55fa539cbb10b2736974f347b081d7bd500a80dacb7dbec06";
+    name = "supply-chain-v0.0.5.tar.gz";
   }
   {
     url = "https://github.com/bazelbuild/apple_support/releases/download/1.24.2/apple_support.1.24.2.tar.gz";
@@ -398,29 +348,14 @@
     name = "re2-2024-07-02.zip";
   }
   {
-    url = "https://github.com/google/snappy/archive/refs/tags/1.2.1.tar.gz";
-    sha256 = "736aeb64d86566d2236ddffa2865ee5d7a82d26c9016b36218fcc27ea4f09f86";
-    name = "1.2.1.tar.gz";
+    url = "https://github.com/google/snappy/archive/refs/tags/1.2.2.tar.gz";
+    sha256 = "90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc";
+    name = "1.2.2.tar.gz";
   }
   {
     url = "https://github.com/googleapis/googleapis/archive/f9d6fe4a6ad9ed89dfc315f284124d2104377940.zip";
     sha256 = "07283fe78fd8834604d79e5009f3c96761f94135c48088e8e17a8b6f83e94036";
     name = "f9d6fe4a6ad9ed89dfc315f284124d2104377940.zip";
-  }
-  {
-    url = "https://github.com/helly25/bzl/releases/download/0.3.1/bzl-0.3.1.tar.gz";
-    sha256 = "c8e28a3cb7e465b4b71f5d4d366c5796cc0ae822fa510a8adf12cf39a9709902";
-    name = "bzl-0.3.1.tar.gz";
-  }
-  {
-    url = "https://github.com/keith/buildifier-prebuilt/archive/refs/tags/8.2.0.2.tar.gz";
-    sha256 = "f98dd3d8f32661629b8cab11f02d7730bb8e03bd8af09dbbb268047889c8ff10";
-    name = "8.2.0.2.tar.gz";
-  }
-  {
-    url = "https://github.com/krb5/krb5/archive/refs/tags/krb5-1.21.3-final.tar.gz";
-    sha256 = "2157d92020d408ed63ebcd886a92d1346a1383b0f91123a0473b4f69b4a24861";
-    name = "krb5-1.21.3-final.tar.gz";
   }
   {
     url = "https://github.com/lz4/lz4/releases/download/v1.9.4/lz4-1.9.4.tar.gz";
@@ -478,34 +413,19 @@
     name = "pybind11_bazel-2.12.0.zip";
   }
   {
-    url = "https://github.com/redpanda-data/CRoaring/archive/c433d1c70c10fb2e40f049e019e2abbcafa6e69d.tar.gz";
-    sha256 = "78487658b774f27546e79de2ddd37fca56679b23f256425d2c86aabf7d1b8066";
-    name = "c433d1c70c10fb2e40f049e019e2abbcafa6e69d.tar.gz";
-  }
-  {
     url = "https://github.com/redpanda-data/avro/archive/6821e2b454401308d4e3819c0569d0fe7f2a66fa.tar.gz";
     sha256 = "1c09dd94cc8fcac0fa99359254507cfd538c527bcb8b5066d16b6289ac87ea93";
     name = "6821e2b454401308d4e3819c0569d0fe7f2a66fa.tar.gz";
   }
   {
-    url = "https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-22.1.0/sysroot-ubuntu-22.04-aarch64-2026-05-05.tar.zst";
-    sha256 = "1afc00adf978c90ad8ffd3b729180923c27d57a7702ea23ba35c714e11d0def2";
-    name = "sysroot-ubuntu-22.04-aarch64-2026-05-05.tar.zst";
+    url = "https://github.com/redpanda-data/rapidjson/archive/a47f8d7379e9d1dfbac415e7d8ccece605275e5b.tar.gz";
+    sha256 = "bb6805bfb8d5491b7ba77019dda08ddb0912b853399409bbf8a74d8357581c9c";
+    name = "a47f8d7379e9d1dfbac415e7d8ccece605275e5b.tar.gz";
   }
   {
-    url = "https://github.com/redpanda-data/llvm-project/releases/download/llvmorg-22.1.0/sysroot-ubuntu-22.04-x86_64-2026-05-05.tar.zst";
-    sha256 = "0d85fc9e155e664403c1c3c40831d865796d36a91b78a2e6d8922aa6ad3f0375";
-    name = "sysroot-ubuntu-22.04-x86_64-2026-05-05.tar.zst";
-  }
-  {
-    url = "https://github.com/redpanda-data/rapidjson/archive/14a5dd756e9bef26f9b53d3b4eb1b73c6a1794d5.tar.gz";
-    sha256 = "d085ef6d175d9b20800958c695c7767d65f9c1985a73d172150e57e84f6cd61c";
-    name = "14a5dd756e9bef26f9b53d3b4eb1b73c6a1794d5.tar.gz";
-  }
-  {
-    url = "https://github.com/redpanda-data/seastar/archive/9de2b0b3a75a78ace41d06ea8b24ad12bfbb0186.tar.gz";
-    sha256 = "d2a4816aa75e1c8eacdd78265e7461bd2e3885f0daf30904e5d1fb638ceda37c";
-    name = "9de2b0b3a75a78ace41d06ea8b24ad12bfbb0186.tar.gz";
+    url = "https://github.com/redpanda-data/seastar/archive/a6ac2ff6190a4a9dce5059991355703e1073d11f.tar.gz";
+    sha256 = "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f";
+    name = "a6ac2ff6190a4a9dce5059991355703e1073d11f.tar.gz";
   }
   {
     url = "https://github.com/stonier/yaml-cpp/releases/download/0.8.0/yaml-cpp-0.8.0.tar.gz";
@@ -523,614 +443,14 @@
     name = "bzip2-1.0.8.tar.gz";
   }
   {
-    url = "https://static.crates.io/crates/addr2line/0.26.1/download";
-    sha256 = "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/allocator-api2/0.2.21/download";
-    sha256 = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/anyhow/1.0.102/download";
-    sha256 = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/arbitrary/1.4.2/download";
-    sha256 = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/async-trait/0.1.89/download";
-    sha256 = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/bitflags/2.11.1/download";
-    sha256 = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/bumpalo/3.20.2/download";
-    sha256 = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cc/1.2.60/download";
-    sha256 = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cfg-if/1.0.4/download";
-    sha256 = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cobs/0.3.0/download";
-    sha256 = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-assembler-x64-meta/0.129.2/download";
-    sha256 = "499715f19799219f32641b14f2a162f91e50bc1b61c2d2184c2be971716f5c56";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-assembler-x64/0.129.2/download";
-    sha256 = "4b242b4c3675139f52f0b55624fb92571551a344305c5998f55ad20fa527bc55";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-bforest/0.129.2/download";
-    sha256 = "1ebca2ea7c62c56feb88a5b23ec380460fe6d7c18134520f6ddf4bfa35cbea68";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-bitset/0.129.2/download";
-    sha256 = "fe11f154b62d7421d909503a746e89995393b1b71926e6f12b08a2076396d7fb";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-codegen-meta/0.129.2/download";
-    sha256 = "483b2c94a1b7f6fba0714387ba34ca56d114b2214a80be018acbb2ed40e09a1e";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-codegen-shared/0.129.2/download";
-    sha256 = "c4aae718c336a52d90d4ebe9a2d8c3cf0906a4bee78f0e6867e777eebbe554fe";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-codegen/0.129.2/download";
-    sha256 = "1f2d0da3d51979dc0183fac3076a535477eab794716b063143ecb16632408664";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-control/0.129.2/download";
-    sha256 = "a18e94519070dc56cddb71906a08cea6a28a1d7c58ed501b88f273fa6b45fa07";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-entity/0.129.2/download";
-    sha256 = "e0ab4e0eff1045ff2f5ddd8195bf3c97d7b5ef9b780cb044e0cce76e4d352057";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-frontend/0.129.2/download";
-    sha256 = "e7645a236e1ec49e660f09ec9fa979a1c5d0b612c419db7610573d4d58a03b7c";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-isle/0.129.2/download";
-    sha256 = "57e0b4a1a0ea01cc19084ff01aaeb640dfe22905d47d83037a419b81ba587ed0";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-native/0.129.2/download";
-    sha256 = "7bdec40b396eb630ecfb0e7a81766d7287f464a7631b9eb5862f7711f1020012";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/cranelift-srcgen/0.129.2/download";
-    sha256 = "4a1a001a9dc4557d9e2be324bc932621c0aa9bf33b74dfefa2338f0bf8913329";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/crc32fast/1.5.0/download";
-    sha256 = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/either/1.15.0/download";
-    sha256 = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/embedded-io/0.4.0/download";
-    sha256 = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/embedded-io/0.6.1/download";
-    sha256 = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/equivalent/1.0.2/download";
-    sha256 = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/errno/0.3.14/download";
-    sha256 = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/find-msvc-tools/0.1.9/download";
-    sha256 = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/fnv/1.0.7/download";
-    sha256 = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/foldhash/0.1.5/download";
-    sha256 = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures-channel/0.3.32/download";
-    sha256 = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures-core/0.3.32/download";
-    sha256 = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures-io/0.3.32/download";
-    sha256 = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures-sink/0.3.32/download";
-    sha256 = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures-task/0.3.32/download";
-    sha256 = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures-util/0.3.32/download";
-    sha256 = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/futures/0.3.32/download";
-    sha256 = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/gimli/0.33.0/download";
-    sha256 = "0bf7f043f89559805f8c7cacc432749b2fa0d0a0a9ee46ce47164ed5ba7f126c";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/hashbrown/0.15.5/download";
-    sha256 = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/hashbrown/0.16.1/download";
-    sha256 = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/hashbrown/0.17.0/download";
-    sha256 = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/heck/0.5.0/download";
-    sha256 = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/id-arena/2.3.0/download";
-    sha256 = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/indexmap/2.14.0/download";
-    sha256 = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/itertools/0.14.0/download";
-    sha256 = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/itoa/1.0.18/download";
-    sha256 = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/leb128fmt/0.1.0/download";
-    sha256 = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/libc/0.2.185/download";
-    sha256 = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/libm/0.2.16/download";
-    sha256 = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/linux-raw-sys/0.12.1/download";
-    sha256 = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/log/0.4.29/download";
-    sha256 = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/mach2/0.4.3/download";
-    sha256 = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/memchr/2.8.0/download";
-    sha256 = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/memfd/0.6.5/download";
-    sha256 = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/object/0.37.3/download";
-    sha256 = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/once_cell/1.21.4/download";
-    sha256 = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/pin-project-lite/0.2.17/download";
-    sha256 = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/postcard/1.1.3/download";
-    sha256 = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/proc-macro2/1.0.106/download";
-    sha256 = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/pulley-interpreter/42.0.2/download";
-    sha256 = "1e59a11b64c166a6e1e990303f46a255a52fb4e84d175dbd5e5ca0428e8c02ce";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/pulley-macros/42.0.2/download";
-    sha256 = "823a9d8da391be21a5f4d5e11c39d15f45b011076c6825fc2323f7e4753f09ce";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/quote/1.0.45/download";
-    sha256 = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/regalloc2/0.13.5/download";
-    sha256 = "08effbc1fa53aaebff69521a5c05640523fab037b34a4a2c109506bc938246fa";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/rustc-hash/2.1.2/download";
-    sha256 = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/rustix/1.1.4/download";
-    sha256 = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/semver/1.0.28/download";
-    sha256 = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/serde/1.0.228/download";
-    sha256 = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/serde_core/1.0.228/download";
-    sha256 = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/serde_derive/1.0.228/download";
-    sha256 = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/serde_json/1.0.149/download";
-    sha256 = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/shlex/1.3.0/download";
-    sha256 = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/smallvec/1.15.1/download";
-    sha256 = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/stable_deref_trait/1.2.1/download";
-    sha256 = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/syn/2.0.117/download";
-    sha256 = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/target-lexicon/0.13.5/download";
-    sha256 = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/termcolor/1.4.1/download";
-    sha256 = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/thiserror-impl/2.0.18/download";
-    sha256 = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/thiserror/2.0.18/download";
-    sha256 = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/tracing-core/0.1.36/download";
-    sha256 = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/tracing/0.1.44/download";
-    sha256 = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/unicode-ident/1.0.24/download";
-    sha256 = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/unicode-width/0.2.2/download";
-    sha256 = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/unicode-xid/0.2.6/download";
-    sha256 = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasm-encoder/0.244.0/download";
-    sha256 = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasm-encoder/0.246.2/download";
-    sha256 = "61fb705ce81adde29d2a8e99d87995e39a6e927358c91398f374474746070ef7";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmparser/0.244.0/download";
-    sha256 = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmparser/0.246.2/download";
-    sha256 = "71cde4757396defafd25417cfb36aa3161027d06d865b0c24baaae229aac005d";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmprinter/0.244.0/download";
-    sha256 = "09390d7b2bd7b938e563e4bff10aa345ef2e27a3bc99135697514ef54495e68f";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-c-api-impl/42.0.2/download";
-    sha256 = "a90148ddf1018308569c17ac6df564418055ac16f601f654af04667feb723643";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-environ/42.0.2/download";
-    sha256 = "90d3611be7991cba09f14dbb99fe7a0fbaca9eb995ab5c548456eeda44afe20e";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-c-api-macros/42.0.2/download";
-    sha256 = "bf2c463653ab4da75b17b66841559b2d13f2d14420df2b7acdd77f60951fad21";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-component-macro/42.0.2/download";
-    sha256 = "3616cebe594e6c4b573ddb908d2703d13b53b2abdaeb73acd1ca8b5a911bc256";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-component-util/42.0.2/download";
-    sha256 = "61571112f9cbf9798e48f3bd6ba5161588a08b99158585153784e3f46f955053";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-core/42.0.2/download";
-    sha256 = "be7c68311d6220c20cefdf334e0c8021e16a050383c67edc5be42e5661ddf265";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-cranelift/42.0.2/download";
-    sha256 = "c5fd90a9113379260508193bab9f4e870d34078fdd181f9fc8dd053b0f7a958c";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-fiber/42.0.2/download";
-    sha256 = "cbd95ecd37e62eaae686256ca9773902b73c0398c2eb8cfbca49fbf950609c22";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-jit-debug/42.0.2/download";
-    sha256 = "b875a7727c043a308c81f2de5ce7260b7513cb5baaa2af32937646b8c9019a3f";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-jit-icache-coherence/42.0.2/download";
-    sha256 = "f52c0779e711777b915d017b3f54049e658057a77df99e0e7958406b3c5d7d07";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-unwinder/42.0.2/download";
-    sha256 = "3acb031b1e9700667b3f818235b2846e3babeb30bc340c8233d3fad4c44d80ff";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-versioned-export-macros/42.0.2/download";
-    sha256 = "cbfbbfdb0cfd638145b0de4d3e309901ccc4e29965a33ca1eb18ab6f37057350";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-winch/42.0.2/download";
-    sha256 = "5f4853af4a25f98c039cc27c7238e40df9ec783fc7981b879a813153d1d3211a";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime-internal-wit-bindgen/42.0.2/download";
-    sha256 = "0de1c8eaa54b17e3a64b6c0cfabd065bdbdfd06f5d7c685272b7309117377be0";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wasmtime/42.0.2/download";
-    sha256 = "66806cf6094768e227f74d209eb017cc967276c94fea478e62a0dffede2b3d0d";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wast/246.0.2/download";
-    sha256 = "fe3fe8e3bf88ad96d031b4181ddbd64634b17cb0d06dfc3de589ef43591a9a62";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wat/1.246.2/download";
-    sha256 = "4bd7fda1199b94fff395c2d19a153f05dbe7807630316fa9673367666fd2ad8c";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/winapi-util/0.1.11/download";
-    sha256 = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/winch-codegen/42.0.2/download";
-    sha256 = "2d1bc7cbb9103e6847042f0514f911126263173f6e9a18e5cfa257d3b5711c09";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/windows-link/0.2.1/download";
-    sha256 = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/windows-sys/0.61.2/download";
-    sha256 = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/wit-parser/0.244.0/download";
-    sha256 = "ecc8ac4bc1dc3381b7f59c34f00b67e18f910c2c0f50015669dde7def656a736";
-    name = "download";
-  }
-  {
-    url = "https://static.crates.io/crates/zmij/1.0.21/download";
-    sha256 = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa";
-    name = "download";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/base64-v0.5.0.tar.gz";
-    sha256 = "b21be58a90d31302ba86056db7ef77a481393b9359c505be5337d7d54e8a0559";
-    name = "base64-v0.5.0.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/c-ares-1.34.6.tar.gz";
-    sha256 = "912dd7cc3b3e8a79c52fd7fb9c0f4ecf0aaa73e45efda880266a2d6e26b84ef5";
-    name = "c-ares-1.34.6.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/hwloc-2.11.2.tar.gz";
-    sha256 = "866ac8ef07b350a6a2ba0c6826c37d78e8994dcbcd443bdd2b436350de19d540";
-    name = "hwloc-2.11.2.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/libpciaccess-2ec2576cabefef1eaa5dd9307c97de2e887fc347.tar.gz";
-    sha256 = "d0d0d53c2085d21ab37ae5989e55a3de13d4d80dc2c0a8d5c77154ea70f4783c";
-    name = "libpciaccess-2ec2576cabefef1eaa5dd9307c97de2e887fc347.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/lksctp-tools-1.0.19.tar.gz";
-    sha256 = "0c8fac0a5c66eea339dce6be857101b308ce1064c838b81125b0dde3901e8032";
-    name = "lksctp-tools-1.0.19.tar.gz";
+    url = "https://services.gradle.org/distributions/gradle-8.5-bin.zip";
+    sha256 = "9d926787066a081739e8200858338b4a69e837c3a821a33aca9db09dd4a41026";
+    name = "gradle-8.5-bin.zip";
   }
   {
     url = "https://vectorized-public.s3.amazonaws.com/dependencies/omb/omb_minimal_3c624daad47f16ae7036b67142c384d3e59150bf.tar.gz";
     sha256 = "9d1f651d98a624dcfb09c213a8b77732bd08e037d32922b06c06e6027841e8ee";
     name = "omb_minimal_3c624daad47f16ae7036b67142c384d3e59150bf.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.1.2.tar.gz";
-    sha256 = "a0ce69b8b97ea6a35b96875235aa453b966ba3cba8af2de23657d8b6767d6539";
-    name = "openssl-3.1.2.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.6.tar.gz";
-    sha256 = "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736";
-    name = "openssl-3.5.6.tar.gz";
-  }
-  {
-    url = "https://vectorized-public.s3.us-west-2.amazonaws.com/dependencies/ada-3.2.4.single-header.zip";
-    sha256 = "bd89fcf57c93e965e6e2488448ab9d1cf8005311808c563b288f921d987e4924";
-    name = "ada-3.2.4.single-header.zip";
   }
   # Manually added after dev merge — gen-bazel-deps.py didn't pick these up:
   # supply-chain v0.0.5 is pinned by @package_metadata internally (MVS chose
@@ -1186,4 +506,3 @@
     name = "cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only.tar.gz";
   }
 ]
-
