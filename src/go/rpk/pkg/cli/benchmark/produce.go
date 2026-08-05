@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"golang.org/x/time/rate"
 )
 
 type produceConfig struct {
@@ -62,13 +63,20 @@ func runProduceBenchmark(fs afero.Fs, p *config.Params, cmd *cobra.Command, cfg 
 
 	payload := createPayload(cfg.recordSize)
 	stats := &stats{}
+	hist := &latencyHistogram{}
+	limiter := newRateLimiter(cfg.targetRateMBps)
+
+	// Cap buffered records so we don't exhaust disk on a single-node
+	// broker. Target ~100 MB buffered per client.
+	maxBuf := max(100, min(50000, 100*1024*1024/cfg.recordSize))
 
 	producerOpts := []kgo.Opt{
 		kgo.DefaultProduceTopic(cfg.topic),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.RecordPartitioner(kgo.RoundRobinPartitioner()),
-		kgo.ProducerLinger(0),
+		kgo.ProducerLinger(5 * time.Millisecond),
 		kgo.ProducerBatchCompression(kgo.NoCompression()),
+		kgo.MaxBufferedRecords(maxBuf),
 	}
 
 	producerClients := make([]*kgo.Client, 0, cfg.clients)
@@ -114,11 +122,11 @@ func runProduceBenchmark(fs afero.Fs, p *config.Params, cmd *cobra.Command, cfg 
 		wg.Add(1)
 		go func(cl *kgo.Client) {
 			defer wg.Done()
-			runProducerLoop(run.timing.runCtx, cl, cfg.topic, payload, run.timing.measureStart, stats)
+			runProducerLoop(run.timing.runCtx, cl, cfg.topic, payload, run.timing.measureStart, stats, hist, limiter)
 		}(cl)
 	}
 
-	return runBenchmarkReporter(run.ctx, run.timing, stats, cfg.metricsJSON, wg.Wait)
+	return runBenchmarkReporter(run.ctx, run.timing, stats, hist, cfg.metricsJSON, wg.Wait)
 }
 
 func runProducerLoop(
@@ -128,29 +136,40 @@ func runProducerLoop(
 	payload []byte,
 	measureStart time.Time,
 	stats *stats,
+	hist *latencyHistogram,
+	limiter *rate.Limiter,
 ) {
 	for {
 		if ctx.Err() != nil {
-			return
+			break
+		}
+
+		if limiter != nil {
+			if err := limiter.WaitN(ctx, len(payload)); err != nil {
+				break
+			}
 		}
 
 		rec := &kgo.Record{Topic: topic, Value: payload}
+		start := time.Now()
+		payloadLen := uint64(len(payload))
 
-		// We use sync produce. Like this we can guarantee single record per batch per request.
-		// To increase inflight it's easy to just bump clients/connections (this is cheap in franz-go)
-		err := cl.ProduceSync(ctx, rec).FirstErr()
-		if time.Now().Before(measureStart) {
-			continue
-		}
-		if err != nil {
-			if ctx.Err() == nil {
-				stats.requests.Add(1)
-				stats.errors.Add(1)
+		cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
+			if time.Now().Before(measureStart) {
+				return
 			}
-			continue
-		}
-
-		stats.requests.Add(1)
-		stats.bytes.Add(uint64(len(payload)))
+			if err != nil {
+				if ctx.Err() == nil {
+					stats.requests.Add(1)
+					stats.errors.Add(1)
+				}
+				return
+			}
+			hist.add(time.Since(start))
+			stats.requests.Add(1)
+			stats.bytes.Add(payloadLen)
+		})
 	}
+	// Flush remaining buffered records before exiting.
+	cl.Flush(context.Background())
 }
