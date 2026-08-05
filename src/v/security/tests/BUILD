@@ -1,4 +1,4 @@
-load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_cc_gtest", "redpanda_test_cc_library")
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_btest", "redpanda_cc_fuzz_test", "redpanda_cc_gtest", "redpanda_test_cc_library")
 
 redpanda_test_cc_library(
     name = "utils",
@@ -28,6 +28,23 @@ redpanda_cc_btest(
         "//src/v/test_utils:random_bytes",
         "//src/v/utils:base64",
         "@boost//:algorithm",
+        "@boost//:test",
+        "@fmt",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "scram_credential_cache_test",
+    timeout = "short",
+    srcs = [
+        "scram_credential_cache_test.cc",
+    ],
+    deps = [
+        "//src/v/bytes",
+        "//src/v/config",
+        "//src/v/security",
+        "//src/v/test_utils:random_bytes",
         "@boost//:test",
         "@fmt",
         "@seastar//:testing",
@@ -196,6 +213,7 @@ redpanda_cc_btest(
         "//src/v/random:generators",
         "//src/v/security",
         "//src/v/test_utils:seastar_boost",
+        "@abseil-cpp//absl/container:flat_hash_map",
         "@abseil-cpp//absl/container:node_hash_set",
         "@boost//:range",
         "@boost//:test",
@@ -220,6 +238,22 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_bench(
+    name = "authorizer_bench_rpbench",
+    srcs = [
+        "authorizer_bench.cc",
+    ],
+    deps = [
+        "//src/v/config",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/security",
+        "@fmt",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
     name = "role_store_bench_rpbench",
     srcs = [
         "role_store_bench.cc",
@@ -229,6 +263,20 @@ redpanda_cc_bench(
         "//src/v/random:generators",
         "//src/v/security",
         "@boost//:range",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "scram_credential_bench_rpbench",
+    srcs = [
+        "scram_credential_bench.cc",
+    ],
+    deps = [
+        "//src/v/config",
+        "//src/v/security",
+        "//src/v/ssx:sformat",
         "@seastar",
         "@seastar//:benchmark",
     ],
@@ -279,5 +327,24 @@ redpanda_cc_gtest(
         "//src/v/security:license",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_fuzz_test(
+    name = "acl_store_fuzz",
+    timeout = "short",
+    srcs = [
+        "acl_store_fuzz.cc",
+    ],
+    args = [
+        "-max_total_time=30",
+        "-rss_limit_mb=8192",
+    ],
+    deps = [
+        "//src/v/container:chunked_vector",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_fuzz",
+        "@fmt",
+        "@seastar",
     ],
 )

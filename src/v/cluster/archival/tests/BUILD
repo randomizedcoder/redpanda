@@ -162,7 +162,10 @@ redpanda_cc_btest(
         "//src/v/cluster:topic_metrics_watcher",
         "//src/v/cluster:topic_table",
         "//src/v/config",
+        "//src/v/kafka/data:partition_proxy",
+        "//src/v/kafka/protocol",
         "//src/v/model",
+        "//src/v/raft",
         "//src/v/random:generators",
         "//src/v/ssx:sformat",
         "//src/v/storage",
@@ -200,6 +203,23 @@ redpanda_cc_btest(
         "//src/v/test_utils:scoped_config",
         "//src/v/test_utils:seastar_boost",
         "@seastar",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "spillover_tail_test",
+    timeout = "short",
+    srcs = [
+        "spillover_tail_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/cloud_storage",
+        "//src/v/cluster",
+        "//src/v/model",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
     ],
 )
 

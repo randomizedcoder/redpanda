@@ -46,6 +46,10 @@ struct coordinator_stm_fixture : stm_raft_fixture<stm> {
         return config::mock_binding<bool>(false);
     }
 
+    config::binding<size_t> max_pending_files() const {
+        return config::mock_binding<size_t>(100000);
+    }
+
     stm_shptrs_t create_stms(
       state_machine_manager_builder& builder,
       raft_node_instance& node) override {
@@ -70,7 +74,8 @@ struct coordinator_stm_fixture : stm_raft_fixture<stm> {
                 snapshot_remover,
                 commit_interval(),
                 default_partition_spec(),
-                disable_snapshot_expiry());
+                disable_snapshot_expiry(),
+                max_pending_files());
             coordinators[node.get_vnode()]->start();
             return ss::now();
         });
@@ -167,6 +172,7 @@ struct coordinator_stm_fixture : stm_raft_fixture<stm> {
     ss::future<> register_in_topic_table() {
         auto topic_cfg = cluster::topic_configuration(
           tp_ns.ns, tp_ns.tp, /*partition_count=*/1, /*replication_factor=*/1);
+        topic_cfg.properties.iceberg_mode = model::iceberg_mode::key_value;
         auto tt_res = co_await topic_table.apply(
           cluster::create_topic_cmd{tp_ns, {topic_cfg, {}}},
           model::offset{rev()});

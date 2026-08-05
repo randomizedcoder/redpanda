@@ -96,8 +96,8 @@ private:
 
     bool should_stop_rebalancing_update(const update_meta&) const;
 
-    ss::future<std::error_code>
-    update_raft0_configuration(const members_manager::node_update&);
+    ss::future<std::error_code> update_raft0_configuration(
+      const members_manager::node_update&, model::revision_id);
 
     ss::future<std::error_code>
       add_to_raft0(model::node_id, model::revision_id);
@@ -125,10 +125,10 @@ private:
 
     // replicas reallocations in progress
     std::vector<update_meta> _updates;
-    ss::circular_buffer<members_manager::node_update> _raft0_updates;
+    std::vector<members_manager::node_update> _raft0_updates;
     std::chrono::milliseconds _retry_timeout;
     ss::condition_variable _new_updates;
-    metrics::public_metric_groups _metrics;
+    metrics::public_metric_groups _public_metrics;
     config::binding<size_t> _max_concurrent_reallocations;
 };
 

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
+#include "base/outcome.h"
 #include "base/seastarx.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -19,11 +20,6 @@
 
 #include <optional>
 #include <vector>
-
-namespace storage {
-class kvstore;
-class api;
-} // namespace storage
 
 namespace cluster {
 struct cluster_bootstrap_info_reply;
@@ -80,7 +76,27 @@ public:
     };
 
     cluster_discovery(
-      const model::node_uuid& node_uuid, storage::api&, ss::abort_source&);
+      const model::node_uuid& node_uuid,
+      std::optional<model::cluster_uuid> cluster_uuid,
+      ss::abort_source&);
+
+    // Controls how register_with_cluster() behaves.
+    enum class join_retry_policy : uint8_t {
+        // Determine whether this node is a cluster founder (which may block on
+        // the full mutual seed handshake, so this is only safe once every
+        // seed's RPC server is listening) and, if not, retry registration until
+        // it succeeds. This path is taken for non-registered joining nodes, as
+        // well as seed nodes that are attempting to form a cluster for the
+        // first time.
+        retry_until_joined,
+        // Assume a cluster already exists: skip founder discovery entirely and
+        // make a single, bounded registration pass. If no cluster answers,
+        // return an empty result rather than blocking. This path is taken for
+        // apparent seed nodes (e.g. brokers that indicate they are seed nodes
+        // according to their node-local config) that may in fact be wiped nodes
+        // trying to join an existing cluster.
+        require_existing_cluster,
+    };
 
     // Register with the cluster:
     // - If we are a fresh cluster founder, broadcast to other founders
@@ -94,7 +110,14 @@ public:
     // the cluster has accepted our request to join, and we have a controller
     // snapshot that we can use to prime configuration/features state before
     // starting up the controller.
-    ss::future<registration_result> register_with_cluster();
+    //
+    // With join_retry_policy::require_existing_cluster the founder handshake is
+    // skipped and a single bounded registration pass is made; the result is
+    // nullopt if no cluster answered (the caller should then defer to the late
+    // founder handshake). join_retry_policy::retry_until_joined always yields a
+    // result (or throws on shutdown).
+    ss::future<std::optional<registration_result>> register_with_cluster(
+      join_retry_policy = join_retry_policy::retry_until_joined);
 
     // Returns brokers to be used to form a Raft group for a new cluster.
     //
@@ -124,15 +147,36 @@ public:
     // \pre get_node_ids_by_uuid() has never been called
     node_ids_by_uuid& get_node_ids_by_uuid();
 
+    // Fetch a fresh controller_join_snapshot from a peer. Used by
+    // restarting nodes (those that already have a node_id and are not
+    // going through register_with_cluster) so that bootstrap can apply
+    // the current cluster-config view to shard_local_cfg before any
+    // downstream service reads it.
+    //
+    // Iterates `peers` in order, returning the first valid response.
+    // The responder forwards to the controller leader if it is not the
+    // leader itself, so the result is leader-authoritative regardless
+    // of which peer answered. Returns nullopt if every peer fails or
+    // none have a snapshot ready; the caller falls through to whatever
+    // shard_local_cfg view was loaded from the local cache.
+    static ss::future<std::optional<iobuf>>
+    fetch_controller_snapshot_from_leader(
+      const std::vector<model::broker>& peers);
+
 private:
     // Sends requests to each seed server to register the local node UUID
     // until one succeeds. Returns nullopt if registration did not succeed.
     ss::future<std::optional<registration_result>>
     dispatch_node_uuid_registration_to_seeds();
 
-    // Requests `cluster_bootstrap_info` from the given address, returning
-    // early with a bogus result if it's already been determined if this node
-    // is a cluster founder.
+    // Issues a single cluster_bootstrap_info RPC to the given address.
+    ss::future<result<cluster_bootstrap_info_reply>>
+    request_cluster_bootstrap_info_attempt(
+      net::unresolved_address, std::chrono::milliseconds timeout) const;
+
+    // Requests `cluster_bootstrap_info` from the given address, retrying until
+    // it succeeds, and returning early with a bogus result if it's already been
+    // determined that this node is a cluster founder.
     ss::future<cluster_bootstrap_info_reply>
       request_cluster_bootstrap_info_single(net::unresolved_address) const;
 
@@ -147,11 +191,11 @@ private:
     ss::future<> discover_founding_brokers();
 
     const model::node_uuid _node_uuid;
+    const std::optional<model::cluster_uuid> _cluster_uuid;
     simple_time_jitter<model::timeout_clock> _join_retry_jitter;
     const std::chrono::milliseconds _join_timeout;
 
     std::optional<bool> _is_cluster_founder;
-    storage::api& _storage;
     ss::abort_source& _as;
     brokers _founding_brokers;
     node_ids_by_uuid _node_ids_by_uuid;

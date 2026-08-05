@@ -377,11 +377,14 @@ redpanda_cc_gtest(
         "//src/v/datalake:record_translator",
         "//src/v/datalake:serde_parquet_writer",
         "//src/v/datalake:table_creator",
+        "//src/v/datalake:table_id_provider",
         "//src/v/datalake:translation_task",
         "//src/v/datalake/translation:translation_probe",
         "//src/v/features",
+        "//src/v/iceberg:datatypes",
         "//src/v/iceberg:field_name_comparison",
         "//src/v/iceberg:filesystem_catalog",
+        "//src/v/iceberg:schema",
         "//src/v/model",
         "//src/v/model/tests:random",
         "//src/v/storage:record_batch_builder",
@@ -428,6 +431,29 @@ redpanda_cc_btest(
         "//src/v/test_utils:scoped_config",
         "//src/v/test_utils:seastar_boost",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "table_definition_test",
+    timeout = "short",
+    srcs = [
+        "table_definition_test.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/container:chunked_vector",
+        "//src/v/datalake:record_schema_resolver",
+        "//src/v/datalake:record_translator",
+        "//src/v/datalake:table_definition",
+        "//src/v/iceberg:datatypes",
+        "//src/v/iceberg:values",
+        "//src/v/metrics",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
     ],
 )
 

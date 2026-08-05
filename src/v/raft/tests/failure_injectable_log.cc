@@ -184,8 +184,10 @@ failure_injectable_log::offset_range_size(
 
 ss::future<std::optional<failure_injectable_log::offset_range_size_result_t>>
 failure_injectable_log::offset_range_size(
-  model::offset first, offset_range_size_requirements_t target) {
-    return _underlying_log->offset_range_size(first, target);
+  model::offset first,
+  offset_range_size_requirements_t target,
+  ss::semaphore::time_point deadline) {
+    return _underlying_log->offset_range_size(first, target, deadline);
 }
 
 bool failure_injectable_log::is_compacted(
@@ -254,6 +256,11 @@ size_t failure_injectable_log::reclaimable_size_bytes() const {
 std::optional<model::offset>
 failure_injectable_log::retention_offset(storage::gc_config cfg) const {
     return _underlying_log->retention_offset(cfg);
+}
+
+ss::future<std::optional<model::offset>>
+failure_injectable_log::compute_gc_offset(storage::gc_config cfg) {
+    return _underlying_log->compute_gc_offset(cfg);
 }
 
 ssize_t failure_injectable_log::dirty_segment_bytes() const {

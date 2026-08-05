@@ -11,11 +11,14 @@
 #pragma once
 
 #include "cloud_topics/level_one/common/file_io.h"
+#include "cloud_topics/level_one/maintenance/compaction/compaction_queue.h"
+#include "cloud_topics/level_one/maintenance/leveling/leveling_queue.h"
 #include "cloud_topics/level_one/maintenance/logger.h"
 #include "cloud_topics/level_one/maintenance/meta.h"
 #include "cloud_topics/level_one/maintenance/scheduler_probe.h"
 #include "cloud_topics/level_one/maintenance/worker.h"
 #include "cloud_topics/level_one/metastore/replicated_metastore.h"
+#include "cloud_topics/level_zero/notifier/level_zero_notifier.h"
 #include "cluster/metadata_cache.h"
 #include "container/chunked_hash_map.h"
 #include "model/fundamental.h"
@@ -29,9 +32,9 @@ class SchedulerTestFixture;
 namespace cloud_topics::l1 {
 
 // A worker_manager which exists as a singleton on shard0, owns a sharded pool
-// of `compaction_worker`s, and provides access to a priority queue of CTPs
-// which require compaction. Manages inflight compactions and can request early
-// abort of inflight jobs.
+// of `compaction_worker`s, and provides access to two priority queues of CTPs
+// that require maintenance work: one for compaction, one for leveling. Manages
+// inflight jobs and can request early abort of inflight jobs.
 // TODO: Hook this up to the AdminAPI to allow for users to customize which
 // shards have active `compaction_worker`s, and persist that information in e.g.
 // the kvstore.
@@ -40,14 +43,16 @@ public:
     static constexpr ss::shard_id worker_manager_shard = 0;
 
     worker_manager(
-      log_compaction_queue&,
+      compaction_queue&,
+      leveling_queue&,
       ss::sharded<file_io>*,
       ss::sharded<replicated_metastore>*,
       ss::sharded<cluster::metadata_cache>*,
       compaction_scheduler_probe&,
-      ss::sharded<level_one_reader_probe>*);
+      ss::sharded<level_one_reader_probe>*,
+      ss::sharded<cloud_topics::level_zero_notifier>* notifier = nullptr);
 
-    // Starts the pool of workers, making them available for compaction jobs.
+    // Starts the pool of workers, making them available for maintenance jobs.
     ss::future<> start();
 
     // Stops all workers (and inflight compaction jobs) and then destructs
@@ -56,14 +61,26 @@ public:
     // be invoked during application shutdown.
     ss::future<> stop();
 
-    // Returns the top entry of `_work_queue`, if it is not empty, and sets
-    // inflight state for the provided shard & CTP. Returns `std::nullopt` if
-    // the `_work_queue` is empty.
-    std::optional<foreign_log_compaction_meta_ptr>
-      try_acquire_work(ss::shard_id);
+    // Returns the top job of `_compaction_queue`, if it is not empty, and marks
+    // the provided shard as compacting that job's CTP. Returns `std::nullopt`
+    // if the `_compaction_queue` is empty.
+    std::optional<foreign_compaction_job_ptr>
+      try_acquire_compaction_work(ss::shard_id);
 
-    // Resets inflight state for the provided CTP.
-    void complete_work(log_compaction_meta*);
+    // Clears the inflight shard for the completed job's CTP.
+    void complete_compaction_work(compaction_job*);
+
+    // Returns the top job of `_leveling_queue`, dropping at the head any jobs
+    // whose meta has been unmanaged. Marks the job's range inflight (for the
+    // provided shard) so the collector won't re-queue an overlapping range
+    // until it completes. Returns `std::nullopt` if no live job remains.
+    std::optional<foreign_leveling_job_ptr>
+      try_acquire_leveling_work(ss::shard_id);
+
+    // Decrements the inflight-range count for the completed job's CTP on the
+    // provided shard and records the range's commit time so the collector
+    // applies a post-commit cooldown before re-scheduling it.
+    void complete_leveling_work(leveling_job*, ss::shard_id);
 
     // If an inflight compaction job for the provided log exists, a signal is
     // sent to the worker shard on which the job is occurring to request an
@@ -78,22 +95,40 @@ public:
     // single compaction job must be stopped.
     void request_stop_compaction(log_compaction_meta_ptr);
 
-    // Alert all workers that new jobs have become available in the
-    // `_work_queue`.
-    ss::future<> alert_workers();
+    // Stops every inflight leveling range for `log` across all worker shards
+    // that have one. Like `request_stop_compaction`, this only requests a
+    // pre-emption; it does not wait for the inflight jobs to wind down.
+    void request_stop_leveling(log_compaction_meta_ptr);
 
-    // Pauses the worker on the provided shard.
-    ss::future<> pause_worker(ss::shard_id);
+    // Alert the compaction fiber on all workers that new compaction jobs may
+    // be available in the `_compaction_queue`.
+    ss::future<> alert_compaction_workers();
 
-    // Resumes the worker on the provided shard.
-    ss::future<> resume_worker(ss::shard_id);
+    // Alert the leveling fiber on all workers that new leveling jobs may be
+    // available in the `_leveling_queue`.
+    ss::future<> alert_leveling_workers();
+
+    // Pauses/resumes the given kind(s) of maintenance work on the worker at
+    // the provided shard.
+    ss::future<> pause_worker(
+      ss::shard_id, maintenance_job_type = maintenance_job_type::all);
+    ss::future<> resume_worker(
+      ss::shard_id, maintenance_job_type = maintenance_job_type::all);
+
+    // Pauses/resumes the given kind(s) of maintenance work on every worker
+    // shard.
+    ss::future<> pause_all_workers(maintenance_job_type);
+    ss::future<> resume_all_workers(maintenance_job_type);
 
 private:
     friend class ::WorkerManagerTestFixture;
     friend class ::SchedulerTestFixture;
 
     // Owned by `scheduler`.
-    log_compaction_queue& _work_queue;
+    compaction_queue& _compaction_queue;
+
+    // Owned by `scheduler`.
+    leveling_queue& _leveling_queue;
 
     // Owned by `app`.
     ss::sharded<file_io>* _io;
@@ -108,6 +143,10 @@ private:
 
     // Owned by `app`.
     ss::sharded<level_one_reader_probe>* _l1_reader_probe;
+
+    // Owned by `app`. The per-shard level_zero_notifier forwarded to every
+    // compaction_worker (and from there to each sink).
+    ss::sharded<cloud_topics::level_zero_notifier>* _notifier;
 
     // A sharded pool of compaction workers.
     ss::sharded<compaction_worker> _workers;

@@ -2352,7 +2352,7 @@ class AuditLogTestOauth(AuditLogTestBase):
         try:
             self.keycloak.start_node(kc_node)
         except Exception as e:
-            self.logger.error(f"{e}")
+            self.logger.exception("Keycloak failed to start")
             self.keycloak.clean_node(kc_node)
             assert False, f"Keycloak failed to start: {e}"
 
@@ -3000,7 +3000,6 @@ class AuditLogTestSchemaRegistryBase(AuditLogTestBase):
     def __init__(self, test_context, **kwargs):
         sr_config = SchemaRegistryConfig()
         sr_config.authn_method = "http_basic"
-        sr_config.mode_mutability = True
         extra_rp_conf = {"schema_registry_use_rpc": False}
         if "extra_rp_conf" in kwargs:
             extra_rp_conf.update(kwargs.pop("extra_rp_conf"))

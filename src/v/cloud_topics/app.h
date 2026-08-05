@@ -42,6 +42,7 @@ class cloud_topics_manager;
 template<class>
 class level_zero_gc_t;
 class housekeeper_manager;
+class level_zero_notifier;
 class topic_manifest_upload_manager;
 
 namespace l1 {
@@ -91,6 +92,7 @@ public:
     l1::compaction_scheduler* get_compaction_scheduler();
     ss::sharded<level_zero_gc_t<ss::lowres_clock>>* get_level_zero_gc();
     cluster_services& get_local_cluster_services();
+    ss::sharded<level_zero_notifier>* get_sharded_l0_notifier();
 
     // TODO: add 'get_control_plane_api' etc
 
@@ -102,6 +104,7 @@ private:
 
     ss::sstring _logger_name;
     ss::sharded<level_one_reader_probe> _l1_reader_probe;
+    ss::sharded<l1::file_io_probe> _l1_file_io_probe;
     ss::sharded<l1_reader_cache> _l1_reader_cache;
     std::unique_ptr<data_plane_api> data_plane;
     ss::sharded<state_accessors> state;
@@ -115,6 +118,7 @@ private:
     ss::sharded<cloud_topics_manager> manager;
     ss::sharded<level_zero_gc_t<ss::lowres_clock>> l0_gc;
     ss::sharded<housekeeper_manager> housekeeper_manager;
+    ss::sharded<level_zero_notifier> l0_notifier;
     ss::sharded<topic_manifest_upload_manager> topic_manifest_upload_mgr;
     std::unique_ptr<l1::compaction_scheduler> compaction_scheduler;
     ss::sharded<l0::cluster_services> cluster_services;

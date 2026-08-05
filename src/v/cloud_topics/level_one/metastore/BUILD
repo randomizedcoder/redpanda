@@ -43,6 +43,7 @@ redpanda_cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//src/v/config",
         "//src/v/container:chunked_vector",
         "//src/v/model",
         "//src/v/serde",
@@ -164,6 +165,7 @@ redpanda_cc_library(
         ":leveling_range_builder",
         ":metastore_manifest",
         ":offset_interval_set",
+        ":state",
         "//src/v/base",
         "//src/v/cloud_topics/level_one/common:object_id",
         "//src/v/container:chunked_hash_map",
@@ -175,8 +177,14 @@ redpanda_cc_library(
 
 redpanda_cc_library(
     name = "retry",
+    srcs = [
+        "retry.cc",
+    ],
     hdrs = [
         "retry.h",
+    ],
+    implementation_deps = [
+        "//src/v/config",
     ],
     visibility = ["//visibility:public"],
     deps = [
@@ -300,6 +308,7 @@ redpanda_cc_library(
         "//src/v/container:chunked_hash_map",
         "//src/v/model",
         "//src/v/serde",
+        "//src/v/serde:enum",
         "//src/v/serde:map",
         "//src/v/serde:named_type",
         "//src/v/serde:optional",

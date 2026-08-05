@@ -9,7 +9,9 @@
  */
 
 #include "cloud_topics/level_one/metastore/leveling_range_builder.h"
+#include "config/configuration.h"
 #include "model/fundamental.h"
+#include "test_utils/scoped_config.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -138,15 +140,55 @@ INSTANTIATE_TEST_SUITE_P(
       .min_acceptable = 50,
       .expected_ranges = {},
     },
-    // All extents undersized: one range covers everything, rewritten as
-    // one tiny object.
+    // All extents undersized, but the run is the partition's tail and its
+    // total (6) can't fill a healthy output extent yet. Held back: leveling
+    // it now would produce another undersized extent that snowballs.
     test_case{
-      .name = "AllSmall",
+      .name = "AllSmallTailHeldBack",
       .extents = {{0_o, 9_o, 2},
                   {10_o, 19_o, 2},
                   {20_o, 29_o, 2}},
       .min_acceptable = 50,
-      .expected_ranges = {{.base_offset = 0_o, .last_offset = 29_o, .size_bytes = 6, .extent_count = 3}},
+      .expected_ranges = {},
+    },
+    // All extents undersized and the tail run's total (60) reaches
+    // min_acceptable: leveling can produce a healthy output extent, so the
+    // range commits.
+    test_case{
+      .name = "AllSmallTailCommits",
+      .extents = {{0_o, 9_o, 20},
+                  {10_o, 19_o, 20},
+                  {20_o, 29_o, 20}},
+      .min_acceptable = 50,
+      .expected_ranges = {{.base_offset = 0_o, .last_offset = 29_o, .size_bytes = 60, .extent_count = 3}},
+    },
+    // Boundary: tail run total exactly at min_acceptable commits (the
+    // check is `>=`).
+    test_case{
+      .name = "TailExactlyAtMinAcceptableCommits",
+      .extents = {{0_o, 9_o, 25},
+                  {10_o, 19_o, 25}},
+      .min_acceptable = 50,
+      .expected_ranges = {{.base_offset = 0_o, .last_offset = 19_o, .size_bytes = 50, .extent_count = 2}},
+    },
+    // Boundary: tail run total one byte below min_acceptable is held back.
+    test_case{
+      .name = "TailJustBelowMinAcceptableHeldBack",
+      .extents = {{0_o, 9_o, 25},
+                  {10_o, 19_o, 24}},
+      .min_acceptable = 50,
+      .expected_ranges = {},
+    },
+    // An enclosed run (closed by a healthy extent) commits regardless of
+    // its total: it can never grow, so holding it back would strand it
+    // fragmented forever, while one rewrite collapses it for good.
+    test_case{
+      .name = "EnclosedRunBelowMinAcceptableCommits",
+      .extents = {{0_o, 9_o, 2},
+                  {10_o, 19_o, 2},
+                  {20_o, 29_o, 100}},
+      .min_acceptable = 50,
+      .expected_ranges = {{.base_offset = 0_o, .last_offset = 19_o, .size_bytes = 4, .extent_count = 2}},
     },
     // Leading healthies are no-ops (no active range to close). Range
     // opens at obj 2, extends to obj 3, and closes on the trailing
@@ -277,3 +319,61 @@ INSTANTIATE_TEST_SUITE_P(
     }),
   [](const auto& info) { return info.param.name; });
 // clang-format on
+
+// Verifies that long runs of undersized extents are split into multiple
+// ranges when the accumulated bytes reach
+// `cloud_topics_leveling_max_range_bytes`.
+TEST(LevelingRangeBuilderCapTest, LongRunIsSplit) {
+    scoped_config cfg;
+    // Cap at 100 bytes. Each undersized extent is 30 bytes -> 4 extents fit
+    // (120 bytes), so the cap triggers after the 4th extent. Expect a split.
+    cfg.get("cloud_topics_leveling_max_range_bytes").set_value(size_t{100});
+
+    leveling_range_builder builder{/*min_acceptable_extent_bytes=*/50};
+    // 10 undersized extents of 30 bytes each.
+    for (int i = 0; i < 10; ++i) {
+        builder.process_extent(
+          kafka::offset{i * 10},
+          kafka::offset{i * 10 + 9},
+          /*len=*/30);
+    }
+    auto ranges = std::move(builder).finalize();
+
+    // The cap commits after the 4th extent (cumulative 120 bytes >= 100), so
+    // extents 0..3 form one range. The next range starts at extent 4 and is
+    // again capped at the 4-extent mark (extents 4..7 -> 120 bytes). The
+    // remaining extents 8..9 form a third range (2 extents, K=2, committed).
+    EXPECT_EQ(ranges.size(), 3u);
+    EXPECT_EQ(ranges[0].base_offset, kafka::offset{0});
+    EXPECT_EQ(ranges[0].last_offset, kafka::offset{39});
+    EXPECT_EQ(ranges[0].size_bytes, size_t{120});
+    EXPECT_EQ(ranges[1].base_offset, kafka::offset{40});
+    EXPECT_EQ(ranges[1].last_offset, kafka::offset{79});
+    EXPECT_EQ(ranges[1].size_bytes, size_t{120});
+    EXPECT_EQ(ranges[2].base_offset, kafka::offset{80});
+    EXPECT_EQ(ranges[2].last_offset, kafka::offset{99});
+    EXPECT_EQ(ranges[2].size_bytes, size_t{60});
+}
+
+// Verifies that a singleton remainder after a split is dropped (K=1 rule).
+TEST(LevelingRangeBuilderCapTest, SplitWithSingletonRemainderDropped) {
+    scoped_config cfg;
+    cfg.get("cloud_topics_leveling_max_range_bytes").set_value(size_t{100});
+
+    leveling_range_builder builder{/*min_acceptable_extent_bytes=*/50};
+    // 5 undersized extents of 30 bytes each. Cap triggers after the 4th
+    // (cumulative 120 >= 100), so extents 0..3 form one range. The 5th is
+    // a singleton remainder and gets dropped.
+    for (int i = 0; i < 5; ++i) {
+        builder.process_extent(
+          kafka::offset{i * 10},
+          kafka::offset{i * 10 + 9},
+          /*len=*/30);
+    }
+    auto ranges = std::move(builder).finalize();
+
+    EXPECT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].base_offset, kafka::offset{0});
+    EXPECT_EQ(ranges[0].last_offset, kafka::offset{39});
+    EXPECT_EQ(ranges[0].size_bytes, size_t{120});
+}

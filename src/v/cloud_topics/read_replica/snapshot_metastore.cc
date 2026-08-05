@@ -171,6 +171,7 @@ snapshot_metastore::get_offsets(const model::topic_id_partition& tidp) {
     co_return offsets_response{
       .start_offset = metadata.start_offset,
       .next_offset = metadata.next_offset,
+      .migrating = metadata.migrating,
     };
 }
 
@@ -212,6 +213,11 @@ snapshot_metastore::set_start_offset(
     co_return std::unexpected(errc::invalid_request);
 }
 
+ss::future<std::expected<void, l1::metastore::errc>>
+snapshot_metastore::set_migrating(const model::topic_id_partition&, bool) {
+    co_return std::unexpected(errc::invalid_request);
+}
+
 ss::future<
   std::expected<l1::metastore::topic_removal_response, l1::metastore::errc>>
 snapshot_metastore::remove_topics(const chunked_vector<model::topic_id>&) {
@@ -227,6 +233,11 @@ snapshot_metastore::get_first_offset_for_bytes(
 ss::future<std::expected<void, l1::metastore::errc>>
 snapshot_metastore::compact_objects(
   const object_metadata_builder&, const compaction_map_t&) {
+    co_return std::unexpected(errc::invalid_request);
+}
+
+ss::future<std::expected<void, l1::metastore::errc>>
+snapshot_metastore::commit_compaction_metadata(const compaction_map_t&) {
     co_return std::unexpected(errc::invalid_request);
 }
 

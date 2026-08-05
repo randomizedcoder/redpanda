@@ -18,6 +18,7 @@
 #include "security/role.h"
 #include "security/types.h"
 
+#include <seastar/core/future.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 #include <boost/range/iterator_range.hpp>
@@ -25,6 +26,7 @@
 #include <ranges>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace security {
 
@@ -78,7 +80,7 @@ class role_store {
       detail::role_member_eq>;
     using role_accessor = std::pair<
       role_name_view, /* role_name */
-      ss::noncopyable_function<const members_store_type&(void)>>;
+      ss::noncopyable_function<const members_store_type&()>>;
     using range_query_container_type = chunked_vector<role_name_view>;
 
 public:
@@ -134,6 +136,28 @@ public:
     // });
     range_query_container_type
     range(std::function<bool(const role_accessor&)>&& pred) const;
+
+    // Retrieve roles whose name satisfies pred, each together with its
+    // members, computed in a single pass over the member store (linear in
+    // total memberships). Prefer this over calling get() per role when
+    // enumerating: get() rescans the member store on every call, so per-role
+    // get() is quadratic. Matching roles with no members are included (with
+    // an empty member set).
+    chunked_vector<role_with_members>
+    roles_with_members(const std::function<bool(const role_name&)>& pred) const;
+
+    // IMPORTANT: intended solely for security_manager::fill_snapshot. This
+    // suspends mid-iteration, which is safe ONLY while the caller holds
+    // mux_state_machine's _apply_mtx: that mutex serializes against command
+    // application, so _roles/_members_store can't mutate across a yield. A
+    // caller without that lock risks iterating a container that changes
+    // underfoot.
+    //
+    // Like roles_with_members, but enumerates every role with its members in a
+    // single pass and yields periodically, so snapshotting a very large role
+    // store doesn't stall the reactor.
+    ss::future<chunked_vector<role_with_members>>
+    all_roles_with_members() const;
 
     static constexpr auto name_prefix_filter =
       [](const role_accessor& e, std::string_view filter) {

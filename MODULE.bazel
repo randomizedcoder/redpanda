@@ -19,6 +19,18 @@ use_repo(
 
 bazel_dep(name = "gazelle", version = "0.45.0")
 bazel_dep(name = "abseil-cpp", version = "20250814.1")
+
+# Clang 23 deprecates lifetime_capture_by(this). Remove this override after
+# upgrading to an Abseil release containing this upstream fix:
+# https://github.com/abseil/abseil-cpp/commit/0784689a65b4ea1329fbc5174b8a57c88ec796a9
+single_version_override(
+    module_name = "abseil-cpp",
+    patch_strip = 1,
+    patches = [
+        "//bazel/thirdparty:abseil-clang-23-lifetime-capture.patch",
+    ],
+)
+
 bazel_dep(name = "bazel_skylib", version = "1.8.2")
 bazel_dep(name = "crc32c", version = "1.1.0")
 bazel_dep(name = "fmt", version = "12.1.0")
@@ -65,7 +77,15 @@ bazel_dep(name = "rules_pkg", version = "1.0.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "rules_rust", version = "0.70.0")
-bazel_dep(name = "snappy", version = "1.2.1")
+bazel_dep(name = "snappy", version = "1.2.2.bcr.3")
+single_version_override(
+    module_name = "snappy",
+    patch_strip = 1,
+    patches = [
+        "//bazel/thirdparty:snappy-export-internal-h.patch",
+    ],
+)
+
 bazel_dep(name = "utf8proc", version = "2.11.0")
 bazel_dep(name = "yaml-cpp", version = "0.8.0")
 bazel_dep(name = "zlib", version = "1.3.1.bcr.8")
@@ -179,15 +199,15 @@ COMPILERS = {
     "current": {
         "tars": {
             "aarch64": {
-                "build_date": "2026-03-02",
-                "sha": "4fcc2b9cc39b98f63e63739a5229e0b73a2bc9b26d1f4681f12c2cf55ddcab6e",
+                "build_date": "2026-07-28",
+                "sha": "9e588aeaad2baf5606609053d18f496aa1b5c056f7e12bddac2615f0a1695d11",
             },
             "x86_64": {
-                "build_date": "2026-03-02",
-                "sha": "46eacaffa999ea1d0fcb83f28d3f1089363fbb389dfbcf043e6c5de7329dc0b3",
+                "build_date": "2026-07-28",
+                "sha": "ef36b2d7d9a38e6fa7b94b9bd8ef634b90aa312434c1f76a14143004d5497eab",
             },
         },
-        "version": "22.1.0",
+        "version": "23.1.0-rc2",
     },
 }
 
@@ -241,23 +261,24 @@ COMPILERS = {
 # Go Toolchain
 # ====================================
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk", dev_dependency = True)
-go_sdk.download(version = "1.26.3")
+go_sdk.download(version = "1.26.5")
 
 # The microsoft compiler versions can be listed at their github release under the `asset.json` file
 go_sdk.download(
     name = "go_sdk_with_systemcrypto",
     experiments = ["systemcrypto"],
     sdks = {
-        "linux_amd64": ("450d56d408a0b49c0d3a8ba15a0a810d/go1.26.3-20260508.1.linux-amd64.tar.gz", "e09fedd6e53dfe835ea00b38bb678388965417ecdd28b02231fc868d4a9064c8"),
-        "linux_arm64": ("b9189bfbbd3c981361dc32f42bc57edb/go1.26.3-20260508.1.linux-arm64.tar.gz", "782eb2cfeb1c2e21d604d810a3e81a1c7112ba1ca7b1b2aee6131ab0353c8278"),
-        "darwin_amd64": ("75619db85ab8b5467af699f2a5206013/go1.26.3-20260508.1.darwin-amd64.tar.gz", "656c8680be43c2fa64ba1e044c446185264ba056191e62029d1d3e7ac88b0f00"),
-        "darwin_arm64": ("cf9e99b59a4cf1b7826ed21dcf627f4b/go1.26.3-20260508.1.darwin-arm64.tar.gz", "48601476ef9883c84c82d05c13ebb50154825b1c0093186403c011f91eb96bf4"),
+        "linux_amd64": ("96d1f4b28a670f8e9b3259194508ae2f/go1.26.5-20260709.6.linux-amd64.tar.gz", "df9f45167cf1cd825aa8555b76c5b24cb89dfbd771f48cc0007458236c414715"),
+        "linux_arm64": ("af17683a03acab86aec9ba37afbd5ff1/go1.26.5-20260709.6.linux-arm64.tar.gz", "9990f8fcfefcbd15fb888dd777c7a72f1745889c9e94836ffe26f7e46e43328d"),
+        "darwin_amd64": ("d45676061dfccb09b72f2579a6d8927f/go1.26.5-20260709.6.darwin-amd64.tar.gz", "7a4f0bd26ccf1ce912bc509fccb473ee39bdd149b804fa581e59a72b7708e78e"),
+        "darwin_arm64": ("f8da58db7007fa456d93c4f56bf6c337/go1.26.5-20260709.6.darwin-arm64.tar.gz", "a6d2124035c18602926af78d1e3ae523abc613e36b2086da9b451991ce4288c4"),
     },
-    urls = ["https://download.visualstudio.microsoft.com/download/pr/2b5f4cfa-e528-4781-92cb-dbdb5effb00c/{}"],
-    version = "1.26.3",
+    urls = ["https://download.visualstudio.microsoft.com/download/pr/a38f1e38-3cd4-48b2-b032-ca38793ec901/{}"],
+    version = "1.26.5",
 )
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
+go_deps.config(check_direct_dependencies = "error")
 go_deps.from_file(go_work = "//bazel/thirdparty:go.work")
 
 # TODO(bazel): Upstream this so we can remove this obscure workaround.
@@ -290,8 +311,6 @@ use_repo(
     "com_github_cespare_xxhash",
     "com_github_containerd_errdefs",
     "com_github_coreos_go_systemd_v22",
-    "com_github_docker_docker",
-    "com_github_docker_go_connections",
     "com_github_docker_go_units",
     "com_github_fatih_color",
     "com_github_google_uuid",
@@ -306,6 +325,8 @@ use_repo(
     "com_github_lorenzosaino_go_sysctl",
     "com_github_mark3labs_mcp_go",
     "com_github_mattn_go_isatty",
+    "com_github_moby_moby_api",
+    "com_github_moby_moby_client",
     "com_github_moby_term",
     "com_github_opencontainers_go_digest",
     "com_github_opencontainers_image_spec",

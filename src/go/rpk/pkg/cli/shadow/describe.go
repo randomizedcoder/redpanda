@@ -20,9 +20,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
-	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/oauth/providers/auth0"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/out"
-	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/publicapi"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
@@ -35,6 +33,7 @@ const (
 	secConsumerOffset = "Consumer Offset Sync"
 	secSecurity       = "Security Sync"
 	secSchemaRegistry = "Schema Registry Sync"
+	secRole           = "Role Sync"
 )
 
 // shadowLinkDescription is the unified output for both cloud and self-hosted.
@@ -54,6 +53,7 @@ type shadowLinkDescription struct {
 	ConsumerOffsetSyncOptions *describeConsumerOffsetSyncOptions `json:"consumer_offset_sync_options,omitempty" yaml:"consumer_offset_sync_options,omitempty"`
 	SecuritySyncOptions       *describeSecuritySyncOptions       `json:"security_sync_options,omitempty" yaml:"security_sync_options,omitempty"`
 	SchemaRegistrySyncOptions *describeSchemaRegistrySyncOptions `json:"schema_registry_sync_options,omitempty" yaml:"schema_registry_sync_options,omitempty"`
+	RoleSyncOptions           *describeRoleSyncOptions           `json:"role_sync_options,omitempty" yaml:"role_sync_options,omitempty"`
 }
 
 // describeClientOptions uses effective values and auth metadata (not password).
@@ -101,8 +101,30 @@ type describeSecuritySyncOptions struct {
 	ACLFilters []*ACLFilter `json:"acl_filters,omitempty" yaml:"acl_filters,omitempty"`
 }
 
+type describeRoleSyncOptions struct {
+	Interval        string        `json:"interval" yaml:"interval"`
+	Paused          bool          `json:"paused" yaml:"paused"`
+	RoleNameFilters []*NameFilter `json:"role_name_filters,omitempty" yaml:"role_name_filters,omitempty"`
+}
+
 type describeSchemaRegistrySyncOptions struct {
-	ShadowingMode string `json:"shadowing_mode" yaml:"shadowing_mode"`
+	ShadowingMode           string                           `json:"shadowing_mode" yaml:"shadowing_mode"`
+	ShadowSchemaRegistryAPI *describeShadowSchemaRegistryAPI `json:"shadow_schema_registry_api,omitempty" yaml:"shadow_schema_registry_api,omitempty"`
+}
+
+// describeShadowSchemaRegistryAPI uses effective interval/rate values and auth
+// metadata (not the password).
+type describeShadowSchemaRegistryAPI struct {
+	SourceURL                      string                            `json:"source_url" yaml:"source_url"`
+	Paused                         bool                              `json:"paused" yaml:"paused"`
+	AuthOptions                    *describeAuthenticationConfig     `json:"auth_options,omitempty" yaml:"auth_options,omitempty"`
+	TLSSettings                    *TLSSettings                      `json:"tls_settings,omitempty" yaml:"tls_settings,omitempty"`
+	TailInterval                   string                            `json:"tail_interval" yaml:"tail_interval"`
+	FullSyncInterval               string                            `json:"full_sync_interval" yaml:"full_sync_interval"`
+	MaxSourceRequestsPerSecond     int32                             `json:"max_source_requests_per_second" yaml:"max_source_requests_per_second"`
+	SourceFilter                   *SchemaRegistrySourceFilter       `json:"source_filter,omitempty" yaml:"source_filter,omitempty"`
+	Destination                    *SchemaRegistryContextDestination `json:"destination,omitempty" yaml:"destination,omitempty"`
+	UnsupportedSchemaFeaturePolicy string                            `json:"unsupported_schema_feature_policy" yaml:"unsupported_schema_feature_policy"`
 }
 
 func newDescribeCommand(fs afero.Fs, p *config.Params) *cobra.Command {
@@ -160,12 +182,7 @@ Display output as JSON:
 			linkName := args[0]
 
 			if prof.CheckFromCloud() {
-				cloudClient, err := publicapi.NewValidatedCloudClientSet(
-					cfg.DevOverrides().PublicAPIURL,
-					prof.CurrentAuth().AuthToken,
-					auth0.NewClient(cfg.DevOverrides()).Audience(),
-					[]string{prof.CurrentAuth().ClientID},
-				)
+				cloudClient, err := newCloudClientSet(cfg, prof)
 				out.MaybeDieErr(err)
 
 				link, err := cloudClient.ShadowLinkByNameAndRPID(cmd.Context(), linkName, prof.CloudCluster.ClusterID)
@@ -190,6 +207,7 @@ Display output as JSON:
 	cmd.Flags().BoolVarP(&opts.co, "print-consumer", "r", false, "Print the detailed consumer offset configuration section")
 	cmd.Flags().BoolVarP(&opts.sec, "print-security", "s", false, "Print the detailed security configuration section")
 	cmd.Flags().BoolVarP(&opts.sr, "print-registry", "y", false, "Print the detailed schema registry configuration section")
+	cmd.Flags().BoolVar(&opts.role, "print-role", false, "Print the detailed role sync configuration section")
 	cmd.Flags().BoolVarP(&opts.all, "print-all", "a", false, "Print all sections")
 	p.InstallFormatFlag(cmd)
 	return cmd
@@ -203,16 +221,17 @@ type slDescribeOptions struct {
 	co       bool // consumer offset
 	sec      bool // security
 	sr       bool // schema registry
+	role     bool
 }
 
 // If no flags are set, default to overview and client sections.
 func (o *slDescribeOptions) defaultOrAll() {
-	if !o.all && !o.overview && !o.client && !o.topic && !o.co && !o.sec && !o.sr {
+	if !o.all && !o.overview && !o.client && !o.topic && !o.co && !o.sec && !o.sr && !o.role {
 		o.overview, o.client = true, true
 	}
 
 	if o.all {
-		o.overview, o.client, o.topic, o.co, o.sec, o.sr = true, true, true, true, true, true
+		o.overview, o.client, o.topic, o.co, o.sec, o.sr, o.role = true, true, true, true, true, true, true
 	}
 }
 
@@ -231,6 +250,7 @@ func printShadowLinkDescription(f config.OutFormatter, link *adminv2.ShadowLink,
 			secConsumerOffset: opts.co,
 			secSecurity:       opts.sec,
 			secSchemaRegistry: opts.sr,
+			secRole:           opts.role,
 		})...,
 	)
 
@@ -259,6 +279,10 @@ func printShadowLinkDescription(f config.OutFormatter, link *adminv2.ShadowLink,
 	sections.Add(secSchemaRegistry, func() {
 		printSchemaRegistrySync(cfg.GetSchemaRegistrySyncOptions())
 	})
+
+	sections.Add(secRole, func() {
+		printRoleSync(cfg.GetRoleSyncOptions())
+	})
 }
 
 func printCloudShadowLinkDescription(f config.OutFormatter, link *controlplanev1.ShadowLink, opts slDescribeOptions) {
@@ -275,6 +299,7 @@ func printCloudShadowLinkDescription(f config.OutFormatter, link *controlplanev1
 			secTopicSync:      opts.topic,
 			secConsumerOffset: opts.co,
 			secSecurity:       opts.sec,
+			secSchemaRegistry: opts.sr,
 		})...,
 	)
 
@@ -350,29 +375,7 @@ func printClient(opts *adminv2.ShadowLinkClientOptions) {
 	}
 
 	// TLS section
-	if tls := opts.GetTlsSettings(); tls != nil {
-		tw.Print("TLS:", "")
-		tw.Print("----", "")
-		// TLS settings can be either file-based or PEM-based.
-		if fileSettings := tls.GetTlsFileSettings(); fileSettings != nil {
-			// CA is required, key and cert are optional.
-			tw.Print("CA", fileSettings.GetCaPath())
-			if keyPath := fileSettings.GetKeyPath(); keyPath != "" {
-				tw.Print("KEY", keyPath)
-			}
-			if certPath := fileSettings.GetCertPath(); certPath != "" {
-				tw.Print("CERT", certPath)
-			}
-		} else if pemSettings := tls.GetTlsPemSettings(); pemSettings != nil {
-			tw.Print("CA", pemSettings.GetCa())
-			if key := pemSettings.GetKeyFingerprint(); key != "" {
-				tw.Print("KEY FINGERPRINT", key)
-			}
-			if cert := pemSettings.GetCert(); cert != "" {
-				tw.Print("CERT", cert)
-			}
-		}
-	}
+	printTLSSettings(tw, opts.GetTlsSettings())
 
 	// SASL section
 	if auth := opts.GetAuthenticationConfiguration(); auth != nil {
@@ -521,6 +524,25 @@ func printConsumerOffsetSync(opts *adminv2.ConsumerOffsetSyncOptions) {
 	}
 }
 
+func printRoleSync(opts *adminv2.RoleSyncOptions) {
+	tw := out.NewTabWriter()
+	defer tw.Flush()
+	if opts == nil {
+		tw.Print("No role sync configuration")
+		return
+	}
+
+	tw.Print("PAUSED", opts.GetPaused())
+	tw.Print("INTERVAL", opts.GetEffectiveInterval().AsDuration().String())
+
+	if len(opts.GetRoleNameFilters()) > 0 {
+		tw.Print("ROLE NAME FILTERS:", "")
+		for _, filter := range opts.GetRoleNameFilters() {
+			tw.Print("", fmt.Sprintf("- %s %s %q", formatFilterType(filter.GetFilterType()), formatPatternType(filter.GetPatternType()), filter.GetName()))
+		}
+	}
+}
+
 func printSecuritySync(opts *adminv2.SecuritySettingsSyncOptions) {
 	tw := out.NewTabWriter()
 	defer tw.Flush()
@@ -560,6 +582,85 @@ func printSchemaRegistrySync(opts *adminv2.SchemaRegistrySyncOptions) {
 		return
 	}
 	tw.Print("SHADOWING MODE", strings.ReplaceAll(opts.WhichSchemaRegistryShadowingMode().String(), "_", " "))
+
+	api := opts.GetShadowSchemaRegistryApi()
+	if api == nil {
+		return
+	}
+	tw.Print("PAUSED", api.GetPaused())
+	tw.Print("SOURCE URL", api.GetSourceUrl())
+	tw.Print("TAIL INTERVAL", api.GetEffectiveTailInterval().AsDuration().String())
+	tw.Print("FULL SYNC INTERVAL", api.GetEffectiveFullSyncInterval().AsDuration().String())
+	tw.Print("MAX SOURCE REQUESTS PER SECOND", api.GetEffectiveMaxSourceRequestsPerSecond())
+	tw.Print("UNSUPPORTED SCHEMA FEATURE POLICY", formatUnsupportedSchemaFeaturePolicy(api.GetUnsupportedSchemaFeaturePolicy()))
+
+	printTLSSettings(tw, api.GetTlsSettings())
+
+	if basic := api.GetAuthOptions().GetBasic(); basic != nil {
+		tw.Print("", "")
+		tw.Print("BASIC AUTH:", "")
+		tw.Print("-----------", "")
+		tw.Print("USERNAME", basic.GetUsername())
+		if basic.GetPasswordSet() {
+			tw.Print("PASSWORD SET AT", basic.GetPasswordSetAt().AsTime().Format(time.RFC3339))
+		}
+	}
+
+	if sf := api.GetSourceFilter(); sf != nil {
+		if contexts := sf.GetContexts(); len(contexts) > 0 {
+			tw.Print("SOURCE CONTEXTS:", "")
+			for _, c := range contexts {
+				tw.Print("", fmt.Sprintf("- %s", c))
+			}
+		}
+		if subjects := sf.GetSubjects(); len(subjects) > 0 {
+			tw.Print("SOURCE SUBJECTS:", "")
+			for _, s := range subjects {
+				tw.Print("", fmt.Sprintf("- %s", s))
+			}
+		}
+	}
+
+	if dest := api.GetDestination(); dest != nil {
+		switch {
+		case dest.GetIdentity() != nil:
+			tw.Print("DESTINATION", "identity")
+		case dest.GetExact() != nil:
+			tw.Print("DESTINATION", "exact")
+			for _, m := range dest.GetExact().GetMappings() {
+				tw.Print("", fmt.Sprintf("- %s -> %s", m.GetSource(), m.GetDestination()))
+			}
+		}
+	}
+}
+
+// printTLSSettings renders the shared core TLS settings (file- or PEM-based)
+// used by both the client options and the schema registry API.
+func printTLSSettings(tw *out.TabWriter, tls *corecommonv1.TLSSettings) {
+	if tls == nil {
+		return
+	}
+	tw.Print("TLS:", "")
+	tw.Print("----", "")
+	// TLS settings can be either file-based or PEM-based.
+	if fileSettings := tls.GetTlsFileSettings(); fileSettings != nil {
+		// CA is required, key and cert are optional.
+		tw.Print("CA", fileSettings.GetCaPath())
+		if keyPath := fileSettings.GetKeyPath(); keyPath != "" {
+			tw.Print("KEY", keyPath)
+		}
+		if certPath := fileSettings.GetCertPath(); certPath != "" {
+			tw.Print("CERT", certPath)
+		}
+	} else if pemSettings := tls.GetTlsPemSettings(); pemSettings != nil {
+		tw.Print("CA", pemSettings.GetCa())
+		if key := pemSettings.GetKeyFingerprint(); key != "" {
+			tw.Print("KEY FINGERPRINT", key)
+		}
+		if cert := pemSettings.GetCert(); cert != "" {
+			tw.Print("CERT", cert)
+		}
+	}
 }
 
 func formatScramMechanism(m adminv2.ScramMechanism) string {
@@ -611,6 +712,10 @@ func formatACLPermissionType(p corecommonv1.ACLPermissionType) string {
 	return strings.ToUpper(strings.TrimPrefix(p.String(), "ACL_PERMISSION_TYPE_"))
 }
 
+func formatUnsupportedSchemaFeaturePolicy(p adminv2.UnsupportedSchemaFeaturePolicy) string {
+	return strings.TrimPrefix(p.String(), "UNSUPPORTED_SCHEMA_FEATURE_POLICY_")
+}
+
 // fromAdminV2ShadowLinkDescription converts adminv2.ShadowLink to shadowLinkDescription.
 func fromAdminV2ShadowLinkDescription(link *adminv2.ShadowLink) shadowLinkDescription {
 	cfg := link.GetConfigurations()
@@ -627,6 +732,7 @@ func fromAdminV2ShadowLinkDescription(link *adminv2.ShadowLink) shadowLinkDescri
 		ConsumerOffsetSyncOptions: buildDescribeConsumerOffsetOptions(cfg.GetConsumerOffsetSyncOptions()),
 		SecuritySyncOptions:       buildDescribeSecurityOptions(cfg.GetSecuritySyncOptions()),
 		SchemaRegistrySyncOptions: buildDescribeSchemaRegistryOptions(cfg.GetSchemaRegistrySyncOptions()),
+		RoleSyncOptions:           buildDescribeRoleOptions(cfg.GetRoleSyncOptions()),
 	}
 }
 
@@ -768,6 +874,21 @@ func buildDescribeConsumerOffsetOptions(opts *adminv2.ConsumerOffsetSyncOptions)
 	}
 }
 
+func buildDescribeRoleOptions(opts *adminv2.RoleSyncOptions) *describeRoleSyncOptions {
+	if opts == nil {
+		return nil
+	}
+	var filters []*NameFilter
+	for _, f := range opts.GetRoleNameFilters() {
+		filters = append(filters, adminMapFilterToCfg(f))
+	}
+	return &describeRoleSyncOptions{
+		Interval:        opts.GetEffectiveInterval().AsDuration().String(),
+		Paused:          opts.GetPaused(),
+		RoleNameFilters: filters,
+	}
+}
+
 func buildDescribeSecurityOptions(opts *adminv2.SecuritySettingsSyncOptions) *describeSecuritySyncOptions {
 	if opts == nil {
 		return nil
@@ -788,6 +909,36 @@ func buildDescribeSchemaRegistryOptions(opts *adminv2.SchemaRegistrySyncOptions)
 		return nil
 	}
 	return &describeSchemaRegistrySyncOptions{
-		ShadowingMode: strings.ReplaceAll(opts.WhichSchemaRegistryShadowingMode().String(), "_", " "),
+		ShadowingMode:           strings.ReplaceAll(opts.WhichSchemaRegistryShadowingMode().String(), "_", " "),
+		ShadowSchemaRegistryAPI: buildDescribeShadowSchemaRegistryAPI(opts.GetShadowSchemaRegistryApi()),
 	}
+}
+
+func buildDescribeShadowSchemaRegistryAPI(api *adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi) *describeShadowSchemaRegistryAPI {
+	if api == nil {
+		return nil
+	}
+	d := &describeShadowSchemaRegistryAPI{
+		SourceURL:                      api.GetSourceUrl(),
+		Paused:                         api.GetPaused(),
+		TLSSettings:                    adminTLSToCfg(api.GetTlsSettings()),
+		TailInterval:                   api.GetEffectiveTailInterval().AsDuration().String(),
+		FullSyncInterval:               api.GetEffectiveFullSyncInterval().AsDuration().String(),
+		MaxSourceRequestsPerSecond:     api.GetEffectiveMaxSourceRequestsPerSecond(),
+		SourceFilter:                   adminSchemaRegistrySourceFilterToCfg(api.GetSourceFilter()),
+		Destination:                    adminSchemaRegistryDestinationToCfg(api.GetDestination()),
+		UnsupportedSchemaFeaturePolicy: formatUnsupportedSchemaFeaturePolicy(api.GetUnsupportedSchemaFeaturePolicy()),
+	}
+	if basic := api.GetAuthOptions().GetBasic(); basic != nil {
+		var passwordSetAt string
+		if basic.GetPasswordSet() && basic.GetPasswordSetAt() != nil {
+			passwordSetAt = basic.GetPasswordSetAt().AsTime().Format(time.RFC3339)
+		}
+		d.AuthOptions = &describeAuthenticationConfig{
+			Username:      basic.GetUsername(),
+			PasswordSet:   basic.GetPasswordSet(),
+			PasswordSetAt: passwordSetAt,
+		}
+	}
+	return d
 }

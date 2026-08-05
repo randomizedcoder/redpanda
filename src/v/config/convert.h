@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "cloud_io/admission_control_types.h"
 #include "config/leaders_preference.h"
 #include "config/types.h"
 #include "model/compression.h"
@@ -601,6 +602,23 @@ struct convert<model::redpanda_storage_mode> {
 };
 
 template<>
+struct convert<model::redpanda_storage_mode_tiered_impl> {
+    using type = model::redpanda_storage_mode_tiered_impl;
+
+    static Node encode(const type& rhs) { return Node(fmt::format("{}", rhs)); }
+
+    static bool decode(const Node& node, type& rhs) {
+        auto value = node.as<std::string>();
+        auto mode = model::redpanda_storage_mode_tiered_impl_from_string(value);
+        if (!mode) {
+            return false;
+        }
+        rhs = mode.value();
+        return true;
+    }
+};
+
+template<>
 struct convert<model::recovery_validation_mode> {
     using type = model::recovery_validation_mode;
     constexpr static auto acceptable_values = std::to_array(
@@ -851,6 +869,26 @@ struct convert<security::oidc::nested_group_behavior> {
         std::istringstream iss(value);
         iss >> rhs;
         return true;
+    }
+};
+
+template<>
+struct convert<cloud_io::policy_type> {
+    static Node encode(cloud_io::policy_type rhs) {
+        return Node(fmt::format("{}", rhs));
+    }
+
+    static bool decode(const Node& node, cloud_io::policy_type& rhs) {
+        using type = cloud_io::policy_type;
+        try {
+            rhs = string_switch<type>(node.as<std::string>())
+                    .match(to_string_view(type::passthrough), type::passthrough)
+                    .match(
+                      to_string_view(type::reservation), type::reservation);
+            return true;
+        } catch (const std::runtime_error&) {
+            return false;
+        }
     }
 };
 

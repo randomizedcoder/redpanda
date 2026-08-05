@@ -136,18 +136,6 @@ bool config_property_requested(
                 != configuration_keys->end();
 }
 
-template<typename T>
-ss::sstring describe_as_string(const T& t) {
-    if constexpr (::detail::is_specialization_of_v<T, std::chrono::duration>) {
-        return ssx::sformat("{}", t.count());
-    } else {
-        return ssx::sformat("{}", t);
-    }
-}
-
-// Instantiate explicitly for unit testing
-template ss::sstring describe_as_string(const int&);
-
 // Kafka protocol defines integral types by sizes. See
 // https://kafka.apache.org/protocol.html
 // Therefore we should also use type sizes for integrals and use Java type sizes
@@ -464,15 +452,6 @@ template void add_topic_config_if_requested<int, describe_int_t>(
   std::optional<ss::sstring> documentation,
   describe_int_t&& describe_f,
   bool hide_default_override = false);
-
-template<typename T>
-static ss::sstring maybe_print_tristate(const tristate<T>& tri) {
-    if (tri.is_disabled() || !tri.has_optional_value()) {
-        return "-1";
-    }
-
-    return describe_as_string(tri.value());
-}
 
 template<typename T>
 static void add_topic_config(
@@ -1218,7 +1197,41 @@ config_response_container_t make_topic_configs(
       maybe_make_documentation(
         include_documentation,
         config::shard_local_cfg().default_redpanda_storage_mode.desc()),
-      &describe_as_string<model::redpanda_storage_mode>);
+      [](const model::redpanda_storage_mode& mode) {
+          return ss::sstring(model::redpanda_storage_mode_user_name(mode));
+      });
+
+    // Read-only companion of redpanda.storage.mode: the exact
+    // implementation of the topic's storage mode, always present and never
+    // ambiguous (the tiered variants report tiered_v1/tiered_v2 while the
+    // mode itself displays both as 'tiered').
+    if (
+      config_property_requested(
+        config_keys, topic_property_redpanda_storage_mode_impl)) {
+        result.push_back(
+          config_response{
+            .name = ss::sstring(topic_property_redpanda_storage_mode_impl),
+            .value = ss::sstring(
+              model::redpanda_storage_mode_impl_name(
+                topic_properties.storage_mode)),
+            .read_only = true,
+            // The value is derived from the storage mode rather than being
+            // an explicit override: report it as a default so config
+            // backup/replay tooling does not treat it as user-set (and so
+            // upgrade config comparisons tolerate its appearance).
+            .is_default = true,
+            .config_source = describe_configs_source::default_config,
+            .config_type = describe_configs_type::string,
+            .documentation = maybe_make_documentation(
+              include_documentation,
+              "Exact implementation of the topic's storage mode. Tiered "
+              "topics report tiered_v1 (classic tiered-storage "
+              "architecture) or tiered_v2 (new tiered-storage "
+              "architecture); other modes mirror redpanda.storage.mode. "
+              "Read-only after creation: supply it at topic creation to "
+              "select the implementation explicitly."),
+          });
+    }
 
     return result;
 }
@@ -1302,11 +1315,11 @@ config_response_container_t make_broker_configs(
       config_keys,
       result,
       "default.replication.factor",
-      config::shard_local_cfg().default_topic_replication,
+      config::shard_local_cfg().default_topic_replications,
       include_synonyms,
       maybe_make_documentation(
         include_documentation,
-        config::shard_local_cfg().default_topic_replication.desc()),
+        config::shard_local_cfg().default_topic_replications.desc()),
       &describe_as_string<int16_t>);
 
     add_broker_config_if_requested(

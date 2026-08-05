@@ -16,6 +16,7 @@
 #include "reflection/adl.h"
 #include "serde/rw/vector.h"
 
+#include <absl/container/inlined_vector.h>
 #include <boost/range/join.hpp>
 
 #include <optional>
@@ -290,6 +291,7 @@ public:
     void for_each_learner(Func&& f) const;
 
     const std::vector<vnode>& all_nodes() const;
+    const std::vector<vnode>& replicas() const { return _all_replicas; }
 
     std::optional<vnode> find_by_node_id(model::node_id) const;
 
@@ -447,7 +449,10 @@ auto quorum_match(ValueProvider&& f, Range&& range) {
         return ret_t{};
     }
 
-    std::vector<ret_t> values;
+    // quorum_match runs on every commit index update i.e. on every replicate
+    // round, so keep the voter values inline for any realistic replication
+    // factor instead of allocating.
+    absl::InlinedVector<ret_t, 5> values;
     values.reserve(range.size());
     std::transform(
       std::cbegin(range),
@@ -489,7 +494,7 @@ void group_configuration::for_each_broker(Func&& f) const {
 
 template<typename Func>
 void group_configuration::for_each_replica(Func&& f) const {
-    std::ranges::for_each(_all_replicas, std::forward<Func>(f));
+    std::ranges::for_each(replicas(), std::forward<Func>(f));
 }
 
 template<typename Func, typename Ret>

@@ -17,6 +17,7 @@
 #include "cloud_storage/remote_label.h"
 #include "cluster/cloud_metadata/cluster_manifest.h"
 #include "cluster/cluster_link/errc.h"
+#include "cluster/data_policy.h"
 #include "cluster/errc.h"
 #include "cluster/feature_update_action.h"
 #include "cluster/fwd.h"
@@ -55,7 +56,6 @@
 #include "serde/rw/vector.h"
 #include "storage/ntp_config.h"
 #include "utils/tristate.h"
-#include "v8_engine/data_policy.h"
 
 #include <seastar/core/chunked_fifo.hh>
 #include <seastar/core/sstring.hh>
@@ -380,6 +380,78 @@ struct join_node_reply
     auto serde_fields() {
         return std::tie(success, id, controller_snapshot, raw_status);
     }
+};
+
+/// Request a fresh controller_join_snapshot from a peer. Issued by
+/// restarting nodes (those that already have a node_id and are not
+/// going through register_with_cluster) so that bootstrap can apply
+/// the current cluster-config view to shard_local_cfg before any
+/// downstream service reads it.
+///
+/// The responder forwards to the controller leader if it is not the
+/// leader itself, so the snapshot is leader-authoritative regardless
+/// of which seed the client happened to ask. Empty payload — the
+/// request carries no requester identification; mTLS at the
+/// connection layer is the only access control.
+struct fetch_controller_snapshot_request
+  : serde::envelope<
+      fetch_controller_snapshot_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    fetch_controller_snapshot_request() noexcept = default;
+
+    fetch_controller_snapshot_request(
+      cluster_version earliest, cluster_version latest)
+      : earliest_logical_version(earliest)
+      , latest_logical_version(latest) {}
+
+    // The lowest logical version the requester supports; its feature
+    // table is already initialized to at least this version.
+    cluster_version earliest_logical_version{cluster::invalid_version};
+    // The highest logical version the requester supports.
+    cluster_version latest_logical_version{cluster::invalid_version};
+
+    friend bool operator==(
+      const fetch_controller_snapshot_request&,
+      const fetch_controller_snapshot_request&) = default;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "fetch_controller_snapshot_request{{logical_version {}-{}}}",
+          earliest_logical_version,
+          latest_logical_version);
+    }
+
+    auto serde_fields() {
+        return std::tie(earliest_logical_version, latest_logical_version);
+    }
+};
+
+struct fetch_controller_snapshot_reply
+  : serde::envelope<
+      fetch_controller_snapshot_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    fetch_controller_snapshot_reply() noexcept = default;
+
+    explicit fetch_controller_snapshot_reply(std::optional<iobuf> snap)
+      : controller_snapshot(std::move(snap)) {}
+
+    /// The serialized controller_join_snapshot, or nullopt if the
+    /// responder is not yet ready to produce one (e.g. still bootstrapping).
+    std::optional<iobuf> controller_snapshot;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "snap {}",
+          controller_snapshot.has_value()
+            ? controller_snapshot.value().size_bytes()
+            : 0);
+    }
+
+    auto serde_fields() { return std::tie(controller_snapshot); }
 };
 
 struct configuration_update_request
@@ -779,9 +851,9 @@ struct incremental_topic_custom_updates
       incremental_topic_custom_updates,
       serde::version<1>,
       serde::compat_version<0>> {
-    // Data-policy property is replicated by data_policy_frontend and handled by
-    // data_policy_manager.
-    property_update<std::optional<v8_engine::data_policy>> data_policy;
+    // Relic of the removed data-policy feature, never set. Kept for wire
+    // format compatibility.
+    property_update<std::optional<cluster::data_policy>> data_policy;
     // Replication factor is custom handled.
     property_update<std::optional<replication_factor>> replication_factor;
 

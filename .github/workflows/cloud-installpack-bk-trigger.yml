@@ -10,11 +10,11 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-region: ${{ vars.RP_AWS_CRED_REGION }}
           role-to-assume: arn:aws:iam::${{ secrets.RP_AWS_CRED_ACCOUNT_ID }}:role/${{ vars.RP_AWS_CRED_BASE_ROLE_NAME }}${{ github.event.repository.name }}
-      - uses: aws-actions/aws-secretsmanager-get-secrets@v2
+      - uses: aws-actions/aws-secretsmanager-get-secrets@v3
         with:
           secret-ids: |
             ,sdlc/prod/github/actions_bot_token
@@ -39,5 +39,5 @@ jobs:
           buildkite_pipeline: ${{ vars.CLOUD_PIPELINE }}
           commit: HEAD
           branch: ${{ vars.CLOUD_DEFAULT_BRANCH }}
-          message: Install Pack version bump trigger
+          message: 'Install pack version bump triggered for redpanda ${{ github.ref_name }} by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
           env: '{"INSTALLPACK_BUMP": "1", "RELEASE_VERSION": "${{ github.ref_name }}"}'

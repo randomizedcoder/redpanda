@@ -101,7 +101,9 @@ public:
                 "Batch size across all topics measured at the kafka layer."),
               {},
               [this] { return _batch_size.batch_size_histogram_logform(); }),
-          });
+          },
+          {},
+          {sm::shard_label});
 
         _metrics.add_group(
           "kafka_rpc",
@@ -159,8 +161,8 @@ public:
     // log_message_timestamp_alert_before_ms
     void produce_bad_create_time() { _produce_bad_create_time++; }
 
-    std::unique_ptr<hist_t::measurement> auto_produce_measurement() {
-        return _produce_latency.auto_measure();
+    hist_t::measurement auto_produce_measurement() {
+        return hist_t::measurement(_produce_latency);
     }
 
     void record_fetch_latency(std::chrono::microseconds micros) {

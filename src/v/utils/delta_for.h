@@ -24,7 +24,7 @@
 #include "serde/rw/tags.h"
 #include "ssx/sformat.h"
 
-#include <seastar/util/log.hh>
+#include <boost/iterator/iterator_facade.hpp>
 
 #include <concepts>
 #include <cstddef>
@@ -441,7 +441,9 @@ public:
     // Only one transaction at a time is supported but this
     // is not enforced. Abandoning tx_state object is ok (this
     // is equivalent for aborting the transaction).
-    tx_state tx_start() { return tx_state{deltafor_encoder{this}}; }
+    tx_state tx_start() {
+        return tx_state{deltafor_encoder{this}};
+    }
 
     // Commit changes done to tx_state.
     // This operation does not throw.
@@ -1006,12 +1008,13 @@ private:
     template<class PredT>
     const_iterator pred_search(value_t value) const {
         PredT pred;
-        for (auto it = begin(); it != end(); ++it) {
+        auto end_it = end();
+        for (auto it = begin(); it != end_it; ++it) {
             if (pred(*it, value)) {
                 return it;
             }
         }
-        return end();
+        return end_it;
     }
 
     std::array<value_t, buffer_depth> _head{};
@@ -1258,6 +1261,14 @@ public:
             return std::nullopt;
         }
         return _frames.back().get_current_stream_pos();
+    }
+
+    /// Number of elements in the last (currently appended to) frame
+    size_t last_frame_size() const {
+        if (_frames.empty()) {
+            return 0;
+        }
+        return _frames.back().size();
     }
 
     struct column_tx_t {
@@ -1509,12 +1520,13 @@ public:
     /// Find first value that matches the predicate
     const_iterator pred_search(
       value_t value, std::regular_invocable<value_t, value_t> auto pred) const {
-        for (auto it = this->begin(); it != this->end(); ++it) {
+        auto end_it = this->end();
+        for (auto it = this->begin(); it != end_it; ++it) {
             if (pred(*it, value)) {
                 return it;
             }
         }
-        return this->end();
+        return end_it;
     }
 };
 
@@ -1556,14 +1568,15 @@ public:
             }
             index += it->size();
         }
+        auto end_it = this->end();
         if (it != this->_frames.end()) {
             auto start = const_iterator(it, this->_frames.end(), 0, index);
-            for (; start != this->end(); ++start) {
+            for (; start != end_it; ++start) {
                 if (pred(*start, value)) {
                     return start;
                 }
             }
         }
-        return this->end();
+        return end_it;
     }
 };

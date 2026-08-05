@@ -480,10 +480,10 @@ TEST_F(storage_test_fixture, test_append_batches_from_multiple_terms) {
           std::back_inserter(batches));
     }
     storage::log_append_config append_cfg{
-      storage::log_append_config::fsync::yes, model::no_timeout};
+      storage::log_append_config::fsync::yes};
     auto reader = model::make_memory_record_batch_reader(std::move(batches));
     std::move(reader)
-      .for_each_ref(log->make_appender(append_cfg), append_cfg.timeout)
+      .for_each_ref(log->make_appender(append_cfg), model::no_timeout)
       .get();
     log->flush().get();
 
@@ -547,11 +547,10 @@ void append_custom_timestamp_batches(
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .timeout = model::no_timeout,
         };
 
         std::move(reader)
-          .for_each_ref(log->make_appender(cfg), cfg.timeout)
+          .for_each_ref(log->make_appender(cfg), model::no_timeout)
           .get();
         current_ts = model::timestamp(current_ts() + 1);
     }
@@ -583,11 +582,10 @@ TEST_F(
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .timeout = model::no_timeout,
         };
 
         std::move(reader)
-          .for_each_ref(log->make_appender(cfg), cfg.timeout)
+          .for_each_ref(log->make_appender(cfg), model::no_timeout)
           .get();
         current_ts = model::timestamp(current_ts() + 1);
     };
@@ -877,7 +875,7 @@ ss::future<storage::append_result> append_exactly(
       model::packed_record_batch_header_size,
       batch_sz);
     storage::log_append_config append_cfg{
-      storage::log_append_config::fsync::no, model::no_timeout};
+      storage::log_append_config::fsync::no};
 
     chunked_circular_buffer<model::record_batch> batches;
     auto val_sz = batch_sz - model::packed_record_batch_header_size;
@@ -1123,8 +1121,7 @@ TEST_F(storage_test_fixture, empty_segment_recovery) {
     model::record_batch_type bt = model::record_batch_type::raft_data;
     using should_flush_t = storage::disk_log_builder::should_flush_after;
     storage::log_append_config appender_cfg{
-      .should_fsync = storage::log_append_config::fsync::no,
-      .timeout = model::no_timeout};
+      .should_fsync = storage::log_append_config::fsync::no};
     builder | storage::start(ntp) | storage::add_segment(0)
       | storage::add_random_batch(
         0,
@@ -1183,8 +1180,7 @@ TEST_F(storage_test_fixture, empty_segment_recovery) {
     // Append single batch
     storage::log_appender appender = log->make_appender(
       storage::log_append_config{
-        .should_fsync = storage::log_append_config::fsync::no,
-        .timeout = model::no_timeout});
+        .should_fsync = storage::log_append_config::fsync::no});
     chunked_circular_buffer<model::record_batch> batches;
     batches.push_back(
       model::test::make_random_batch(model::offset(0), 1, false));
@@ -1213,8 +1209,7 @@ TEST_F(storage_test_fixture, test_compaction_preserve_state) {
     model::record_batch_type bt = model::record_batch_type::raft_configuration;
     using should_flush_t = storage::disk_log_builder::should_flush_after;
     storage::log_append_config appender_cfg{
-      .should_fsync = storage::log_append_config::fsync::no,
-      .timeout = model::no_timeout};
+      .should_fsync = storage::log_append_config::fsync::no};
 
     // single segment
     builder | storage::start(ntp) | storage::add_segment(0)
@@ -1263,8 +1258,7 @@ TEST_F(storage_test_fixture, test_compaction_preserve_state) {
     // Append single batch
     storage::log_appender appender = log->make_appender(
       storage::log_append_config{
-        .should_fsync = storage::log_append_config::fsync::no,
-        .timeout = model::no_timeout});
+        .should_fsync = storage::log_append_config::fsync::no});
 
     chunked_circular_buffer<model::record_batch> batches;
     batches.push_back(
@@ -1313,11 +1307,10 @@ ss::future<> append_single_record_batch_coro(
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .timeout = model::no_timeout,
         };
 
         co_await std::move(reader).for_each_ref(
-          log->make_appender(cfg), cfg.timeout);
+          log->make_appender(cfg), model::no_timeout);
     }
 }
 
@@ -2377,8 +2370,7 @@ TEST_F(storage_test_fixture, committed_offset_updates) {
         // Append single batch
         storage::log_appender appender = log->make_appender(
           storage::log_append_config{
-            .should_fsync = storage::log_append_config::fsync::no,
-            .timeout = model::no_timeout});
+            .should_fsync = storage::log_append_config::fsync::no});
 
         chunked_circular_buffer<model::record_batch> batches;
         batches.push_back(
@@ -2498,11 +2490,10 @@ TEST_F(storage_test_fixture, changing_cleanup_policy_back_and_forth) {
                   {std::move(batch)});
                 storage::log_append_config cfg{
                   .should_fsync = storage::log_append_config::fsync::no,
-                  .timeout = model::no_timeout,
                 };
 
                 std::move(reader)
-                  .for_each_ref(log->make_appender(cfg), cfg.timeout)
+                  .for_each_ref(log->make_appender(cfg), model::no_timeout)
                   .get();
             }
         } while (log->segments().back()->size_bytes() < size);
@@ -2674,10 +2665,11 @@ void write_batch(
     auto reader = model::make_memory_record_batch_reader({std::move(batch)});
     storage::log_append_config cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .timeout = model::no_timeout,
     };
 
-    std::move(reader).for_each_ref(log->make_appender(cfg), cfg.timeout).get();
+    std::move(reader)
+      .for_each_ref(log->make_appender(cfg), model::no_timeout)
+      .get();
 }
 
 absl::
@@ -2811,14 +2803,13 @@ TEST_F(storage_test_fixture, read_write_truncate) {
 
           storage::log_append_config cfg{
             .should_fsync = storage::log_append_config::fsync::no,
-            .timeout = model::no_timeout,
           };
           SUCCEED() << "append";
           return log_mutex
             .with([reader = std::move(reader), cfg, &log]() mutable {
                 SUCCEED() << "append_lock";
                 return std::move(reader).for_each_ref(
-                  log->make_appender(cfg), cfg.timeout);
+                  log->make_appender(cfg), model::no_timeout);
             })
             .then([](storage::append_result res) {
                 SUCCEED() << fmt::format("append_result: {}", res.last_offset);
@@ -2934,12 +2925,11 @@ TEST_F(storage_test_fixture, write_truncate_compact) {
 
               storage::log_append_config cfg{
                 .should_fsync = storage::log_append_config::fsync::no,
-                .timeout = model::no_timeout,
               };
               return log_mutex
                 .with([reader = std::move(reader), cfg, &log]() mutable {
                     return std::move(reader).for_each_ref(
-                      log->make_appender(cfg), cfg.timeout);
+                      log->make_appender(cfg), model::no_timeout);
                 })
                 .then([](storage::append_result res) {
                     SUCCEED()
@@ -3111,7 +3101,6 @@ TEST_F(storage_test_fixture, compaction_non_raft_batches_regression_test) {
 
     storage::log_append_config appender_cfg{
       .should_fsync = storage::log_append_config::fsync::no,
-      .timeout = model::no_timeout,
     };
 
     auto append_random_batch = [&](model::record_batch_type bt) {
@@ -3236,7 +3225,6 @@ TEST_F(storage_test_fixture, compaction_truncation_corner_cases) {
 
           storage::log_append_config appender_cfg{
             .should_fsync = storage::log_append_config::fsync::no,
-            .timeout = model::no_timeout,
           };
 
           std::move(reader)
@@ -3569,11 +3557,10 @@ do_compact_test(const compact_test_args args, storage_test_fixture& f) {
           {std::move(batch)});
         storage::log_append_config cfg{
           .should_fsync = storage::log_append_config::fsync::no,
-          .timeout = model::no_timeout,
         };
 
         std::move(reader)
-          .for_each_ref(log->make_appender(cfg), cfg.timeout)
+          .for_each_ref(log->make_appender(cfg), model::no_timeout)
           .get();
     };
 
@@ -3951,14 +3938,13 @@ TEST_F(storage_test_fixture, issue_8091) {
 
           storage::log_append_config cfg{
             .should_fsync = storage::log_append_config::fsync::no,
-            .timeout = model::no_timeout,
           };
           SUCCEED() << "append";
           return log_mutex
             .with([reader = std::move(reader), cfg, &log]() mutable {
                 SUCCEED() << "append_lock";
                 return std::move(reader)
-                  .for_each_ref(log->make_appender(cfg), cfg.timeout)
+                  .for_each_ref(log->make_appender(cfg), model::no_timeout)
                   .then([](storage::append_result res) {
                       SUCCEED()
                         << fmt::format("append_result: {}", res.last_offset);
@@ -6630,6 +6616,91 @@ TEST_F(storage_test_fixture, test_offset_range_size_lock_timeout) {
             .get(),
           ss::timed_out_error);
     }
+}
+
+TEST_F(storage_test_fixture, test_make_reader_range_lock_abort) {
+    // - Generate a few segments
+    // - Acquire read locks from each
+    // - Queue up a write lock behind one of them, in the background
+    // - make_reader now blocks on segment range lock acquisition behind the
+    //   pending write lock
+    // - firing the reader config's abort source (or reaching its deadline)
+    //   must promptly fail the acquisition instead of waiting indefinitely
+
+    constexpr size_t num_segments = 5;
+    ss::gate gate{};
+
+    auto cfg = default_log_config(test_dir);
+    storage::log_manager mgr = make_log_manager(cfg);
+    auto deferred = ss::defer([&mgr]() mutable { mgr.stop().get(); });
+    auto ntp = model::ntp("redpanda", "test-topic", 0);
+
+    storage::ntp_config ntp_cfg(ntp, mgr.config().base_dir);
+
+    auto log = manage_log(mgr, std::move(ntp_cfg));
+
+    for (size_t i = 0; i < num_segments; i++) {
+        append_random_batches(
+          log,
+          10,
+          model::term_id(0),
+          std::nullopt,
+          custom_ts_batch_generator(model::timestamp::now()));
+        log->force_roll().get();
+    }
+
+    auto& segments = log->segments();
+
+    {
+        std::vector<ss::future<ss::rwlock::holder>> f_locks;
+        f_locks.reserve(segments.size());
+        for (auto& s : segments) {
+            f_locks.emplace_back(s->read_lock());
+        }
+
+        auto seg = *std::next(segments.begin(), num_segments / 2);
+
+        ssx::spawn_with_gate(gate, [seg] {
+            return seg->write_lock().then([](auto) { return ss::now(); });
+        });
+
+        auto make_blocked_reader_cfg = [&](ss::abort_source& as) {
+            auto reader_cfg = storage::local_log_reader_config(
+              log->offsets().start_offset, log->offsets().dirty_offset, as);
+            reader_cfg.skip_readers_cache = true;
+            return reader_cfg;
+        };
+
+        {
+            // abort source only
+            ss::abort_source as;
+            auto fut = log->make_reader(make_blocked_reader_cfg(as));
+            EXPECT_FALSE(fut.available());
+            as.request_abort();
+            EXPECT_THROW(std::move(fut).get(), ss::abort_requested_exception);
+        }
+
+        {
+            // abort source and deadline: deadline fires first
+            ss::abort_source as;
+            auto reader_cfg = make_blocked_reader_cfg(as);
+            reader_cfg.read_lock_deadline = ss::semaphore::clock::now() + 20ms;
+            EXPECT_THROW(
+              log->make_reader(reader_cfg).get(), ss::timed_out_error);
+        }
+
+        {
+            // abort source and deadline: abort fires first
+            ss::abort_source as;
+            auto reader_cfg = make_blocked_reader_cfg(as);
+            reader_cfg.read_lock_deadline = ss::semaphore::clock::now() + 1h;
+            auto fut = log->make_reader(reader_cfg);
+            EXPECT_FALSE(fut.available());
+            as.request_abort();
+            EXPECT_THROW(std::move(fut).get(), ss::abort_requested_exception);
+        }
+    }
+    gate.close().get();
 }
 
 TEST_F(storage_test_fixture, test_max_eligible_for_compacted_reupload_offset) {

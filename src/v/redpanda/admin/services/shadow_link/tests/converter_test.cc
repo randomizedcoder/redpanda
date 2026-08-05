@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <utility>
 
 using namespace std::chrono_literals;
@@ -599,13 +600,7 @@ TEST(converter_test, create_with_metadata_sync_options) {
       md.configuration.topic_metadata_mirroring_cfg.topic_name_filters.size(),
       2);
     EXPECT_TRUE(md.configuration.topic_metadata_mirroring_cfg.exclude_default);
-    ASSERT_TRUE(md.configuration.schema_registry_sync_cfg
-                  .sync_schema_registry_topic_mode.has_value());
-    EXPECT_TRUE(
-      std::holds_alternative<cluster_link::model::schema_registry_sync_config::
-                               shadow_entire_schema_registry>(
-        *md.configuration.schema_registry_sync_cfg
-           .sync_schema_registry_topic_mode));
+    EXPECT_TRUE(md.configuration.schema_registry_sync_cfg.is_topic_mode());
 
     chunked_vector<cluster_link::model::resource_name_filter_pattern> expected{
       cluster_link::model::resource_name_filter_pattern{
@@ -948,9 +943,8 @@ TEST(converter_test, metadata_to_shadow_link_topic_mirroring_cfg) {
       }};
     md->configuration.topic_metadata_mirroring_cfg.exclude_default = true;
 
-    md->configuration.schema_registry_sync_cfg.sync_schema_registry_topic_mode
-      = cluster_link::model::schema_registry_sync_config::
-        shadow_entire_schema_registry{};
+    md->configuration.schema_registry_sync_cfg.sync_mode = cluster_link::model::
+      schema_registry_sync_config::shadow_entire_schema_registry{};
 
     auto sl = admin::metadata_to_shadow_link(std::move(md), {});
     const auto& topic_metadata_sync_options
@@ -1259,6 +1253,113 @@ TEST(converter_test, invalid_scram_update) {
       serde::pb::rpc::invalid_argument_exception);
 }
 
+TEST(converter_test, update_plain_creds_preserves_password) {
+    auto password_last_updated = model::to_timestamp(
+      std::chrono::system_clock::now() - 1h);
+    cluster_link::model::metadata current_md;
+    current_md.name = cluster_link::model::name_t{"test-link"};
+    current_md.uuid = cluster_link::model::uuid_t{uuid_t::create()};
+    current_md.connection.bootstrap_servers = {
+      net::unresolved_address("localhost", 9092)};
+    current_md.connection.authn_config = cluster_link::model::scram_credentials{
+      .username = "plain-user",
+      .password = "old-password",
+      .mechanism = "PLAIN",
+      .password_last_updated = password_last_updated};
+    admin::set_client_id(current_md);
+
+    // Mirror rpk's editor flow: an empty mask (full replace) carrying the
+    // complete configuration with the plain password left empty.
+    proto::admin::plain_config plain_config;
+    plain_config.set_username("plain-user");
+
+    proto::admin::authentication_configuration authn_config;
+    authn_config.set_plain_configuration(std::move(plain_config));
+
+    proto::admin::shadow_link_client_options client_options;
+    client_options.set_bootstrap_servers({"localhost:9092"});
+    client_options.set_authentication_configuration(std::move(authn_config));
+
+    proto::admin::update_shadow_link_request req;
+    req.get_shadow_link().set_name("test-link");
+    req.get_shadow_link().get_configurations().set_client_options(
+      std::move(client_options));
+
+    auto update_cmd = admin::create_update_cluster_link_config_cmd(
+      std::move(req),
+      ss::make_lw_shared<cluster_link::model::metadata>({
+        .name = current_md.name,
+        .uuid = current_md.uuid,
+        .connection = current_md.connection,
+        .configuration = current_md.configuration.copy(),
+      }));
+
+    ASSERT_TRUE(update_cmd.connection.authn_config.has_value());
+    const auto& creds = std::get<cluster_link::model::scram_credentials>(
+      update_cmd.connection.authn_config.value());
+    EXPECT_EQ(creds.username, "plain-user");
+    EXPECT_EQ(creds.password, "old-password");
+    EXPECT_EQ(creds.mechanism, "PLAIN");
+    EXPECT_EQ(creds.password_last_updated, password_last_updated);
+}
+
+TEST(converter_test, update_with_empty_mask_replaces_repeated_fields) {
+    cluster_link::model::metadata current_md;
+    current_md.name = cluster_link::model::name_t{"test-link"};
+    current_md.uuid = cluster_link::model::uuid_t{uuid_t::create()};
+    current_md.connection.bootstrap_servers = {
+      net::unresolved_address("localhost", 9092)};
+    current_md.configuration.topic_metadata_mirroring_cfg.topic_name_filters
+      .emplace_back(
+        cluster_link::model::resource_name_filter_pattern{
+          .pattern_type = cluster_link::model::filter_pattern_type::literal,
+          .filter = cluster_link::model::filter_type::include,
+          .pattern = "drop-me-1"});
+    current_md.configuration.topic_metadata_mirroring_cfg.topic_name_filters
+      .emplace_back(
+        cluster_link::model::resource_name_filter_pattern{
+          .pattern_type = cluster_link::model::filter_pattern_type::literal,
+          .filter = cluster_link::model::filter_type::include,
+          .pattern = "drop-me-2"});
+    admin::set_client_id(current_md);
+
+    // An empty mask replaces the whole configuration, so the repeated filter
+    // list must shrink to the single submitted entry rather than be appended
+    // to.
+    proto::admin::topic_metadata_sync_options topic_metadata_sync_options;
+    chunked_vector<proto::admin::name_filter> filters;
+    filters.emplace_back(create_name_filter(
+      proto::admin::pattern_type::literal,
+      proto::admin::filter_type::include,
+      "keep-me"));
+    topic_metadata_sync_options.set_auto_create_shadow_topic_filters(
+      std::move(filters));
+
+    proto::admin::shadow_link_client_options client_options;
+    client_options.set_bootstrap_servers({"localhost:9092"});
+
+    proto::admin::update_shadow_link_request req;
+    req.get_shadow_link().set_name("test-link");
+    req.get_shadow_link().get_configurations().set_client_options(
+      std::move(client_options));
+    req.get_shadow_link().get_configurations().set_topic_metadata_sync_options(
+      std::move(topic_metadata_sync_options));
+
+    auto update_cmd = admin::create_update_cluster_link_config_cmd(
+      std::move(req),
+      ss::make_lw_shared<cluster_link::model::metadata>({
+        .name = current_md.name,
+        .uuid = current_md.uuid,
+        .connection = current_md.connection,
+        .configuration = current_md.configuration.copy(),
+      }));
+
+    const auto& filters_after
+      = update_cmd.link_config.topic_metadata_mirroring_cfg.topic_name_filters;
+    ASSERT_EQ(filters_after.size(), 1);
+    EXPECT_EQ(filters_after[0].pattern, "keep-me");
+}
+
 TEST(converter_test, test_update_tls_value) {
     cluster_link::model::metadata current_md;
     current_md.name = cluster_link::model::name_t{"test-link"};
@@ -1429,7 +1530,679 @@ proto::admin::create_shadow_link_request create_base_link() {
 
     return req;
 }
+
+proto::admin::schema_registry_sync_options_shadow_schema_registry_api
+create_schema_registry_api_options(
+  ss::sstring username = "sr-api-key",
+  std::optional<ss::sstring> password = ss::sstring{"sr-api-secret"}) {
+    proto::admin::http_basic_auth_options basic_auth;
+    basic_auth.set_username(std::move(username));
+    if (password.has_value()) {
+        basic_auth.set_password(std::move(*password));
+    }
+    proto::admin::schema_registry_auth_options auth_options;
+    auth_options.set_basic(std::move(basic_auth));
+
+    proto::admin::schema_registry_sync_options_shadow_schema_registry_api api;
+    api.set_source_url("https://schema-registry.example.com");
+    api.set_auth_options(std::move(auth_options));
+    return api;
+}
+
+cluster_link::model::metadata
+create_metadata_with_schema_registry_api_basic_auth(
+  ss::sstring password, model::timestamp password_last_updated) {
+    cluster_link::model::metadata md;
+    md.name = cluster_link::model::name_t{"test-link"};
+    md.uuid = cluster_link::model::uuid_t{uuid_t::create()};
+    md.connection.bootstrap_servers = {
+      net::unresolved_address("localhost", 9092)};
+
+    cluster_link::model::schema_registry_sync_config::shadow_schema_registry_api
+      api;
+    api.source_url = "https://schema-registry.example.com";
+    api.auth_config
+      = cluster_link::model::schema_registry_sync_config::basic_auth{
+        .username = "sr-api-key",
+        .password = std::move(password),
+        .password_last_updated = password_last_updated};
+    md.configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
+    admin::set_client_id(md);
+    return md;
+}
+
+ss::lw_shared_ptr<cluster_link::model::metadata>
+copy_metadata_for_update(const cluster_link::model::metadata& md) {
+    return ss::make_lw_shared<cluster_link::model::metadata>({
+      .name = md.name,
+      .uuid = md.uuid,
+      .connection = md.connection,
+      .configuration = md.configuration.copy(),
+    });
+}
+
+proto::admin::update_shadow_link_request create_schema_registry_api_update(
+  proto::admin::schema_registry_sync_options_shadow_schema_registry_api api) {
+    proto::admin::update_shadow_link_request req;
+    req.get_shadow_link()
+      .get_configurations()
+      .get_schema_registry_sync_options()
+      .set_shadow_schema_registry_api(std::move(api));
+
+    serde::pb::field_mask mask;
+    mask.paths.emplace_back(
+      serde::pb::field_mask::path{
+        "configurations", "schema_registry_sync_options"});
+    req.set_update_mask(std::move(mask));
+
+    return req;
+}
 } // namespace
+
+TEST(converter_test, create_with_schema_registry_api_sync_options) {
+    auto req = create_base_link();
+
+    proto::admin::http_basic_auth_options basic_auth;
+    basic_auth.set_username("sr-api-key");
+    basic_auth.set_password("sr-api-secret");
+    proto::admin::schema_registry_auth_options auth_options;
+    auth_options.set_basic(std::move(basic_auth));
+
+    proto::common::tls_file_settings file_settings;
+    file_settings.set_ca_path("/etc/redpanda/sr-ca.crt");
+    file_settings.set_cert_path("/etc/redpanda/sr-client.crt");
+    file_settings.set_key_path("/etc/redpanda/sr-client.key");
+    proto::common::tls_settings tls_settings;
+    tls_settings.set_enabled(true);
+    tls_settings.set_tls_file_settings(std::move(file_settings));
+
+    proto::admin::schema_registry_source_filter source_filter;
+    source_filter.set_contexts({".", ".prod"});
+    source_filter.set_subjects({"orders-value", ":.prod:payments-value"});
+
+    proto::admin::schema_registry_context_map prod_mapping;
+    prod_mapping.set_source(".prod");
+    prod_mapping.set_destination(".shadow-prod");
+    chunked_vector<proto::admin::schema_registry_context_map> mappings;
+    mappings.emplace_back(std::move(prod_mapping));
+    proto::admin::schema_registry_exact_context_mappings exact_mappings;
+    exact_mappings.set_mappings(std::move(mappings));
+    proto::admin::schema_registry_context_destination destination;
+    destination.set_exact(std::move(exact_mappings));
+
+    proto::admin::schema_registry_sync_options_shadow_schema_registry_api api;
+    api.set_source_url("https://schema-registry.example.com");
+    api.set_auth_options(std::move(auth_options));
+    api.set_tls_settings(std::move(tls_settings));
+    api.set_tail_interval(absl::Seconds(17));
+    api.set_full_sync_interval(absl::Minutes(7));
+    api.set_max_source_requests_per_second(77);
+    api.set_source_filter(std::move(source_filter));
+    api.set_destination(std::move(destination));
+    api.set_unsupported_schema_feature_policy(
+      proto::admin::unsupported_schema_feature_policy::remove);
+    api.set_paused(true);
+
+    auto& sr_options = req.get_shadow_link()
+                         .get_configurations()
+                         .get_schema_registry_sync_options();
+    sr_options.set_shadow_schema_registry_api(std::move(api));
+
+    auto now = model::to_time_point(model::timestamp::now());
+    auto md = admin::convert_create_to_metadata(std::move(req));
+
+    EXPECT_FALSE(md.configuration.schema_registry_sync_cfg.is_topic_mode());
+    const auto* mode = md.configuration.schema_registry_sync_cfg.api_mode();
+    ASSERT_NE(mode, nullptr);
+
+    const auto& sr_api = *mode;
+    EXPECT_EQ(sr_api.is_enabled, cluster_link::model::enabled_t::no);
+    EXPECT_EQ(sr_api.source_url, "https://schema-registry.example.com");
+    ASSERT_TRUE(sr_api.auth_config.has_value());
+    ASSERT_TRUE(
+      std::holds_alternative<
+        cluster_link::model::schema_registry_sync_config::basic_auth>(
+        *sr_api.auth_config));
+    const auto& auth
+      = std::get<cluster_link::model::schema_registry_sync_config::basic_auth>(
+        *sr_api.auth_config);
+    EXPECT_EQ(auth.username, "sr-api-key");
+    EXPECT_EQ(auth.password, "sr-api-secret");
+    auto pwd_updated = model::to_time_point(auth.password_last_updated);
+    EXPECT_GE(pwd_updated, now - 5s);
+    EXPECT_LE(pwd_updated, now + 5s);
+
+    EXPECT_TRUE(sr_api.tls_enabled);
+    ASSERT_TRUE(sr_api.ca.has_value());
+    ASSERT_TRUE(
+      std::holds_alternative<cluster_link::model::tls_file_path>(*sr_api.ca));
+    EXPECT_EQ(
+      std::get<cluster_link::model::tls_file_path>(*sr_api.ca)(),
+      "/etc/redpanda/sr-ca.crt");
+    ASSERT_TRUE(sr_api.cert.has_value());
+    ASSERT_TRUE(
+      std::holds_alternative<cluster_link::model::tls_file_path>(*sr_api.cert));
+    EXPECT_EQ(
+      std::get<cluster_link::model::tls_file_path>(*sr_api.cert)(),
+      "/etc/redpanda/sr-client.crt");
+    ASSERT_TRUE(sr_api.key.has_value());
+    ASSERT_TRUE(
+      std::holds_alternative<cluster_link::model::tls_file_path>(*sr_api.key));
+    EXPECT_EQ(
+      std::get<cluster_link::model::tls_file_path>(*sr_api.key)(),
+      "/etc/redpanda/sr-client.key");
+
+    EXPECT_EQ(sr_api.tail_interval, 17s);
+    EXPECT_EQ(sr_api.full_sync_interval, 7min);
+    EXPECT_EQ(sr_api.max_source_requests_per_second, 77);
+    EXPECT_EQ(
+      sr_api.filter.contexts, chunked_vector<ss::sstring>({".", ".prod"}));
+    EXPECT_EQ(
+      sr_api.filter.subjects,
+      chunked_vector<ss::sstring>({"orders-value", ":.prod:payments-value"}));
+
+    ASSERT_TRUE(sr_api.destination.has_value());
+    ASSERT_TRUE(
+      std::holds_alternative<cluster_link::model::schema_registry_sync_config::
+                               exact_context_mapping>(*sr_api.destination));
+    const auto& exact = std::get<
+      cluster_link::model::schema_registry_sync_config::exact_context_mapping>(
+      *sr_api.destination);
+    ASSERT_EQ(exact.mappings.size(), 1);
+    auto prod = exact.mappings.find(".prod");
+    ASSERT_NE(prod, exact.mappings.end());
+    EXPECT_EQ(prod->second, ".shadow-prod");
+    EXPECT_EQ(
+      sr_api.feature_policy,
+      cluster_link::model::schema_registry_sync_config::
+        unsupported_feature_policy::remove);
+}
+
+// The proto contract requires every source context to have exactly one
+// destination mapping; the model stores mappings keyed by source, so a
+// duplicate source in the request must be rejected rather than silently
+// collapsed.
+TEST(converter_test, create_with_duplicate_exact_context_mapping_rejected) {
+    auto req = create_base_link();
+
+    proto::admin::schema_registry_context_map first;
+    first.set_source(".prod");
+    first.set_destination(".shadow-prod");
+    proto::admin::schema_registry_context_map duplicate;
+    duplicate.set_source(".prod");
+    duplicate.set_destination(".other-prod");
+    chunked_vector<proto::admin::schema_registry_context_map> mappings;
+    mappings.emplace_back(std::move(first));
+    mappings.emplace_back(std::move(duplicate));
+    proto::admin::schema_registry_exact_context_mappings exact_mappings;
+    exact_mappings.set_mappings(std::move(mappings));
+    proto::admin::schema_registry_context_destination destination;
+    destination.set_exact(std::move(exact_mappings));
+
+    proto::admin::schema_registry_sync_options_shadow_schema_registry_api api;
+    api.set_source_url("https://schema-registry.example.com");
+    api.set_destination(std::move(destination));
+
+    req.get_shadow_link()
+      .get_configurations()
+      .get_schema_registry_sync_options()
+      .set_shadow_schema_registry_api(std::move(api));
+
+    EXPECT_THROW(
+      admin::convert_create_to_metadata(std::move(req)),
+      serde::pb::rpc::invalid_argument_exception);
+}
+
+// The proto contract requires each source context to map to a distinct
+// destination context. Two distinct sources mapping to the same destination
+// would merge unrelated source contexts in the destination Schema Registry, so
+// the request must be rejected.
+TEST(converter_test, create_with_colliding_exact_destination_rejected) {
+    auto req = create_base_link();
+
+    proto::admin::schema_registry_context_map prod;
+    prod.set_source(".prod");
+    prod.set_destination(".shared");
+    proto::admin::schema_registry_context_map staging;
+    staging.set_source(".staging");
+    staging.set_destination(".shared");
+    chunked_vector<proto::admin::schema_registry_context_map> mappings;
+    mappings.emplace_back(std::move(prod));
+    mappings.emplace_back(std::move(staging));
+    proto::admin::schema_registry_exact_context_mappings exact_mappings;
+    exact_mappings.set_mappings(std::move(mappings));
+    proto::admin::schema_registry_context_destination destination;
+    destination.set_exact(std::move(exact_mappings));
+
+    proto::admin::schema_registry_sync_options_shadow_schema_registry_api api;
+    api.set_source_url("https://schema-registry.example.com");
+    api.set_destination(std::move(destination));
+
+    req.get_shadow_link()
+      .get_configurations()
+      .get_schema_registry_sync_options()
+      .set_shadow_schema_registry_api(std::move(api));
+
+    EXPECT_THROW(
+      admin::convert_create_to_metadata(std::move(req)),
+      serde::pb::rpc::invalid_argument_exception);
+}
+
+TEST(converter_test, create_with_schema_registry_api_sync_options_invalid) {
+    {
+        auto req = create_base_link();
+        proto::admin::schema_registry_sync_options_shadow_schema_registry_api
+          api;
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options();
+        api.set_tail_interval(absl::Seconds(-1));
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options();
+        api.set_full_sync_interval(absl::Seconds(-1));
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options();
+        api.set_max_source_requests_per_second(-1);
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options();
+        api.set_unsupported_schema_feature_policy(
+          static_cast<proto::admin::unsupported_schema_feature_policy>(123));
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options(
+          ss::sstring{}, ss::sstring{"sr-api-secret"});
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options(
+          "sr-api-key", ss::sstring{});
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+    {
+        auto req = create_base_link();
+        auto api = create_schema_registry_api_options();
+        proto::common::tls_file_settings file_settings;
+        file_settings.set_cert_path("/etc/redpanda/sr-client.crt");
+        proto::common::tls_settings tls_settings;
+        tls_settings.set_tls_file_settings(std::move(file_settings));
+        api.set_tls_settings(std::move(tls_settings));
+        req.get_shadow_link()
+          .get_configurations()
+          .get_schema_registry_sync_options()
+          .set_shadow_schema_registry_api(std::move(api));
+
+        EXPECT_THROW(
+          admin::convert_create_to_metadata(std::move(req)),
+          serde::pb::rpc::invalid_argument_exception);
+    }
+}
+
+TEST(converter_test, update_schema_registry_basic_auth_preserves_password) {
+    auto password_last_updated = model::timestamp{1759193250080};
+    auto current_md = create_metadata_with_schema_registry_api_basic_auth(
+      "old-password", password_last_updated);
+    auto req = create_schema_registry_api_update(
+      create_schema_registry_api_options("sr-api-key", std::nullopt));
+
+    auto update_cmd = admin::create_update_cluster_link_config_cmd(
+      std::move(req), copy_metadata_for_update(current_md));
+
+    const auto* api
+      = update_cmd.link_config.schema_registry_sync_cfg.api_mode();
+    ASSERT_NE(api, nullptr);
+    ASSERT_TRUE(api->auth_config.has_value());
+    const auto& basic
+      = std::get<cluster_link::model::schema_registry_sync_config::basic_auth>(
+        *api->auth_config);
+    EXPECT_EQ(basic.username, "sr-api-key");
+    EXPECT_EQ(basic.password, "old-password");
+    EXPECT_EQ(basic.password_last_updated, password_last_updated);
+}
+
+TEST(
+  converter_test,
+  update_schema_registry_basic_auth_preserves_timestamp_for_same_password) {
+    auto password_last_updated = model::timestamp{1759193250080};
+    auto current_md = create_metadata_with_schema_registry_api_basic_auth(
+      "old-password", password_last_updated);
+    auto req = create_schema_registry_api_update(
+      create_schema_registry_api_options(
+        "sr-api-key", ss::sstring{"old-password"}));
+
+    auto update_cmd = admin::create_update_cluster_link_config_cmd(
+      std::move(req), copy_metadata_for_update(current_md));
+
+    const auto* api
+      = update_cmd.link_config.schema_registry_sync_cfg.api_mode();
+    ASSERT_NE(api, nullptr);
+    ASSERT_TRUE(api->auth_config.has_value());
+    const auto& basic
+      = std::get<cluster_link::model::schema_registry_sync_config::basic_auth>(
+        *api->auth_config);
+    EXPECT_EQ(basic.password, "old-password");
+    EXPECT_EQ(basic.password_last_updated, password_last_updated);
+}
+
+TEST(
+  converter_test,
+  update_schema_registry_basic_auth_updates_timestamp_for_changed_password) {
+    auto current_md = create_metadata_with_schema_registry_api_basic_auth(
+      "old-password", model::timestamp{1759193250080});
+    auto req = create_schema_registry_api_update(
+      create_schema_registry_api_options(
+        "sr-api-key", ss::sstring{"new-password"}));
+
+    auto now = model::to_time_point(model::timestamp::now());
+    auto update_cmd = admin::create_update_cluster_link_config_cmd(
+      std::move(req), copy_metadata_for_update(current_md));
+
+    const auto* api
+      = update_cmd.link_config.schema_registry_sync_cfg.api_mode();
+    ASSERT_NE(api, nullptr);
+    ASSERT_TRUE(api->auth_config.has_value());
+    const auto& basic
+      = std::get<cluster_link::model::schema_registry_sync_config::basic_auth>(
+        *api->auth_config);
+    EXPECT_EQ(basic.password, "new-password");
+    auto pwd_updated = model::to_time_point(basic.password_last_updated);
+    EXPECT_GE(pwd_updated, now - 5s);
+    EXPECT_LE(pwd_updated, now + 5s);
+}
+
+TEST(converter_test, metadata_to_shadow_link_schema_registry_api_options) {
+    auto uuid = uuid_t::create();
+    auto md = ss::make_lw_shared<cluster_link::model::metadata>();
+    md->name = cluster_link::model::name_t{"test-link"};
+    md->uuid = cluster_link::model::uuid_t(uuid);
+    md->connection.bootstrap_servers = {
+      net::unresolved_address("localhost", 9092)};
+    cluster_link::model::schema_registry_sync_config::shadow_schema_registry_api
+      api;
+    api.source_url = "https://schema-registry.example.com";
+    api.auth_config
+      = cluster_link::model::schema_registry_sync_config::basic_auth{
+        .username = "sr-api-key",
+        .password = "sr-api-secret",
+        .password_last_updated = model::timestamp{1759193250080}};
+    api.tls_enabled
+      = cluster_link::model::connection_config::tls_enabled_t::yes;
+    api.ca = cluster_link::model::tls_file_path{"/etc/redpanda/sr-ca.crt"};
+    api.cert = cluster_link::model::tls_file_path{
+      "/etc/redpanda/sr-client.crt"};
+    api.key = cluster_link::model::tls_file_path{"/etc/redpanda/sr-client.key"};
+    api.tail_interval = 17s;
+    api.full_sync_interval = 7min;
+    api.max_source_requests_per_second = 77;
+    api.filter.contexts = {".", ".prod"};
+    api.filter.subjects = {"orders-value", ":.prod:payments-value"};
+    api.destination = cluster_link::model::schema_registry_sync_config::
+      identity_context_mapping{};
+    api.feature_policy = cluster_link::model::schema_registry_sync_config::
+      unsupported_feature_policy::remove;
+    api.is_enabled = cluster_link::model::enabled_t::no;
+    md->configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
+
+    auto sl = admin::metadata_to_shadow_link(std::move(md), {});
+
+    const auto& options
+      = sl.get_configurations().get_schema_registry_sync_options();
+    ASSERT_TRUE(options.has_shadow_schema_registry_api());
+    const auto& proto_api = options.get_shadow_schema_registry_api();
+    EXPECT_TRUE(proto_api.get_paused());
+    EXPECT_EQ(
+      proto_api.get_source_url(), "https://schema-registry.example.com");
+    ASSERT_TRUE(proto_api.get_auth_options().has_basic());
+    EXPECT_EQ(
+      proto_api.get_auth_options().get_basic().get_username(), "sr-api-key");
+    EXPECT_TRUE(
+      proto_api.get_auth_options().get_basic().get_password().empty());
+    EXPECT_TRUE(proto_api.get_auth_options().get_basic().get_password_set());
+    EXPECT_EQ(
+      proto_api.get_auth_options().get_basic().get_password_set_at(),
+      absl::FromUnixMillis(1759193250080));
+
+    ASSERT_TRUE(proto_api.has_tls_settings());
+    ASSERT_TRUE(proto_api.get_tls_settings().has_tls_file_settings());
+    const auto& tls_file_settings
+      = proto_api.get_tls_settings().get_tls_file_settings();
+    EXPECT_TRUE(proto_api.get_tls_settings().get_enabled());
+    EXPECT_EQ(tls_file_settings.get_ca_path(), "/etc/redpanda/sr-ca.crt");
+    EXPECT_EQ(tls_file_settings.get_cert_path(), "/etc/redpanda/sr-client.crt");
+    EXPECT_EQ(tls_file_settings.get_key_path(), "/etc/redpanda/sr-client.key");
+
+    EXPECT_EQ(proto_api.get_tail_interval(), absl::Seconds(17));
+    EXPECT_EQ(proto_api.get_effective_tail_interval(), absl::Seconds(17));
+    EXPECT_EQ(proto_api.get_full_sync_interval(), absl::Minutes(7));
+    EXPECT_EQ(proto_api.get_effective_full_sync_interval(), absl::Minutes(7));
+    EXPECT_EQ(proto_api.get_max_source_requests_per_second(), 77);
+    EXPECT_EQ(proto_api.get_effective_max_source_requests_per_second(), 77);
+    EXPECT_EQ(
+      proto_api.get_source_filter().get_contexts(),
+      chunked_vector<ss::sstring>({".", ".prod"}));
+    EXPECT_EQ(
+      proto_api.get_source_filter().get_subjects(),
+      chunked_vector<ss::sstring>({"orders-value", ":.prod:payments-value"}));
+    EXPECT_TRUE(proto_api.get_destination().has_identity());
+    EXPECT_EQ(
+      proto_api.get_unsupported_schema_feature_policy(),
+      proto::admin::unsupported_schema_feature_policy::remove);
+
+    // No task status report was supplied, so no sync is running: current_sync
+    // must be absent rather than materialized as an empty (UNSPECIFIED) sync.
+    EXPECT_FALSE(
+      sl.get_status().get_schema_registry_sync_status().has_current_sync());
+}
+
+namespace {
+
+cluster_link::model::task_status_report sr_task_report(
+  cluster_link::model::task_state state,
+  cluster_link::model::schema_registry_sync_status sr) {
+    cluster_link::model::task_status_report report;
+    report.task_name = "Schema Registry Shadowing";
+    report.task_state = state;
+    report.detail = cluster_link::model::task_detail{
+      .schema_registry_sync_status = std::move(sr)};
+    return report;
+}
+
+cluster_link::model::shadow_link_status_report sr_status_report(
+  chunked_vector<cluster_link::model::task_status_report> reports) {
+    cluster_link::model::shadow_link_status_report report;
+    report.task_status_reports.emplace(
+      ss::sstring{"Schema Registry Shadowing"}, std::move(reports));
+    return report;
+}
+
+ss::lw_shared_ptr<cluster_link::model::metadata> sr_api_metadata() {
+    auto md = ss::make_lw_shared<cluster_link::model::metadata>();
+    md->name = cluster_link::model::name_t{"test-link"};
+    md->uuid = cluster_link::model::uuid_t(uuid_t::create());
+    cluster_link::model::schema_registry_sync_config::shadow_schema_registry_api
+      api;
+    api.source_url = "https://schema-registry.example.com";
+    md->configuration.schema_registry_sync_cfg.sync_mode = std::move(api);
+    return md;
+}
+
+} // namespace
+
+TEST(converter_test, metadata_to_shadow_link_schema_registry_sync_status) {
+    cluster_link::model::schema_registry_sync_status sr;
+    sr.inventory.selected_source_subjects = 3;
+    sr.inventory.selected_source_subject_versions = 7;
+    sr.inventory.destination_subjects = 2;
+    sr.inventory.destination_subject_versions = 5;
+    sr.current_sync = cluster_link::model::schema_registry_current_sync{
+      .sync_type = cluster_link::model::schema_registry_sync_type::full,
+      .summary = {}};
+    sr.current_sync->summary.start_time = model::timestamp{1000};
+    sr.last_full_sync = cluster_link::model::schema_registry_sync_summary{};
+    sr.last_full_sync->start_time = model::timestamp{2000};
+    sr.last_full_sync->finish_time = model::timestamp{3000};
+    sr.last_full_sync->subject_versions_changed = 9;
+    sr.last_full_sync->errors = 1;
+    sr.totals_since_task_start.subject_versions_changed = 42;
+    sr.totals_since_task_start.errors = 2;
+    sr.last_error_message = "boom";
+
+    chunked_vector<cluster_link::model::task_status_report> reports;
+    reports.push_back(
+      sr_task_report(cluster_link::model::task_state::active, std::move(sr)));
+    auto sl = admin::metadata_to_shadow_link(
+      sr_api_metadata(), sr_status_report(std::move(reports)));
+
+    const auto& proto = sl.get_status().get_schema_registry_sync_status();
+
+    const auto& inv = proto.get_inventory();
+    EXPECT_EQ(inv.get_selected_source_subjects(), 3);
+    EXPECT_EQ(inv.get_selected_source_subject_versions(), 7);
+    EXPECT_EQ(inv.get_destination_subjects(), 2);
+    EXPECT_EQ(inv.get_destination_subject_versions(), 5);
+
+    // A running full sync must report as present and carry its real sync_type
+    // (not the UNSPECIFIED default a materialized-empty current_sync carries).
+    ASSERT_TRUE(proto.has_current_sync());
+    EXPECT_EQ(
+      proto.get_current_sync().get_sync_type(),
+      proto::admin::schema_registry_sync_type::full);
+    EXPECT_TRUE(proto.get_current_sync().get_summary().has_start_time());
+    EXPECT_EQ(
+      proto.get_current_sync().get_summary().get_start_time(),
+      absl::FromUnixMillis(1000));
+    // The sync is still running, so its summary has no finish_time.
+    EXPECT_FALSE(proto.get_current_sync().get_summary().has_finish_time());
+
+    ASSERT_TRUE(proto.has_last_full_sync());
+    EXPECT_TRUE(proto.get_last_full_sync().has_start_time());
+    EXPECT_EQ(
+      proto.get_last_full_sync().get_start_time(), absl::FromUnixMillis(2000));
+    EXPECT_TRUE(proto.get_last_full_sync().has_finish_time());
+    EXPECT_EQ(
+      proto.get_last_full_sync().get_finish_time(), absl::FromUnixMillis(3000));
+    EXPECT_EQ(proto.get_last_full_sync().get_subject_versions_changed(), 9);
+    EXPECT_EQ(proto.get_last_full_sync().get_errors(), 1);
+
+    // Cumulative totals are always present but never carry a finish_time.
+    EXPECT_FALSE(proto.get_totals_since_task_start().has_finish_time());
+    EXPECT_EQ(
+      proto.get_totals_since_task_start().get_subject_versions_changed(), 42);
+    EXPECT_EQ(proto.get_totals_since_task_start().get_errors(), 2);
+
+    EXPECT_EQ(proto.get_last_error_message(), "boom");
+}
+
+// A parked task that has never synced must report current_sync and
+// last_full_sync as absent, not as present-but-empty. Regression test for the
+// admin proto materializing unset singular message fields (pre-`optional`).
+TEST(converter_test, metadata_to_shadow_link_schema_registry_sync_status_idle) {
+    cluster_link::model::schema_registry_sync_status sr;
+    sr.inventory.selected_source_subjects = 1;
+    // A fresh task instance stamps only the cumulative start time.
+    sr.totals_since_task_start.start_time = model::timestamp{1000};
+
+    chunked_vector<cluster_link::model::task_status_report> reports;
+    reports.push_back(
+      sr_task_report(cluster_link::model::task_state::active, std::move(sr)));
+    auto sl = admin::metadata_to_shadow_link(
+      sr_api_metadata(), sr_status_report(std::move(reports)));
+
+    const auto& proto = sl.get_status().get_schema_registry_sync_status();
+
+    EXPECT_FALSE(proto.has_current_sync());
+    EXPECT_FALSE(proto.has_last_full_sync());
+    EXPECT_TRUE(proto.get_totals_since_task_start().has_start_time());
+    EXPECT_FALSE(proto.get_totals_since_task_start().has_finish_time());
+}
+
+// The SR task runs only on the _schemas/0 leader shard; reports are aggregated
+// across shards/nodes. A stopped (non-leader) report must never shadow the
+// leader's real status in the admin response.
+TEST(
+  converter_test,
+  metadata_to_shadow_link_schema_registry_status_prefers_leader) {
+    cluster_link::model::schema_registry_sync_status leader_status;
+    leader_status.totals_since_task_start.subject_versions_changed = 5;
+
+    chunked_vector<cluster_link::model::task_status_report> reports;
+    // Stopped report first, so a naive "first with value" would pick it.
+    reports.push_back(
+      sr_task_report(cluster_link::model::task_state::stopped, {}));
+    reports.push_back(sr_task_report(
+      cluster_link::model::task_state::active, std::move(leader_status)));
+    auto sl = admin::metadata_to_shadow_link(
+      sr_api_metadata(), sr_status_report(std::move(reports)));
+
+    EXPECT_EQ(
+      sl.get_status()
+        .get_schema_registry_sync_status()
+        .get_totals_since_task_start()
+        .get_subject_versions_changed(),
+      5);
+}
 
 TEST(converter_test, test_convert_timestamp) {
     {
@@ -1539,4 +2312,88 @@ TEST(converter_test, timestamp_to_string) {
                     .get_start_at_timestamp();
         EXPECT_EQ(absl::FromUnixMillis(1759193250080), ts);
     }
+}
+
+TEST(converter_test, metadata_to_shadow_link_roles) {
+    auto md = ss::make_lw_shared<cluster_link::model::metadata>();
+    md->configuration.role_sync_cfg.task_interval = 45s;
+    md->configuration.role_sync_cfg.role_name_filters.push_back(
+      cluster_link::model::resource_name_filter_pattern{
+        .pattern_type = cluster_link::model::filter_pattern_type::prefix,
+        .filter = cluster_link::model::filter_type::include,
+        .pattern = "analytics-"});
+
+    auto sl = admin::metadata_to_shadow_link(std::move(md), {});
+
+    const auto& role_sync = sl.get_configurations().get_role_sync_options();
+    EXPECT_EQ(role_sync.get_interval(), absl::Seconds(45));
+    EXPECT_EQ(role_sync.get_paused(), false);
+    ASSERT_EQ(role_sync.get_role_name_filters().size(), 1);
+
+    const auto& filter = role_sync.get_role_name_filters()[0];
+    EXPECT_EQ(filter.get_pattern_type(), proto::admin::pattern_type::prefix);
+    EXPECT_EQ(filter.get_filter_type(), proto::admin::filter_type::include);
+    EXPECT_EQ(filter.get_name(), "analytics-");
+}
+
+TEST(converter_test, shadow_link_to_metadata_roles) {
+    proto::admin::create_shadow_link_request req;
+    auto& shadow_link = req.get_shadow_link();
+    shadow_link.set_name("test-link");
+
+    auto& configs = shadow_link.get_configurations();
+    configs.get_client_options().set_bootstrap_servers({"localhost:9092"});
+
+    auto& role_sync = configs.get_role_sync_options();
+    role_sync.set_interval(absl::Seconds(45));
+    role_sync.set_paused(true);
+
+    auto& filter = role_sync.get_role_name_filters().emplace_back();
+    filter.set_pattern_type(proto::admin::pattern_type::prefix);
+    filter.set_filter_type(proto::admin::filter_type::include);
+    filter.set_name("analytics-");
+
+    auto md = admin::convert_create_to_metadata(std::move(req));
+
+    const auto& role_sync_cfg = md.configuration.role_sync_cfg;
+    EXPECT_EQ(role_sync_cfg.get_task_interval(), 45s);
+    EXPECT_FALSE(role_sync_cfg.is_enabled);
+    ASSERT_EQ(role_sync_cfg.role_name_filters.size(), 1);
+
+    const auto& filter_pattern = role_sync_cfg.role_name_filters[0];
+    EXPECT_EQ(
+      filter_pattern.pattern_type,
+      cluster_link::model::filter_pattern_type::prefix);
+    EXPECT_EQ(filter_pattern.filter, cluster_link::model::filter_type::include);
+    EXPECT_EQ(filter_pattern.pattern, "analytics-");
+}
+
+TEST(converter_test, update_shadow_link_role_sync) {
+    cluster_link::model::metadata current_md;
+    current_md.name = cluster_link::model::name_t{"test-link"};
+    current_md.uuid = cluster_link::model::uuid_t{uuid_t::create()};
+    current_md.connection.bootstrap_servers = {
+      net::unresolved_address("localhost", 9092)};
+    admin::set_client_id(current_md);
+
+    proto::admin::update_shadow_link_request req;
+    req.get_shadow_link()
+      .get_configurations()
+      .get_role_sync_options()
+      .set_interval(absl::Seconds(90));
+    req.get_update_mask().paths.push_back(
+      serde::pb::field_mask::path{
+        "configurations", "role_sync_options", "interval"});
+
+    auto update_cmd = admin::create_update_cluster_link_config_cmd(
+      std::move(req),
+      ss::make_lw_shared<cluster_link::model::metadata>({
+        .name = current_md.name,
+        .uuid = current_md.uuid,
+        .connection = current_md.connection,
+        .configuration = current_md.configuration.copy(),
+      }));
+
+    EXPECT_EQ(update_cmd.connection, current_md.connection);
+    EXPECT_EQ(update_cmd.link_config.role_sync_cfg.get_task_interval(), 90s);
 }

@@ -296,7 +296,6 @@ struct offset_stats {
 struct log_append_config {
     using fsync = ss::bool_class<class skip_tag>;
     fsync should_fsync;
-    model::timeout_clock::time_point timeout;
 };
 struct append_result {
     log_clock::time_point append_time;
@@ -462,7 +461,8 @@ struct local_log_reader_config {
     /// `timestamp > batch.header().max_timestamp`.
     std::optional<model::timestamp> timestamp;
 
-    /// abort source for read operations
+    /// abort source for read operations. aborts the segment range lock
+    /// acquisition in make_reader and ends the stream of an existing reader.
     model::opt_abort_source_t abort_source;
 
     model::opt_client_address_t client_address;

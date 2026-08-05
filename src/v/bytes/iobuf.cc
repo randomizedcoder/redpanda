@@ -48,7 +48,7 @@ iobuf iobuf::copy() const {
 iobuf iobuf_copy(iobuf::iterator_consumer& in, size_t len) {
     iobuf ret;
 
-    int bytes_left = len;
+    size_t bytes_left = len;
     while (bytes_left) {
         ss::temporary_buffer<char> buf(
           details::io_allocation_size::ss_next_allocation_size(bytes_left));
@@ -305,8 +305,7 @@ iobuf::placeholder iobuf::reserve(size_t sz) {
 }
 
 ss::sstring iobuf::linearize_to_string() const {
-    constexpr static size_t max_size = 128_KiB;
-    if (size_bytes() > max_size) {
+    if (size_bytes() > max_linearize_size) {
         throw std::runtime_error(
           fmt::format("string too big: {}", size_bytes()));
     }

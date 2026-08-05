@@ -29,6 +29,7 @@ def data_dependency():
         patches = [
             "//bazel/thirdparty:avro-snappy-includes.patch",
             "//bazel/thirdparty:avro-fmt-const.patch",
+            "//bazel/thirdparty:avro-libcxx-includes.patch",
         ],
         patch_args = ["-p1"],
     )
@@ -78,12 +79,12 @@ def data_dependency():
     http_archive(
         name = "krb5",
         build_file = "//bazel/thirdparty:krb5.BUILD",
-        sha256 = "2157d92020d408ed63ebcd886a92d1346a1383b0f91123a0473b4f69b4a24861",
-        strip_prefix = "krb5-krb5-1.21.3-final",
-        url = "https://github.com/krb5/krb5/archive/refs/tags/krb5-1.21.3-final.tar.gz",
+        sha256 = "289f5bb81d1f2f8d5eecebe56a056aeed95d35fd9bb4a7071c5dd7ad4b3fe888",
+        strip_prefix = "krb5-krb5-1.22.2-final",
+        url = "https://github.com/krb5/krb5/archive/refs/tags/krb5-1.22.2-final.tar.gz",
         patches = [
-            "//bazel/thirdparty:0001-Fix-two-unlikely-memory-leaks.patch",
             "//bazel/thirdparty:0002-Fix-two-NegoEx-parsing-vulnerabilities.patch",
+            "//bazel/thirdparty:0003-Fix-build-when-KRB5_DNS_LOOKUP-isnt-defined.patch",
         ],
         patch_args = ["-p1"],
     )
@@ -131,9 +132,9 @@ def data_dependency():
         build_file = "//bazel/thirdparty:openssl.BUILD",
         patches = ["//bazel/thirdparty:openssl-reproducible-buildinf.patch"],
         patch_args = ["-p1"],
-        sha256 = "deae7c80cba99c4b4f940ecadb3c3338b13cb77418409238e57d7f31f2a3b736",
-        strip_prefix = "openssl-3.5.6",
-        url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.6.tar.gz",
+        sha256 = "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8",
+        strip_prefix = "openssl-3.5.7",
+        url = "https://vectorized-public.s3.amazonaws.com/dependencies/openssl-3.5.7.tar.gz",
     )
 
     http_archive(
@@ -147,9 +148,9 @@ def data_dependency():
     http_archive(
         name = "rapidjson",
         build_file = "//bazel/thirdparty:rapidjson.BUILD",
-        sha256 = "d085ef6d175d9b20800958c695c7767d65f9c1985a73d172150e57e84f6cd61c",
-        strip_prefix = "rapidjson-14a5dd756e9bef26f9b53d3b4eb1b73c6a1794d5",
-        url = "https://github.com/redpanda-data/rapidjson/archive/14a5dd756e9bef26f9b53d3b4eb1b73c6a1794d5.tar.gz",
+        sha256 = "bb6805bfb8d5491b7ba77019dda08ddb0912b853399409bbf8a74d8357581c9c",
+        strip_prefix = "rapidjson-a47f8d7379e9d1dfbac415e7d8ccece605275e5b",
+        url = "https://github.com/redpanda-data/rapidjson/archive/a47f8d7379e9d1dfbac415e7d8ccece605275e5b.tar.gz",
     )
 
     http_archive(
@@ -160,13 +161,13 @@ def data_dependency():
         url = "https://github.com/redpanda-data/CRoaring/archive/c433d1c70c10fb2e40f049e019e2abbcafa6e69d.tar.gz",
     )
 
-    # branch: v26.2.x
+    # branch: v26.3.x
     http_archive(
         name = "seastar",
         build_file = "//bazel/thirdparty:seastar.BUILD",
-        sha256 = "d2a4816aa75e1c8eacdd78265e7461bd2e3885f0daf30904e5d1fb638ceda37c",
-        strip_prefix = "seastar-9de2b0b3a75a78ace41d06ea8b24ad12bfbb0186",
-        url = "https://github.com/redpanda-data/seastar/archive/9de2b0b3a75a78ace41d06ea8b24ad12bfbb0186.tar.gz",
+        sha256 = "5918f72ec59c159a8d2fe36870e7d30c6e61426fde766d7dd6853fa7f9871f7f",
+        strip_prefix = "seastar-a6ac2ff6190a4a9dce5059991355703e1073d11f",
+        url = "https://github.com/redpanda-data/seastar/archive/a6ac2ff6190a4a9dce5059991355703e1073d11f.tar.gz",
     )
 
     http_archive(

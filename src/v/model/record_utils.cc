@@ -225,7 +225,9 @@ void append_record_to_buffer(iobuf& a, const model::record& r) {
     append_vint_to_iobuf(a, r.timestamp_delta());
     append_vint_to_iobuf(a, r.offset_delta());
 
-    a.reserve_memory(r.key_size() + r.value_size());
+    auto key_bytes = std::max(r.key_size(), 0);
+    auto val_bytes = std::max(r.value_size(), 0);
+    a.reserve_memory(key_bytes + val_bytes);
     append_vint_to_iobuf(a, r.key_size());
     if (r.key_size() > 0) {
         for (auto& f : r.key()) {
@@ -256,6 +258,35 @@ void append_record_to_buffer(iobuf& a, const model::record& r) {
             }
         }
     }
+}
+
+model::record_key_metadata parse_record_key_from_buffer(iobuf_const_parser& p) {
+    [[maybe_unused]] auto [record_size, attr] = parse_record_meta_from_buffer(
+      p);
+    [[maybe_unused]] auto [timestamp_delta, tv] = p.read_varlong();
+    auto [offset_delta, ov] = p.read_varlong();
+    auto [key_length, kv] = p.read_varlong();
+    bytes key;
+    if (key_length > 0) {
+        key = p.read_bytes(static_cast<size_t>(key_length));
+    }
+    auto [value_length, vv] = p.read_varlong();
+    const bool is_tombstone = value_length < 0;
+    // record_size covers attributes(1) + the four varints + key + value +
+    // headers; we've consumed up to and including value_length, so the rest is
+    // the value bytes plus the (skipped) headers.
+    const int64_t header_and_key_bytes = 1 + tv + ov + kv
+                                         + std::max<int64_t>(key_length, 0)
+                                         + vv;
+    if (record_size < header_and_key_bytes) [[unlikely]] {
+        throw std::out_of_range(
+          fmt::format(
+            "Record size {} smaller than parsed header+key bytes {}",
+            record_size,
+            header_and_key_bytes));
+    }
+    p.skip(static_cast<size_t>(record_size - header_and_key_bytes));
+    return {static_cast<int32_t>(offset_delta), is_tombstone, std::move(key)};
 }
 
 model::record_metadata parse_record_metadata_from_buffer(

@@ -31,11 +31,13 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/generate"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/group"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/k8s"
 	plugincmd "github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/plugin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/profile"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/registry"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/security"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/shadow"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/sql"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/topic"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/transform"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version"
@@ -142,6 +144,7 @@ Use --print-tree to emit the full command tree as JSON.`,
 		container.NewCommand(fs, p),
 		check.NewCommand(fs, p, osExec),
 		connect.NewCommand(fs, p, osExec),
+		k8s.NewCommand(fs, p, osExec),
 		profile.NewCommand(fs, p),
 		debug.NewCommand(fs, p),
 		generate.NewCommand(fs, p),
@@ -150,6 +153,7 @@ Use --print-tree to emit the full command tree as JSON.`,
 		registry.NewCommand(fs, p),
 		security.NewCommand(fs, p),
 		shadow.NewCommand(fs, p),
+		sql.NewCommand(fs, p),
 		topic.NewCommand(fs, p),
 		transform.NewCommand(fs, p, osExec),
 		versioncmd.NewCommand(fs, p),

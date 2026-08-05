@@ -189,6 +189,7 @@ simple_metastore::get_offsets(
     return offsets_response{
       .start_offset = prt.start_offset,
       .next_offset = prt.next_offset,
+      .migrating = prt.migrating,
     };
 }
 
@@ -312,6 +313,22 @@ simple_metastore::set_start_offset(
     co_return std::expected<void, metastore::errc>{};
 }
 
+ss::future<std::expected<void, metastore::errc>>
+simple_metastore::set_migrating(
+  const model::topic_id_partition& tp, bool migrating) {
+    auto update_res = set_migrating_update::build(state_, tp, migrating);
+    if (!update_res.has_value()) {
+        vlog(cd_log.debug, "set_migrating failed: {}", update_res.error());
+        co_return std::unexpected(metastore::errc::invalid_request);
+    }
+    auto apply_res = update_res->apply(state_);
+    vassert(
+      apply_res.has_value(),
+      "Apply must succeed if can_apply() is true: {}",
+      apply_res.error());
+    co_return std::expected<void, metastore::errc>{};
+}
+
 ss::future<std::expected<metastore::topic_removal_response, metastore::errc>>
 simple_metastore::remove_topics(const chunked_vector<model::topic_id>& topics) {
     auto update_res = remove_topics_update::build(state_, topics.copy());
@@ -369,6 +386,8 @@ simple_metastore::get_first_ge(
           .object_size = object_size,
           .first_offset = it->base_offset,
           .last_offset = it->last_offset,
+          .imported = to_imported_ts_info(
+            object_it->second.imported_ts_location, it->imported_ts_info),
         };
     }
     return std::unexpected(metastore::errc::out_of_range);
@@ -409,6 +428,8 @@ simple_metastore::get_first_ge(
               .object_size = object_size,
               .first_offset = obj.base_offset,
               .last_offset = obj.last_offset,
+              .imported = to_imported_ts_info(
+                object_it->second.imported_ts_location, obj.imported_ts_info),
             };
         }
     }
@@ -526,6 +547,13 @@ simple_metastore::get_term_for_offset(
     }
     auto last_le_it = std::prev(first_gt_it);
     return last_le_it->term_id;
+}
+
+ss::future<std::expected<void, metastore::errc>>
+simple_metastore::commit_compaction_metadata(
+  const compaction_map_t& compaction_metas) {
+    co_return co_await compact_objects(
+      chunked_vector<object_metadata>{}, compaction_metas);
 }
 
 ss::future<std::expected<void, metastore::errc>>
@@ -822,6 +850,9 @@ simple_metastore::get_leveling_info(
         }
         const auto base = std::max(ext.base_offset, prt.start_offset);
         builder.process_extent(base, ext.last_offset, ext.len);
+        if (builder.is_full()) {
+            break;
+        }
     }
     resp.ranges = std::move(builder).finalize();
     return resp;
@@ -902,6 +933,8 @@ simple_metastore::get_extent_metadata_forwards(
               .oid = ext.oid,
               .footer_pos = object_it->second.footer_pos,
               .object_size = object_it->second.object_size,
+              .imported = to_imported_ts_info(
+                object_it->second.imported_ts_location, ext.imported_ts_info),
             };
         }
 

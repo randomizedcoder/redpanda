@@ -49,6 +49,14 @@ func TestValidateParsedShadowLinkConfig(t *testing.T) {
 			expectedErr: "at least one bootstrap server is required",
 		},
 		{
+			name: "self-hosted config - omitted client options",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				// No ClientOptions block at all; must not panic.
+			},
+			expectedErr: "at least one bootstrap server is required",
+		},
+		{
 			name: "both TLS file and PEM settings",
 			config: &ShadowLinkConfig{
 				Name: "test-link",
@@ -217,6 +225,100 @@ func TestValidateParsedShadowLinkConfig(t *testing.T) {
 				},
 			},
 		},
+		// Schema registry validation tests
+		{
+			name: "both schema registry shadowing modes set",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryTopic: &ShadowSchemaRegistryTopic{},
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+					},
+				},
+			},
+			expectedErr: "only one of shadow_schema_registry_topic or shadow_schema_registry_api can be provided",
+		},
+		{
+			name: "schema registry API - both TLS file and PEM settings",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						TLSSettings: &TLSSettings{
+							TLSFileSettings: &TLSFileSettings{CAPath: "/path/to/ca"},
+							TLSPEMSettings:  &TLSPEMSettings{CA: "pem-content"},
+						},
+					},
+				},
+			},
+			expectedErr: "only one of schema registry API TLS file settings or PEM settings can be provided",
+		},
+		{
+			name: "schema registry API - both destination mappings set",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						Destination: &SchemaRegistryContextDestination{
+							Identity: &SchemaRegistryIdentityContextMapping{},
+							Exact: &SchemaRegistryExactContextMappings{
+								Mappings: []*SchemaRegistryContextMap{
+									{Source: ".", Destination: ".shadow"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErr: "only one of schema registry destination identity or exact can be provided",
+		},
+		{
+			name: "valid config - schema registry API mode",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						AuthOptions: &SchemaRegistryAuthOptions{
+							Basic: &HTTPBasicAuthOptions{Username: "u", Password: "p"},
+						},
+						Destination: &SchemaRegistryContextDestination{
+							Identity: &SchemaRegistryIdentityContextMapping{},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid config - self-hosted with role sync",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				RoleSyncOptions: &RoleSyncOptions{
+					Interval: 30 * time.Second,
+					RoleNameFilters: []*NameFilter{
+						{PatternType: PatternTypePrefix, FilterType: FilterTypeInclude, Name: "team-"},
+					},
+				},
+			},
+		},
 		// Cloud-specific validation tests
 		{
 			name: "cloud config - missing shadow_redpanda_id",
@@ -242,6 +344,24 @@ func TestValidateParsedShadowLinkConfig(t *testing.T) {
 				},
 			},
 			expectedErr: "shadow_redpanda_id and source_redpanda_id cannot be the same",
+		},
+		{
+			name: "cloud config - role sync not allowed",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				CloudOptions: &CloudShadowLinkOptions{
+					ShadowRedpandaID: "shadow-cluster",
+				},
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				RoleSyncOptions: &RoleSyncOptions{
+					RoleNameFilters: []*NameFilter{
+						{PatternType: PatternTypeLiteral, FilterType: FilterTypeInclude, Name: "*"},
+					},
+				},
+			},
+			expectedErr: "role sync options are not yet supported for Redpanda Cloud shadow links",
 		},
 		{
 			name: "cloud config - TLS file settings not allowed",
@@ -300,6 +420,128 @@ func TestValidateParsedShadowLinkConfig(t *testing.T) {
 				},
 			},
 			expectedErr: "cloud shadow links don't support plain TLS keys",
+		},
+		{
+			name: "cloud config - schema registry API plain password not allowed",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				CloudOptions: &CloudShadowLinkOptions{
+					ShadowRedpandaID: "shadow-cluster",
+				},
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						AuthOptions: &SchemaRegistryAuthOptions{
+							Basic: &HTTPBasicAuthOptions{
+								Username: "user",
+								Password: "plain-password-not-allowed",
+							},
+						},
+					},
+				},
+			},
+			expectedErr: "cloud shadow links don't support plain passwords",
+		},
+		{
+			name: "cloud config - schema registry API plain tls key not allowed",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				CloudOptions: &CloudShadowLinkOptions{
+					ShadowRedpandaID: "shadow-cluster",
+				},
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						TLSSettings: &TLSSettings{
+							Enabled: true,
+							TLSPEMSettings: &TLSPEMSettings{
+								Key: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+							},
+						},
+					},
+				},
+			},
+			expectedErr: "cloud shadow links don't support plain TLS keys",
+		},
+		{
+			name: "cloud config - schema registry API TLS file settings not allowed",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				CloudOptions: &CloudShadowLinkOptions{
+					ShadowRedpandaID: "shadow-cluster",
+				},
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						TLSSettings: &TLSSettings{
+							Enabled:         true,
+							TLSFileSettings: &TLSFileSettings{CAPath: "/path/to/ca.crt"},
+						},
+					},
+				},
+			},
+			expectedErr: "schema registry API TLS file settings are not supported when using cloud options",
+		},
+		{
+			name: "cloud config - schema registry API plain password with omitted client options",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				CloudOptions: &CloudShadowLinkOptions{
+					ShadowRedpandaID: "shadow-cluster",
+				},
+				// No ClientOptions block; the SR-API secret check must still run.
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						AuthOptions: &SchemaRegistryAuthOptions{
+							Basic: &HTTPBasicAuthOptions{
+								Username: "user",
+								Password: "plain-password-not-allowed",
+							},
+						},
+					},
+				},
+			},
+			expectedErr: "cloud shadow links don't support plain passwords",
+		},
+		{
+			name: "valid cloud config - schema registry API with secrets",
+			config: &ShadowLinkConfig{
+				Name: "test-link",
+				CloudOptions: &CloudShadowLinkOptions{
+					ShadowRedpandaID: "shadow-cluster",
+				},
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr:8081",
+						AuthOptions: &SchemaRegistryAuthOptions{
+							Basic: &HTTPBasicAuthOptions{
+								Username: "user",
+								Password: "${secrets.SR_PASSWORD}",
+							},
+						},
+						TLSSettings: &TLSSettings{
+							Enabled: true,
+							TLSPEMSettings: &TLSPEMSettings{
+								CA:  "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+								Key: "${secrets.SR_TLS_KEY}",
+							},
+						},
+					},
+				},
+			},
 		},
 		{
 			name: "valid cloud config - with secrets store password",

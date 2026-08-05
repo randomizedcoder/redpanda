@@ -3,6 +3,19 @@ load("//bazel:build.bzl", "redpanda_cc_library")
 package(default_visibility = ["//src/v/cloud_topics/level_one:__subpackages__"])
 
 redpanda_cc_library(
+    name = "compaction_queue",
+    hdrs = [
+        "compaction_queue.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/cloud_topics/level_one/maintenance:keyed_priority_queue",
+        "//src/v/cloud_topics/level_one/maintenance:meta",
+        "//src/v/model",
+    ],
+)
+
+redpanda_cc_library(
     name = "compaction_filter",
     srcs = [
         "compaction_filter.cc",
@@ -16,6 +29,7 @@ redpanda_cc_library(
     deps = [
         "//src/v/cloud_topics/level_one/metastore:offset_interval_set",
         "//src/v/compaction:filter",
+        "//src/v/compaction:key",
         "//src/v/compaction:key_offset_map",
         "//src/v/compaction:utils",
         "//src/v/model",
@@ -40,7 +54,7 @@ redpanda_cc_library(
         ":compaction_filter",
         "//src/v/bytes",
         "//src/v/bytes:iostream",
-        "//src/v/cloud_io:scheduler_types",
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/cloud_topics:log_reader_config",
         "//src/v/cloud_topics/level_one/common:abstract_io",
         "//src/v/cloud_topics/level_one/common:object",
@@ -54,6 +68,7 @@ redpanda_cc_library(
         "//src/v/cloud_topics/level_one/metastore:extent_metadata_reader",
         "//src/v/cloud_topics/level_one/metastore:offset_interval_set",
         "//src/v/cloud_topics/level_one/metastore:retry",
+        "//src/v/cloud_topics/level_zero/notifier:level_zero_notifier",
         "//src/v/compaction:key",
         "//src/v/compaction:key_offset_map",
         "//src/v/compaction:reducer",

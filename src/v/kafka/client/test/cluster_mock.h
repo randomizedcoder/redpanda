@@ -120,6 +120,14 @@ public:
         _broker_api_versions[id].insert_or_assign(key, range);
     }
 
+    void remove_supported_version(model::node_id id, api_key key) {
+        if (
+          auto it = _broker_api_versions.find(id);
+          it != _broker_api_versions.end()) {
+            it->second.erase(key);
+        }
+    }
+
     void add_topic(
       model::topic topic_name,
       size_t partition_count,
@@ -146,7 +154,10 @@ public:
         _controller_id = id;
     }
 
-    config::configuration& mock_config() { return _mock_config; }
+    config::configuration& mock_config() {
+        vassert(_mock_config, "_mock_config is null.");
+        return *_mock_config;
+    }
 
     void set_cluster_authorized_operations(cluster_authorized_operations ops) {
         _cluster_authorized_operations = ops;
@@ -194,7 +205,7 @@ private:
       _broker_api_versions;
     chunked_hash_map<model::topic, topic_metadata> _topics;
 
-    config::configuration _mock_config;
+    std::unique_ptr<config::configuration> _mock_config{nullptr};
 
     security::acl_store _acl_store;
 

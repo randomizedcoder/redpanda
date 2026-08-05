@@ -19,12 +19,14 @@
 #include "features/feature_table.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
-#include "storage/api.h"
+#include "storage/ntp_config.h"
 #include "utils/directory_walker.h"
 
 #include <seastar/core/seastar.hh>
 
 #include <chrono>
+#include <optional>
+#include <vector>
 
 using model::node_id;
 using std::vector;
@@ -33,16 +35,25 @@ namespace cluster {
 
 cluster_discovery::cluster_discovery(
   const model::node_uuid& node_uuid,
-  storage::api& storage,
+  std::optional<model::cluster_uuid> cluster_uuid,
   ss::abort_source& as)
   : _node_uuid(node_uuid)
+  , _cluster_uuid(std::move(cluster_uuid))
   , _join_retry_jitter(config::shard_local_cfg().join_retry_timeout_ms())
   , _join_timeout(std::chrono::seconds(2))
-  , _storage(storage)
   , _as(as) {}
 
-ss::future<cluster_discovery::registration_result>
-cluster_discovery::register_with_cluster() {
+ss::future<std::optional<cluster_discovery::registration_result>>
+cluster_discovery::register_with_cluster(join_retry_policy policy) {
+    if (policy == join_retry_policy::require_existing_cluster) {
+        // Skip founder discovery: this path assumes a cluster already exists
+        // (e.g. a wiped seed rejoining, taking the fast joiner path). Make a
+        // single bounded registration pass; a nullopt result means no seed
+        // answered, so the caller can defer to the authoritative founder
+        // handshake once every broker's RPC server is up.
+        co_return co_await dispatch_node_uuid_registration_to_seeds();
+    }
+
     // Initialize cluster founder state, in case we are starting a new cluster.
     // This will validate our configured node ID if we are a cluster founder.
     bool is_founder = co_await is_cluster_founder();
@@ -115,7 +126,7 @@ ss::future<bool> cluster_discovery::is_cluster_founder() {
         }
         _founding_brokers = brokers{make_self_broker(config::node())};
         _node_ids_by_uuid = node_ids_by_uuid{
-          {_storage.node_uuid(), _founding_brokers.front().id()}};
+          {_node_uuid, _founding_brokers.front().id()}};
         _is_cluster_founder = true;
         co_return *_is_cluster_founder;
     }
@@ -135,8 +146,12 @@ cluster_discovery::node_ids_by_uuid& cluster_discovery::get_node_ids_by_uuid() {
 ss::future<std::optional<cluster_discovery::registration_result>>
 cluster_discovery::dispatch_node_uuid_registration_to_seeds() {
     const auto& seed_servers = config::node().seed_servers();
+    const auto self_addr = config::node().advertised_rpc_api();
     auto self = make_self_broker(config::node());
     for (const auto& s : seed_servers) {
+        if (s.addr == self_addr) {
+            continue;
+        }
         vlog(
           clusterlog.info,
           "Requesting node ID {} for node UUID {} from {}",
@@ -209,15 +224,93 @@ cluster_discovery::dispatch_node_uuid_registration_to_seeds() {
     co_return std::nullopt;
 }
 
+ss::future<std::optional<iobuf>>
+cluster_discovery::fetch_controller_snapshot_from_leader(
+  const std::vector<model::broker>& peers) {
+    constexpr auto fetch_timeout = std::chrono::seconds(2);
+    for (const auto& broker : peers) {
+        const auto& addr = broker.rpc_address();
+        vlog(
+          clusterlog.info,
+          "Fetching controller snapshot from {} ({})",
+          broker.id(),
+          addr);
+        result<fetch_controller_snapshot_reply> r(
+          fetch_controller_snapshot_reply{});
+        try {
+            r = co_await do_with_client_one_shot<controller_client_protocol>(
+              addr,
+              config::node().rpc_server_tls(),
+              fetch_timeout,
+              rpc::transport_version::v2,
+              [fetch_timeout](controller_client_protocol c) {
+                  return c
+                    .fetch_controller_snapshot(
+                      fetch_controller_snapshot_request{
+                        features::feature_table::get_earliest_logical_version(),
+                        features::feature_table::get_latest_logical_version()},
+                      rpc::client_opts(rpc::clock_type::now() + fetch_timeout))
+                    .then(&rpc::get_ctx_data<fetch_controller_snapshot_reply>);
+              });
+        } catch (...) {
+            vlog(
+              clusterlog.warn,
+              "Error fetching controller snapshot from {} ({}), retrying: {}",
+              broker.id(),
+              addr,
+              std::current_exception());
+            continue;
+        }
+        if (r.has_error()) {
+            vlog(
+              clusterlog.warn,
+              "Error fetching controller snapshot from {} ({}): {}, retrying",
+              broker.id(),
+              addr,
+              r.error().message());
+            continue;
+        }
+        auto& reply = r.value();
+        if (!reply.controller_snapshot.has_value()) {
+            vlog(
+              clusterlog.debug,
+              "Peer {} ({}) not ready to produce controller snapshot, trying "
+              "next peer",
+              broker.id(),
+              addr);
+            continue;
+        }
+        co_return std::move(reply.controller_snapshot);
+    }
+    co_return std::nullopt;
+}
+
+ss::future<result<cluster_bootstrap_info_reply>>
+cluster_discovery::request_cluster_bootstrap_info_attempt(
+  net::unresolved_address addr, std::chrono::milliseconds timeout) const {
+    return do_with_client_one_shot<cluster_bootstrap_client_protocol>(
+      addr,
+      config::node().rpc_server_tls(),
+      timeout,
+      rpc::transport_version::v2,
+      [timeout](cluster_bootstrap_client_protocol c) {
+          return c
+            .cluster_bootstrap_info(
+              cluster_bootstrap_info_request{},
+              rpc::client_opts(rpc::clock_type::now() + timeout))
+            .then(&rpc::get_ctx_data<cluster_bootstrap_info_reply>);
+      });
+}
+
 ss::future<cluster_bootstrap_info_reply>
 cluster_discovery::request_cluster_bootstrap_info_single(
   net::unresolved_address addr) const {
     vlog(clusterlog.info, "Requesting cluster bootstrap info from {}", addr);
     _as.check();
+    static constexpr auto cluster_bootstrap_info_timeout = std::chrono::seconds(
+      2);
     auto repeat_jitter = simple_time_jitter<model::timeout_clock>(1s);
     while (true) {
-        result<cluster_bootstrap_info_reply> reply_result(
-          std::errc::connection_refused);
         if (_is_cluster_founder.has_value()) {
             // Another fiber detected the presence of a cluster. Just exit
             // early.
@@ -228,19 +321,8 @@ cluster_discovery::request_cluster_bootstrap_info_single(
             co_return cluster_bootstrap_info_reply{};
         }
         try {
-            reply_result = co_await do_with_client_one_shot<
-              cluster_bootstrap_client_protocol>(
-              addr,
-              config::node().rpc_server_tls(),
-              2s,
-              rpc::transport_version::v2,
-              [](cluster_bootstrap_client_protocol c) {
-                  return c
-                    .cluster_bootstrap_info(
-                      cluster_bootstrap_info_request{},
-                      rpc::client_opts(rpc::clock_type::now() + 2s))
-                    .then(&rpc::get_ctx_data<cluster_bootstrap_info_reply>);
-              });
+            auto reply_result = co_await request_cluster_bootstrap_info_attempt(
+              addr, cluster_bootstrap_info_timeout);
             if (reply_result) {
                 vlog(
                   clusterlog.info,
@@ -350,7 +432,7 @@ ss::future<> cluster_discovery::discover_founding_brokers() {
         _is_cluster_founder = false;
         co_return;
     }
-    if (_storage.get_cluster_uuid().has_value()) {
+    if (_cluster_uuid.has_value()) {
         _is_cluster_founder = false;
         co_return;
     }
@@ -449,7 +531,7 @@ ss::future<> cluster_discovery::discover_founding_brokers() {
             vassert(
               broker.id() != model::unassigned_node_id,
               "Should have been assigned before");
-            node_uuid = _storage.node_uuid();
+            node_uuid = _node_uuid;
         } else {
             cluster::cluster_bootstrap_info_reply& reply = replies[seed.addr];
 

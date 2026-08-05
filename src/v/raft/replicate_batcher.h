@@ -12,6 +12,7 @@
 #pragma once
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 #include "base/outcome.h"
 #include "container/chunked_vector.h"
 #include "raft/types.h"
@@ -83,6 +84,7 @@ public:
         ss::optimized_optional<ss::abort_source::subscription> _abort_sub;
     };
     using item_ptr = ss::lw_shared_ptr<item>;
+    using notifications_t = absl::InlinedVector<item_ptr, 5>;
     explicit replicate_batcher(consensus* ptr, size_t cache_size);
 
     replicate_batcher(replicate_batcher&&) noexcept = default;
@@ -100,16 +102,13 @@ public:
 
 private:
     ss::future<> do_flush(
-      std::vector<item_ptr>,
+      notifications_t,
       append_entries_request,
       std::vector<ssx::semaphore_units>,
       absl::flat_hash_map<vnode, follower_req_seq>);
 
-    ss::future<item_ptr>
-      do_cache(chunked_vector<model::record_batch>, replicate_options);
-
     ss::future<replicate_batcher::item_ptr> do_cache_with_backpressure(
-      chunked_vector<model::record_batch>, size_t, replicate_options);
+      chunked_vector<model::record_batch>, replicate_options);
 
     ss::future<result<replicate_result>> cache_and_wait_for_result(
       ss::promise<> enqueued,

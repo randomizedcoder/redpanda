@@ -54,6 +54,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <expected>
 #include <iterator>
 #include <optional>
 #include <ranges>
@@ -205,11 +206,37 @@ void consensus::setup_metrics() {
 }
 
 void consensus::setup_public_metrics() {
+    namespace sm = ss::metrics;
+
     if (config::shard_local_cfg().disable_public_metrics()) {
         return;
     }
 
     _probe->setup_public_metrics(_log->config().ntp());
+
+    // Expose the leadership gauge for the controller group on the public
+    // endpoint so external consumers can identify the controller leader.
+    // Restricted to the controller to avoid a per-partition public series for
+    // every raft group.
+    if (_log->config().ntp() != model::controller_ntp) {
+        return;
+    }
+
+    // Public metrics carry redpanda_-prefixed label names, unlike the internal
+    // (bare) labels used by setup_metrics.
+    const auto& ntp = _log->config().ntp();
+    auto labels = {
+      metrics::make_namespaced_label("namespace")(ntp.ns()),
+      metrics::make_namespaced_label("topic")(ntp.tp.topic()),
+      metrics::make_namespaced_label("partition")(ntp.tp.partition())};
+    _public_metrics.add_group(
+      prometheus_sanitize::metrics_name("raft"),
+      {sm::make_gauge(
+         "leader_for",
+         [this] { return is_elected_leader(); },
+         sm::description("Indicates if this node is the controller leader"),
+         labels)
+         .aggregate({sm::shard_label})});
 }
 
 void consensus::do_step_down(std::string_view ctx) {
@@ -1306,6 +1333,7 @@ consensus::interrupt_configuration_change(model::revision_id revision, Func f) {
 
 ss::future<std::error_code>
 consensus::cancel_configuration_change(model::revision_id revision) {
+    auto holder = _bg.hold();
     vlog(
       _ctxlog.info,
       "requested cancellation of current configuration change - {}",
@@ -1353,7 +1381,8 @@ consensus::cancel_configuration_change(model::revision_id revision) {
               }
           }
           return ss::make_ready_future<std::error_code>(ec);
-      });
+      })
+      .finally([holder = std::move(holder)] {});
 }
 
 ss::future<std::error_code>
@@ -1414,6 +1443,61 @@ ss::future<std::error_code> consensus::force_replace_configuration_locally(
         co_return errc::shutting_down;
     }
     co_return errc::success;
+}
+
+ss::future<std::expected<ssx::semaphore_units, std::error_code>>
+consensus::acquire_op_lock_units() {
+    return _op_lock.get_units()
+      .then([](ssx::semaphore_units u) {
+          return std::expected<ssx::semaphore_units, std::error_code>(
+            std::move(u));
+      })
+      .handle_exception_type([](const ss::broken_semaphore&) {
+          return std::expected<ssx::semaphore_units, std::error_code>(
+            std::unexpected(make_error_code(errc::shutting_down)));
+      });
+}
+
+ss::future<std::error_code> consensus::force_replace_configuration_replicated(
+  std::vector<vnode> voters,
+  std::vector<vnode> learners,
+  model::revision_id new_revision) {
+    auto holder = _bg.hold();
+    auto u = co_await acquire_op_lock_units();
+    if (!u) {
+        co_return u.error();
+    }
+    if (!is_elected_leader()) {
+        co_return errc::not_leader;
+    }
+    // Deliberately skip the configuration_change_in_progress guard used by
+    // change_configuration: this replaces whatever configuration is current,
+    // including an in-flight one, by replicating a fresh configuration.
+    auto new_cfg = group_configuration(
+      std::move(voters), std::move(learners), new_revision);
+    vlog(
+      _ctxlog.info,
+      "Force replacing configuration (replicated) with: {}",
+      new_cfg);
+    // If this node is replicating a configuration that removes itself from the
+    // voter set, it must step down once the configuration is replicated so a
+    // remaining voter can take over leadership.
+    const bool self_removed = !new_cfg.is_voter(_self);
+    auto ec = co_await replicate_configuration(
+      std::move(u.value()), std::move(new_cfg));
+    if (ec || !self_removed) {
+        co_return ec;
+    }
+    auto units = co_await acquire_op_lock_units();
+    if (!units) {
+        co_return units.error();
+    }
+    vlog(
+      _ctxlog.info,
+      "Stepping down: forced reconfiguration removed this node from the voter "
+      "set");
+    do_step_down("forced-reconfiguration-self-removed");
+    co_return ec;
 }
 
 void consensus::try_updating_configuration_version(group_configuration& cfg) {
@@ -2026,6 +2110,8 @@ consensus::do_append_entries(append_entries_request&& r) {
     // follower (§5.2)
     maybe_update_leader(r.source_node());
 
+    auto refresh_hbeat = ss::defer([this] { _hbeat = clock_type::now(); });
+
     // raft.pdf: Reply false if log doesn’t contain an entry at
     // prevLogIndex whose term matches prevLogTerm (§5.3)
     // broken into 3 sections
@@ -2281,11 +2367,6 @@ consensus::do_append_entries(append_entries_request&& r) {
     // success. copy entries for each subsystem
 
     try {
-        auto deferred = ss::defer([this] {
-            // we do not want to include our disk flush latency into
-            // the leader vote timeout
-            _hbeat = clock_type::now();
-        });
         validate_offset_translator_delta(request_metadata, lstats);
 
         // simulate disk error
@@ -2949,30 +3030,12 @@ ss::future<storage::append_result> consensus::disk_append(
     auto cfg = storage::log_append_config{
       // no fsync explicit on a per write, we verify at the end to
       // batch fsync
-      storage::log_append_config::fsync::no,
-      model::timeout_clock::now() + _disk_timeout()};
-
-    class consumer {
-    public:
-        consumer(storage::log_appender appender)
-          : _appender(std::move(appender)) {}
-
-        ss::future<ss::stop_iteration> operator()(model::record_batch& batch) {
-            auto ret = co_await _appender(batch);
-            co_return ret;
-        }
-
-        auto end_of_stream() { return _appender.end_of_stream(); }
-
-    private:
-        storage::log_appender _appender;
-    };
+      storage::log_append_config::fsync::no};
 
     return details::for_each_ref_extract_configuration(
              _log->offsets().dirty_offset,
-             model::make_chunked_memory_record_batch_reader(std::move(batches)),
-             consumer(_log->make_appender(cfg)),
-             cfg.timeout)
+             std::move(batches),
+             _log->make_appender(cfg))
       .then([this, should_update_last_quorum_idx](
               std::tuple<ret_t, chunked_vector<offset_configuration>> t) {
           auto& [ret, configurations] = t;
@@ -3100,6 +3163,7 @@ consensus::next_followers_request_seq() {
 }
 
 ss::future<> consensus::refresh_commit_index() {
+    auto holder = _bg.hold();
     return _op_lock.get_units()
       .then([this](ssx::semaphore_units u) mutable {
           auto f = ss::now();
@@ -3116,7 +3180,8 @@ ss::future<> consensus::refresh_commit_index() {
       })
       .handle_exception_type([](const ss::broken_semaphore&) {
           // ignore exception, shutting down
-      });
+      })
+      .finally([holder = std::move(holder)] {});
 }
 
 void consensus::maybe_update_leader_commit_idx() {
@@ -3141,25 +3206,35 @@ void consensus::maybe_update_leader_commit_idx() {
  * state transition is decided and executed
  */
 ss::future<> consensus::maybe_commit_configuration(ssx::semaphore_units u) {
+    // The checks here are synchronous and almost always conclude that there
+    // is nothing to do (a stable, simple configuration), so perform them
+    // before allocating a coroutine frame for the rare transition handling.
+
     // we are not a leader, do nothing
     if (_vstate != vote_state::leader) {
-        co_return;
+        return ss::now();
     }
 
-    auto latest_offset = _configuration_manager.get_latest_offset();
     // no configurations were committed
-    if (latest_offset > _commit_index) {
-        co_return;
+    if (_configuration_manager.get_latest_offset() > _commit_index) {
+        return ss::now();
     }
 
+    const auto& committed_cfg = _configuration_manager.get_latest();
+    // current config still contains learners, do nothing
+    if (unlikely(!committed_cfg.current_config().learners.empty())) {
+        return ss::now();
+    }
+    if (committed_cfg.get_state() == configuration_state::simple) {
+        return ss::now();
+    }
+
+    return do_commit_configuration_transition(std::move(u));
+}
+
+ss::future<>
+consensus::do_commit_configuration_transition(ssx::semaphore_units u) {
     auto latest_cfg = _configuration_manager.get_latest();
-
-    /**
-     * current config still contains learners, do nothing
-     */
-    if (unlikely(!latest_cfg.current_config().learners.empty())) {
-        co_return;
-    }
     switch (latest_cfg.get_state()) {
     case configuration_state::simple:
         co_return;

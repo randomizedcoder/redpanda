@@ -290,6 +290,7 @@ void application::wire_up_runtime_services(
       &controller->get_security_frontend(),
       &_kafka_data_rpc_client,
       &id_allocator_frontend,
+      _schema_registry.get(),
       smp_service_groups.cluster_link_smp_sg(),
       scheduling_groups::instance().cluster_linking_sg())
       .get();
@@ -313,6 +314,10 @@ void application::wire_up_runtime_services(
       config::node().cloud_storage_cache_path().string());
     construct_single_service(
       _host_metrics_watcher, std::ref(_log), data_dir, cache_dir);
+
+    // Expose cloud instance info as metrics (detected in the background).
+    construct_single_service(_instance_metrics, std::ref(_as.local()));
+    _instance_metrics->start();
 
     construct_service(_kafka_connections_service, std::ref(_kafka_server.ref()))
       .get();

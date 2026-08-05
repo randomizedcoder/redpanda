@@ -14,10 +14,12 @@
 #include "cloud_topics/level_one/metastore/leveling_range_builder.h"
 #include "cloud_topics/level_one/metastore/metastore_manifest.h"
 #include "cloud_topics/level_one/metastore/offset_interval_set.h"
+#include "cloud_topics/level_one/metastore/state.h"
 #include "container/chunked_hash_map.h"
 #include "container/chunked_vector.h"
 #include "model/fundamental.h"
 #include "model/timestamp.h"
+#include "serde/rw/optional.h"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -100,6 +102,12 @@ public:
         // The last offset available in the object (inclusive).
         // This can be used to skip to the next offset.
         kafka::offset last_offset;
+        // Set for an imported tiered-storage segment; nullopt for native L1.
+        // Recomposed from the storage split for the read path: ts_path from the
+        // object row, segment_term from the extent row, and the Kafka offset
+        // bounds from the extent (see extent_object_info, which is the
+        // authoritative read-side carrier -- object_response relays it).
+        std::optional<imported_ts_info> imported;
     };
 
     // Interface to build object metadata for the L1 metastore. Meant to be
@@ -154,6 +162,9 @@ public:
     struct offsets_response {
         kafka::offset start_offset;
         kafka::offset next_offset;
+        // True while mid tiered->cloud migration; for offline/remote consumers.
+        // false for a native cloud topic.
+        bool migrating{};
     };
     virtual ss::future<
       std::expected<std::unique_ptr<object_metadata_builder>, errc>>
@@ -211,6 +222,12 @@ public:
     // Moves the start offset of the given partition's log to the given offset.
     virtual ss::future<std::expected<void, errc>>
     set_start_offset(const model::topic_id_partition&, kafka::offset) = 0;
+
+    // Sets the partition's migration phase. Monotonic (none -> migrating ->
+    // complete) and idempotent; a backward transition is rejected. Creates the
+    // partition's metastore entry if absent.
+    virtual ss::future<std::expected<void, errc>>
+    set_migrating(const model::topic_id_partition&, bool) = 0;
 
     struct topic_removal_response {
         // Topic IDs that were not removed from the metastore and still have
@@ -368,6 +385,15 @@ public:
     virtual ss::future<std::expected<void, errc>> compact_objects(
       const object_metadata_builder&, const compaction_map_t&) = 0;
 
+    // Commits compaction metadata without any object replacements: the
+    // cleaned ranges, tombstone-removal ranges, and one epoch bump. Used by
+    // jobs that installed their output objects incrementally via partial
+    // compact_objects() commits (objects with an empty compaction update,
+    // each of which bumped the epoch), so the expected epoch here is the one
+    // the job's own partial commits advanced.
+    virtual ss::future<std::expected<void, errc>>
+    commit_compaction_metadata(const compaction_map_t&) = 0;
+
     // All the information required to query a `compaction_info_response` from
     // the metastore. Parameters are used for call to `get_compaction_info()`.
     struct compaction_info_spec {
@@ -485,6 +511,8 @@ public:
         object_id oid;
         size_t footer_pos{0};
         size_t object_size{0};
+        // Set for an imported tiered-storage segment; nullopt for native L1.
+        std::optional<imported_ts_info> imported;
     };
 
     struct extent_metadata {
@@ -496,16 +524,21 @@ public:
 
         fmt::iterator format_to(fmt::iterator it) const {
             if (object_info.has_value()) {
-                return fmt::format_to(
+                it = fmt::format_to(
                   it,
                   "{{offsets:({}~{}), max_timestamp:{}, oid:{}, "
-                  "footer_pos:{}, object_size:{}}}",
+                  "footer_pos:{}, object_size:{}",
                   base_offset,
                   last_offset,
                   max_timestamp,
                   object_info->oid,
                   object_info->footer_pos,
                   object_info->object_size);
+                if (object_info->imported) {
+                    it = fmt::format_to(
+                      it, ", ts_path:{}", object_info->imported->ts_path);
+                }
+                return fmt::format_to(it, "}}");
             }
             return fmt::format_to(
               it,

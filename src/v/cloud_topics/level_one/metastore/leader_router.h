@@ -94,6 +94,9 @@ public:
     ss::future<rpc::set_start_offset_reply> set_start_offset(
       rpc::set_start_offset_request, local_only = local_only::no);
 
+    ss::future<rpc::set_migrating_reply>
+      set_migrating(rpc::set_migrating_request, local_only = local_only::no);
+
     ss::future<rpc::remove_topics_reply>
       remove_topics(rpc::remove_topics_request, local_only = local_only::no);
 
@@ -133,8 +136,6 @@ public:
 private:
     using proto_t = cloud_topics::l1::rpc::impl::l1_rpc_client_protocol;
     using client = cloud_topics::l1::rpc::impl::l1_rpc_client_protocol;
-
-    static constexpr std::chrono::seconds rpc_timeout{5};
 
     // utilities for boiler plate RPC code.
 
@@ -208,6 +209,11 @@ private:
 
     ss::future<rpc::set_start_offset_reply> set_start_offset_locally(
       rpc::set_start_offset_request,
+      const model::ntp& metastore_ntp,
+      ss::shard_id);
+
+    ss::future<rpc::set_migrating_reply> set_migrating_locally(
+      rpc::set_migrating_request,
       const model::ntp& metastore_ntp,
       ss::shard_id);
 

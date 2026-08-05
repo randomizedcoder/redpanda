@@ -67,11 +67,23 @@ public:
     /// Get the last reconciled log offset from the ctp_stm state
     model::offset get_last_reconciled_log_offset() const;
 
+    /// Get threshold offset for local readers
+    kafka::offset get_min_allowed_local_threshold() const;
+
+    /// Replicate an advance_reconciled_offset_cmd, optionally combined with
+    /// a set_min_allowed_local_threshold_cmd in the same record batch so
+    /// both advance atomically. The min_allowed_local_threshold is used by
+    /// the reconciler to move the local-read floor over placeholder-backed
+    /// ranges it has reconciled into L1: once the floor passes them, reads
+    /// are served from L1 and the placeholders' L0 objects may be safely
+    /// garbage-collected. Values that do not advance the current floor are
+    /// ignored.
     ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
     advance_reconciled_offset(
       kafka::offset last_reconciled_offset,
       model::timeout_clock::time_point deadline,
-      ss::abort_source& as);
+      ss::abort_source& as,
+      std::optional<kafka::offset> min_allowed_local_threshold = std::nullopt);
 
     ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
     set_start_offset(
@@ -79,11 +91,13 @@ public:
       model::timeout_clock::time_point deadline,
       ss::abort_source& as);
 
-    /// Replicate a set_allowed_local_start_offset_cmd. The STM stores the
-    /// value as a hint for prefix_truncate_below_lro.
+    /// Replicate a set_min_allowed_local_threshold_cmd to advance the
+    /// compaction floor consumed by the prefix-truncate loop (the tiered_cloud
+    /// retention path). The floor is monotonic; replication is skipped when
+    /// `value` does not advance it.
     ss::future<std::expected<std::monostate, ctp_stm_api_errc>>
-    set_allowed_local_start_offset(
-      std::optional<kafka::offset> value,
+    set_min_allowed_local_threshold(
+      kafka::offset value,
       model::timeout_clock::time_point deadline,
       ss::abort_source& as);
 

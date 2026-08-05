@@ -21,6 +21,7 @@
 #include "kafka/server/fetch_memory_units.h"
 #include "kafka/server/fetch_metadata_cache.h"
 #include "kafka/server/fetch_pid_controller.h"
+#include "kafka/server/fetch_read_coalescer.h"
 #include "kafka/server/fetch_session_cache.h"
 #include "kafka/server/fwd.h"
 #include "kafka/server/handlers/fetch/replica_selector.h"
@@ -76,6 +77,7 @@ public:
       ss::sharded<cluster::id_allocator_frontend>&,
       ss::sharded<security::credential_store>&,
       ss::sharded<security::authorizer>&,
+      ss::sharded<security::role_store>&,
       ss::sharded<security::audit::audit_log_manager>&,
       ss::sharded<security::oidc::service>&,
       ss::sharded<cluster::security_frontend>&,
@@ -155,6 +157,8 @@ public:
 
     security::authorizer& authorizer() { return _authorizer.local(); }
 
+    security::role_store& role_store() { return _role_store.local(); }
+
     security::audit::audit_log_manager& audit_mgr() {
         return _audit_mgr.local();
     }
@@ -211,11 +215,11 @@ public:
 
     /**
      * \param api_names list of Kafka API names
-     * \return std::vector<bool> always sized to index the entire Kafka API key
-     * space, with true values at indexes whose names have appeared in
-     * \p api_names
+     * \return api_key_table<bool> covering both the standard and reserved
+     * Kafka API key spaces, with true values at indexes whose names have
+     * appeared in \p api_names
      */
-    static std::vector<bool>
+    static api_key_table<bool>
     convert_api_names_to_key_bitmap(const std::vector<ss::sstring>& api_names);
 
     const replica_selector& get_replica_selector() const {
@@ -234,6 +238,10 @@ public:
 
     fetch_memory_units_manager& fetch_units_manager() noexcept {
         return _fetch_units_manager;
+    }
+
+    fetch_read_coalescer& read_coalescer() noexcept {
+        return _fetch_read_coalescer;
     }
 
     ss::future<> revoke_credentials(std::string_view name);
@@ -293,6 +301,7 @@ private:
     bool _recovery_mode_enabled{false};
     ss::sharded<security::credential_store>& _credentials;
     ss::sharded<security::authorizer>& _authorizer;
+    ss::sharded<security::role_store>& _role_store;
     ss::sharded<security::audit::audit_log_manager>& _audit_mgr;
     ss::sharded<security::oidc::service>& _oidc_service;
     ss::sharded<cluster::security_frontend>& _security_frontend;
@@ -307,6 +316,7 @@ private:
     security::krb5::configurator _krb_configurator;
     ssx::semaphore _memory_fetch_sem;
     fetch_memory_units_manager _fetch_units_manager;
+    fetch_read_coalescer _fetch_read_coalescer;
 
     handler_probe_manager _handler_probes;
     metrics::internal_metric_groups _metrics;

@@ -159,6 +159,52 @@ TASK_STATE_FAULTED: TaskState.ValueType
 'Task is faulted'
 Global___TaskState: typing_extensions.TypeAlias = TaskState
 
+class _SchemaRegistrySyncType:
+    ValueType = typing.NewType('ValueType', builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _SchemaRegistrySyncTypeEnumTypeWrapper(google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_SchemaRegistrySyncType.ValueType], builtins.type):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    SCHEMA_REGISTRY_SYNC_TYPE_UNSPECIFIED: _SchemaRegistrySyncType.ValueType
+    'The Schema Registry sync type is not specified.'
+    SCHEMA_REGISTRY_SYNC_TYPE_FULL: _SchemaRegistrySyncType.ValueType
+    'A full source scan is running.'
+    SCHEMA_REGISTRY_SYNC_TYPE_TAIL: _SchemaRegistrySyncType.ValueType
+    'An incremental tail sync is running.'
+
+class SchemaRegistrySyncType(_SchemaRegistrySyncType, metaclass=_SchemaRegistrySyncTypeEnumTypeWrapper):
+    """Type of Schema Registry sync currently running."""
+SCHEMA_REGISTRY_SYNC_TYPE_UNSPECIFIED: SchemaRegistrySyncType.ValueType
+'The Schema Registry sync type is not specified.'
+SCHEMA_REGISTRY_SYNC_TYPE_FULL: SchemaRegistrySyncType.ValueType
+'A full source scan is running.'
+SCHEMA_REGISTRY_SYNC_TYPE_TAIL: SchemaRegistrySyncType.ValueType
+'An incremental tail sync is running.'
+Global___SchemaRegistrySyncType: typing_extensions.TypeAlias = SchemaRegistrySyncType
+
+class _UnsupportedSchemaFeaturePolicy:
+    ValueType = typing.NewType('ValueType', builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _UnsupportedSchemaFeaturePolicyEnumTypeWrapper(google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_UnsupportedSchemaFeaturePolicy.ValueType], builtins.type):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    UNSUPPORTED_SCHEMA_FEATURE_POLICY_UNSPECIFIED: _UnsupportedSchemaFeaturePolicy.ValueType
+    'Use the default unsupported schema feature handling behavior.'
+    UNSUPPORTED_SCHEMA_FEATURE_POLICY_FAIL: _UnsupportedSchemaFeaturePolicy.ValueType
+    'Fail the sync when an unsupported schema feature is encountered.'
+    UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE: _UnsupportedSchemaFeaturePolicy.ValueType
+    'Remove unsupported schema features before writing to the destination.'
+
+class UnsupportedSchemaFeaturePolicy(_UnsupportedSchemaFeaturePolicy, metaclass=_UnsupportedSchemaFeaturePolicyEnumTypeWrapper):
+    """Policy for handling source schema features unsupported by the destination."""
+UNSUPPORTED_SCHEMA_FEATURE_POLICY_UNSPECIFIED: UnsupportedSchemaFeaturePolicy.ValueType
+'Use the default unsupported schema feature handling behavior.'
+UNSUPPORTED_SCHEMA_FEATURE_POLICY_FAIL: UnsupportedSchemaFeaturePolicy.ValueType
+'Fail the sync when an unsupported schema feature is encountered.'
+UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE: UnsupportedSchemaFeaturePolicy.ValueType
+'Remove unsupported schema features before writing to the destination.'
+Global___UnsupportedSchemaFeaturePolicy: typing_extensions.TypeAlias = UnsupportedSchemaFeaturePolicy
+
 class _ShadowTopicState:
     ValueType = typing.NewType('ValueType', builtins.int)
     V: typing_extensions.TypeAlias = ValueType
@@ -274,18 +320,21 @@ class CreateShadowLinkRequest(google.protobuf.message.Message):
     """
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
     SHADOW_LINK_FIELD_NUMBER: builtins.int
+    VALIDATE_ONLY_FIELD_NUMBER: builtins.int
+    validate_only: builtins.bool
+    'If true, validate connection parameters without creating the link.\n    Returns an empty response on success or an error if validation fails.\n    '
 
     @property
     def shadow_link(self) -> Global___ShadowLink:
         """The shadow link to create"""
 
-    def __init__(self, *, shadow_link: Global___ShadowLink | None=...) -> None:
+    def __init__(self, *, shadow_link: Global___ShadowLink | None=..., validate_only: builtins.bool=...) -> None:
         ...
 
     def HasField(self, field_name: typing.Literal['shadow_link', b'shadow_link']) -> builtins.bool:
         ...
 
-    def ClearField(self, field_name: typing.Literal['shadow_link', b'shadow_link']) -> None:
+    def ClearField(self, field_name: typing.Literal['shadow_link', b'shadow_link', 'validate_only', b'validate_only']) -> None:
         ...
 Global___CreateShadowLinkRequest: typing_extensions.TypeAlias = CreateShadowLinkRequest
 
@@ -563,6 +612,7 @@ class ShadowLinkConfigurations(google.protobuf.message.Message):
     CONSUMER_OFFSET_SYNC_OPTIONS_FIELD_NUMBER: builtins.int
     SECURITY_SYNC_OPTIONS_FIELD_NUMBER: builtins.int
     SCHEMA_REGISTRY_SYNC_OPTIONS_FIELD_NUMBER: builtins.int
+    ROLE_SYNC_OPTIONS_FIELD_NUMBER: builtins.int
 
     @property
     def client_options(self) -> Global___ShadowLinkClientOptions:
@@ -584,13 +634,17 @@ class ShadowLinkConfigurations(google.protobuf.message.Message):
     def schema_registry_sync_options(self) -> Global___SchemaRegistrySyncOptions:
         """Schema Registry sync options"""
 
-    def __init__(self, *, client_options: Global___ShadowLinkClientOptions | None=..., topic_metadata_sync_options: Global___TopicMetadataSyncOptions | None=..., consumer_offset_sync_options: Global___ConsumerOffsetSyncOptions | None=..., security_sync_options: Global___SecuritySettingsSyncOptions | None=..., schema_registry_sync_options: Global___SchemaRegistrySyncOptions | None=...) -> None:
+    @property
+    def role_sync_options(self) -> Global___RoleSyncOptions:
+        """Role sync options"""
+
+    def __init__(self, *, client_options: Global___ShadowLinkClientOptions | None=..., topic_metadata_sync_options: Global___TopicMetadataSyncOptions | None=..., consumer_offset_sync_options: Global___ConsumerOffsetSyncOptions | None=..., security_sync_options: Global___SecuritySettingsSyncOptions | None=..., schema_registry_sync_options: Global___SchemaRegistrySyncOptions | None=..., role_sync_options: Global___RoleSyncOptions | None=...) -> None:
         ...
 
-    def HasField(self, field_name: typing.Literal['client_options', b'client_options', 'consumer_offset_sync_options', b'consumer_offset_sync_options', 'schema_registry_sync_options', b'schema_registry_sync_options', 'security_sync_options', b'security_sync_options', 'topic_metadata_sync_options', b'topic_metadata_sync_options']) -> builtins.bool:
+    def HasField(self, field_name: typing.Literal['client_options', b'client_options', 'consumer_offset_sync_options', b'consumer_offset_sync_options', 'role_sync_options', b'role_sync_options', 'schema_registry_sync_options', b'schema_registry_sync_options', 'security_sync_options', b'security_sync_options', 'topic_metadata_sync_options', b'topic_metadata_sync_options']) -> builtins.bool:
         ...
 
-    def ClearField(self, field_name: typing.Literal['client_options', b'client_options', 'consumer_offset_sync_options', b'consumer_offset_sync_options', 'schema_registry_sync_options', b'schema_registry_sync_options', 'security_sync_options', b'security_sync_options', 'topic_metadata_sync_options', b'topic_metadata_sync_options']) -> None:
+    def ClearField(self, field_name: typing.Literal['client_options', b'client_options', 'consumer_offset_sync_options', b'consumer_offset_sync_options', 'role_sync_options', b'role_sync_options', 'schema_registry_sync_options', b'schema_registry_sync_options', 'security_sync_options', b'security_sync_options', 'topic_metadata_sync_options', b'topic_metadata_sync_options']) -> None:
         ...
 Global___ShadowLinkConfigurations: typing_extensions.TypeAlias = ShadowLinkConfigurations
 
@@ -818,24 +872,279 @@ class SchemaRegistrySyncOptions(google.protobuf.message.Message):
 
         def __init__(self) -> None:
             ...
+
+    @typing.final
+    class ShadowSchemaRegistryApi(google.protobuf.message.Message):
+        """Replicates selected Schema Registry subjects, configs, modes, and schema
+        IDs over the Schema Registry HTTP API.
+        """
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+        SOURCE_URL_FIELD_NUMBER: builtins.int
+        AUTH_OPTIONS_FIELD_NUMBER: builtins.int
+        TLS_SETTINGS_FIELD_NUMBER: builtins.int
+        TAIL_INTERVAL_FIELD_NUMBER: builtins.int
+        EFFECTIVE_TAIL_INTERVAL_FIELD_NUMBER: builtins.int
+        FULL_SYNC_INTERVAL_FIELD_NUMBER: builtins.int
+        EFFECTIVE_FULL_SYNC_INTERVAL_FIELD_NUMBER: builtins.int
+        MAX_SOURCE_REQUESTS_PER_SECOND_FIELD_NUMBER: builtins.int
+        EFFECTIVE_MAX_SOURCE_REQUESTS_PER_SECOND_FIELD_NUMBER: builtins.int
+        SOURCE_FILTER_FIELD_NUMBER: builtins.int
+        DESTINATION_FIELD_NUMBER: builtins.int
+        UNSUPPORTED_SCHEMA_FEATURE_POLICY_FIELD_NUMBER: builtins.int
+        PAUSED_FIELD_NUMBER: builtins.int
+        source_url: builtins.str
+        'The source Schema Registry URL to use.'
+        max_source_requests_per_second: builtins.int
+        'Maximum request rate, in requests per second, for calls to the source\n        Schema Registry. If unset or zero, a default rate limit of 30\n        requests/s is used.\n        '
+        effective_max_source_requests_per_second: builtins.int
+        'The effective maximum request rate, in requests per second.'
+        unsupported_schema_feature_policy: Global___UnsupportedSchemaFeaturePolicy.ValueType
+        'Policy for handling source schema features unsupported by the\n        destination, such as rulesets or metadata tags. If unset, FAIL is\n        used.\n        '
+        paused: builtins.bool
+        "Allows the user to pause the Schema Registry sync task. If paused,\n        the task enters the 'paused' state and stops replicating schemas from\n        the source, and the per-context client write protection on the\n        contexts this link owns is lifted.\n        "
+
+        @property
+        def auth_options(self) -> Global___SchemaRegistryAuthOptions:
+            """Authentication settings for requests to the source Schema Registry.
+            If unset, requests are sent without authentication.
+            """
+
+        @property
+        def tls_settings(self) -> proto.redpanda.core.common.v1.tls_pb2.TLSSettings:
+            """TLS settings for requests to the source Schema Registry."""
+
+        @property
+        def tail_interval(self) -> google.protobuf.duration_pb2.Duration:
+            """Interval between incremental polls for new source subjects and
+            subject versions. If unset or zero, the cluster default of 10s is
+            used.
+            """
+
+        @property
+        def effective_tail_interval(self) -> google.protobuf.duration_pb2.Duration:
+            """The effective interval between incremental polls."""
+
+        @property
+        def full_sync_interval(self) -> google.protobuf.duration_pb2.Duration:
+            """Interval between full scans of the selected source subjects. If unset
+            or zero, the cluster default of 5m is used.
+            """
+
+        @property
+        def effective_full_sync_interval(self) -> google.protobuf.duration_pb2.Duration:
+            """The effective interval between full scans."""
+
+        @property
+        def source_filter(self) -> Global___SchemaRegistrySourceFilter:
+            """Filter for specific Schema Registry contexts and subjects to select
+            for replication. If unset or empty, the whole source Schema Registry
+            is replicated.
+            """
+
+        @property
+        def destination(self) -> Global___SchemaRegistryContextDestination:
+            """Mapping from source contexts implied by `source_filter` to
+            destination contexts. Each source context included in the replication
+            must map to a distinct destination context to avoid
+            collisions. If unset, source context names are preserved.
+            """
+
+        def __init__(self, *, source_url: builtins.str=..., auth_options: Global___SchemaRegistryAuthOptions | None=..., tls_settings: proto.redpanda.core.common.v1.tls_pb2.TLSSettings | None=..., tail_interval: google.protobuf.duration_pb2.Duration | None=..., effective_tail_interval: google.protobuf.duration_pb2.Duration | None=..., full_sync_interval: google.protobuf.duration_pb2.Duration | None=..., effective_full_sync_interval: google.protobuf.duration_pb2.Duration | None=..., max_source_requests_per_second: builtins.int=..., effective_max_source_requests_per_second: builtins.int=..., source_filter: Global___SchemaRegistrySourceFilter | None=..., destination: Global___SchemaRegistryContextDestination | None=..., unsupported_schema_feature_policy: Global___UnsupportedSchemaFeaturePolicy.ValueType=..., paused: builtins.bool=...) -> None:
+            ...
+
+        def HasField(self, field_name: typing.Literal['_tls_settings', b'_tls_settings', 'auth_options', b'auth_options', 'destination', b'destination', 'effective_full_sync_interval', b'effective_full_sync_interval', 'effective_tail_interval', b'effective_tail_interval', 'full_sync_interval', b'full_sync_interval', 'source_filter', b'source_filter', 'tail_interval', b'tail_interval', 'tls_settings', b'tls_settings']) -> builtins.bool:
+            ...
+
+        def ClearField(self, field_name: typing.Literal['_tls_settings', b'_tls_settings', 'auth_options', b'auth_options', 'destination', b'destination', 'effective_full_sync_interval', b'effective_full_sync_interval', 'effective_max_source_requests_per_second', b'effective_max_source_requests_per_second', 'effective_tail_interval', b'effective_tail_interval', 'full_sync_interval', b'full_sync_interval', 'max_source_requests_per_second', b'max_source_requests_per_second', 'paused', b'paused', 'source_filter', b'source_filter', 'source_url', b'source_url', 'tail_interval', b'tail_interval', 'tls_settings', b'tls_settings', 'unsupported_schema_feature_policy', b'unsupported_schema_feature_policy']) -> None:
+            ...
+
+        def WhichOneof(self, oneof_group: typing.Literal['_tls_settings', b'_tls_settings']) -> typing.Literal['tls_settings'] | None:
+            ...
     SHADOW_SCHEMA_REGISTRY_TOPIC_FIELD_NUMBER: builtins.int
+    SHADOW_SCHEMA_REGISTRY_API_FIELD_NUMBER: builtins.int
 
     @property
     def shadow_schema_registry_topic(self) -> Global___SchemaRegistrySyncOptions.ShadowSchemaRegistryTopic:
         ...
 
-    def __init__(self, *, shadow_schema_registry_topic: Global___SchemaRegistrySyncOptions.ShadowSchemaRegistryTopic | None=...) -> None:
+    @property
+    def shadow_schema_registry_api(self) -> Global___SchemaRegistrySyncOptions.ShadowSchemaRegistryApi:
         ...
 
-    def HasField(self, field_name: typing.Literal['schema_registry_shadowing_mode', b'schema_registry_shadowing_mode', 'shadow_schema_registry_topic', b'shadow_schema_registry_topic']) -> builtins.bool:
+    def __init__(self, *, shadow_schema_registry_topic: Global___SchemaRegistrySyncOptions.ShadowSchemaRegistryTopic | None=..., shadow_schema_registry_api: Global___SchemaRegistrySyncOptions.ShadowSchemaRegistryApi | None=...) -> None:
         ...
 
-    def ClearField(self, field_name: typing.Literal['schema_registry_shadowing_mode', b'schema_registry_shadowing_mode', 'shadow_schema_registry_topic', b'shadow_schema_registry_topic']) -> None:
+    def HasField(self, field_name: typing.Literal['schema_registry_shadowing_mode', b'schema_registry_shadowing_mode', 'shadow_schema_registry_api', b'shadow_schema_registry_api', 'shadow_schema_registry_topic', b'shadow_schema_registry_topic']) -> builtins.bool:
         ...
 
-    def WhichOneof(self, oneof_group: typing.Literal['schema_registry_shadowing_mode', b'schema_registry_shadowing_mode']) -> typing.Literal['shadow_schema_registry_topic'] | None:
+    def ClearField(self, field_name: typing.Literal['schema_registry_shadowing_mode', b'schema_registry_shadowing_mode', 'shadow_schema_registry_api', b'shadow_schema_registry_api', 'shadow_schema_registry_topic', b'shadow_schema_registry_topic']) -> None:
+        ...
+
+    def WhichOneof(self, oneof_group: typing.Literal['schema_registry_shadowing_mode', b'schema_registry_shadowing_mode']) -> typing.Literal['shadow_schema_registry_topic', 'shadow_schema_registry_api'] | None:
         ...
 Global___SchemaRegistrySyncOptions: typing_extensions.TypeAlias = SchemaRegistrySyncOptions
+
+@typing.final
+class SchemaRegistryAuthOptions(google.protobuf.message.Message):
+    """Authentication settings for source Schema Registry HTTP requests."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    BASIC_FIELD_NUMBER: builtins.int
+
+    @property
+    def basic(self) -> Global___HTTPBasicAuthOptions:
+        """Authenticate source Schema Registry requests with HTTP Basic auth."""
+
+    def __init__(self, *, basic: Global___HTTPBasicAuthOptions | None=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['auth_options', b'auth_options', 'basic', b'basic']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['auth_options', b'auth_options', 'basic', b'basic']) -> None:
+        ...
+
+    def WhichOneof(self, oneof_group: typing.Literal['auth_options', b'auth_options']) -> typing.Literal['basic'] | None:
+        ...
+Global___SchemaRegistryAuthOptions: typing_extensions.TypeAlias = SchemaRegistryAuthOptions
+
+@typing.final
+class HTTPBasicAuthOptions(google.protobuf.message.Message):
+    """HTTP Basic auth credentials."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    USERNAME_FIELD_NUMBER: builtins.int
+    PASSWORD_FIELD_NUMBER: builtins.int
+    PASSWORD_SET_FIELD_NUMBER: builtins.int
+    PASSWORD_SET_AT_FIELD_NUMBER: builtins.int
+    username: builtins.str
+    'HTTP Basic auth username. For Confluent Cloud, this is the API key.'
+    password: builtins.str
+    'HTTP Basic auth password. For Confluent Cloud, this is the API secret.'
+    password_set: builtins.bool
+    'Indicates that the password has been set.'
+
+    @property
+    def password_set_at(self) -> google.protobuf.timestamp_pb2.Timestamp:
+        """Timestamp of when the password was last set - only valid if password_set
+        is true.
+        """
+
+    def __init__(self, *, username: builtins.str=..., password: builtins.str=..., password_set: builtins.bool=..., password_set_at: google.protobuf.timestamp_pb2.Timestamp | None=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['password_set_at', b'password_set_at']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['password', b'password', 'password_set', b'password_set', 'password_set_at', b'password_set_at', 'username', b'username']) -> None:
+        ...
+Global___HTTPBasicAuthOptions: typing_extensions.TypeAlias = HTTPBasicAuthOptions
+
+@typing.final
+class SchemaRegistrySourceFilter(google.protobuf.message.Message):
+    """Filter for specific Schema Registry contexts and subjects to select for
+    replication. If unset or empty, the whole source Schema Registry is
+    replicated.
+    """
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    CONTEXTS_FIELD_NUMBER: builtins.int
+    SUBJECTS_FIELD_NUMBER: builtins.int
+
+    @property
+    def contexts(self) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]:
+        """Source contexts to replicate in full, for example ".", ".prod", or
+        ".staging". If both `contexts` and `subjects` are set, the effective
+        source scope is the union of both selections.
+        """
+
+    @property
+    def subjects(self) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]:
+        """Exact source subjects to replicate, using Schema Registry qualified
+        subject syntax. For example, "orders-value" selects the subject in the
+        default context, and ":.prod:orders-value" selects the subject in context
+        ".prod". If both `contexts` and `subjects` are set, the union of both
+        selections is replicated. If a subject is also included by `contexts`, it
+        is counted and replicated once.
+        """
+
+    def __init__(self, *, contexts: collections.abc.Iterable[builtins.str] | None=..., subjects: collections.abc.Iterable[builtins.str] | None=...) -> None:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['contexts', b'contexts', 'subjects', b'subjects']) -> None:
+        ...
+Global___SchemaRegistrySourceFilter: typing_extensions.TypeAlias = SchemaRegistrySourceFilter
+
+@typing.final
+class SchemaRegistryContextDestination(google.protobuf.message.Message):
+    """Destination context mapping for source Schema Registry data."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    IDENTITY_FIELD_NUMBER: builtins.int
+    EXACT_FIELD_NUMBER: builtins.int
+
+    @property
+    def identity(self) -> Global___SchemaRegistryIdentityContextMapping:
+        """Preserve source context names in the destination Schema Registry."""
+
+    @property
+    def exact(self) -> Global___SchemaRegistryExactContextMappings:
+        """Map selected source contexts to explicit destination contexts."""
+
+    def __init__(self, *, identity: Global___SchemaRegistryIdentityContextMapping | None=..., exact: Global___SchemaRegistryExactContextMappings | None=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['exact', b'exact', 'identity', b'identity', 'mapping', b'mapping']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['exact', b'exact', 'identity', b'identity', 'mapping', b'mapping']) -> None:
+        ...
+
+    def WhichOneof(self, oneof_group: typing.Literal['mapping', b'mapping']) -> typing.Literal['identity', 'exact'] | None:
+        ...
+Global___SchemaRegistryContextDestination: typing_extensions.TypeAlias = SchemaRegistryContextDestination
+
+@typing.final
+class SchemaRegistryIdentityContextMapping(google.protobuf.message.Message):
+    """Preserve source context names in the destination Schema Registry."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    def __init__(self) -> None:
+        ...
+Global___SchemaRegistryIdentityContextMapping: typing_extensions.TypeAlias = SchemaRegistryIdentityContextMapping
+
+@typing.final
+class SchemaRegistryExactContextMappings(google.protobuf.message.Message):
+    """Explicit source-to-destination context mappings."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    MAPPINGS_FIELD_NUMBER: builtins.int
+
+    @property
+    def mappings(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___SchemaRegistryContextMap]:
+        """Explicit source-to-destination context mappings. Every source context in
+        the effective source scope must have exactly one mapping.
+        """
+
+    def __init__(self, *, mappings: collections.abc.Iterable[Global___SchemaRegistryContextMap] | None=...) -> None:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['mappings', b'mappings']) -> None:
+        ...
+Global___SchemaRegistryExactContextMappings: typing_extensions.TypeAlias = SchemaRegistryExactContextMappings
+
+@typing.final
+class SchemaRegistryContextMap(google.protobuf.message.Message):
+    """One source-to-destination context mapping."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    SOURCE_FIELD_NUMBER: builtins.int
+    DESTINATION_FIELD_NUMBER: builtins.int
+    source: builtins.str
+    'Source context name.'
+    destination: builtins.str
+    'Destination context name.'
+
+    def __init__(self, *, source: builtins.str=..., destination: builtins.str=...) -> None:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['destination', b'destination', 'source', b'source']) -> None:
+        ...
+Global___SchemaRegistryContextMap: typing_extensions.TypeAlias = SchemaRegistryContextMap
 
 @typing.final
 class ConsumerOffsetSyncOptions(google.protobuf.message.Message):
@@ -906,6 +1215,43 @@ class SecuritySettingsSyncOptions(google.protobuf.message.Message):
     def ClearField(self, field_name: typing.Literal['acl_filters', b'acl_filters', 'effective_interval', b'effective_interval', 'interval', b'interval', 'paused', b'paused']) -> None:
         ...
 Global___SecuritySettingsSyncOptions: typing_extensions.TypeAlias = SecuritySettingsSyncOptions
+
+@typing.final
+class RoleSyncOptions(google.protobuf.message.Message):
+    """Options for syncing RBAC roles"""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    INTERVAL_FIELD_NUMBER: builtins.int
+    EFFECTIVE_INTERVAL_FIELD_NUMBER: builtins.int
+    PAUSED_FIELD_NUMBER: builtins.int
+    ROLE_NAME_FILTERS_FIELD_NUMBER: builtins.int
+    paused: builtins.bool
+    "Allows user to pause the role sync task.  If paused, then the task will\n    enter the 'paused' state and will not sync roles from the source cluster\n    "
+
+    @property
+    def interval(self) -> google.protobuf.duration_pb2.Duration:
+        """Sync interval
+        If 0 provided, defaults to 30 seconds
+        """
+
+    @property
+    def effective_interval(self) -> google.protobuf.duration_pb2.Duration:
+        """The effective interval for the task"""
+
+    @property
+    def role_name_filters(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[Global___NameFilter]:
+        """Filters selecting which roles to shadow by name.  Defaults to empty: no
+        roles are synced until at least one include filter is added
+        """
+
+    def __init__(self, *, interval: google.protobuf.duration_pb2.Duration | None=..., effective_interval: google.protobuf.duration_pb2.Duration | None=..., paused: builtins.bool=..., role_name_filters: collections.abc.Iterable[Global___NameFilter] | None=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['effective_interval', b'effective_interval', 'interval', b'interval']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['effective_interval', b'effective_interval', 'interval', b'interval', 'paused', b'paused', 'role_name_filters', b'role_name_filters']) -> None:
+        ...
+Global___RoleSyncOptions: typing_extensions.TypeAlias = RoleSyncOptions
 
 @typing.final
 class AuthenticationConfiguration(google.protobuf.message.Message):
@@ -1102,6 +1448,7 @@ class ShadowLinkStatus(google.protobuf.message.Message):
     TASK_STATUSES_FIELD_NUMBER: builtins.int
     SHADOW_TOPICS_FIELD_NUMBER: builtins.int
     SYNCED_SHADOW_TOPIC_PROPERTIES_FIELD_NUMBER: builtins.int
+    SCHEMA_REGISTRY_SYNC_STATUS_FIELD_NUMBER: builtins.int
     state: Global___ShadowLinkState.ValueType
 
     @property
@@ -1116,10 +1463,17 @@ class ShadowLinkStatus(google.protobuf.message.Message):
     def synced_shadow_topic_properties(self) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]:
         """List of topic properties that are being synced"""
 
-    def __init__(self, *, state: Global___ShadowLinkState.ValueType=..., task_statuses: collections.abc.Iterable[Global___ShadowLinkTaskStatus] | None=..., shadow_topics: collections.abc.Iterable[Global___ShadowTopic] | None=..., synced_shadow_topic_properties: collections.abc.Iterable[builtins.str] | None=...) -> None:
+    @property
+    def schema_registry_sync_status(self) -> Global___SchemaRegistrySyncStatus:
+        """Status of Schema Registry syncing."""
+
+    def __init__(self, *, state: Global___ShadowLinkState.ValueType=..., task_statuses: collections.abc.Iterable[Global___ShadowLinkTaskStatus] | None=..., shadow_topics: collections.abc.Iterable[Global___ShadowTopic] | None=..., synced_shadow_topic_properties: collections.abc.Iterable[builtins.str] | None=..., schema_registry_sync_status: Global___SchemaRegistrySyncStatus | None=...) -> None:
         ...
 
-    def ClearField(self, field_name: typing.Literal['shadow_topics', b'shadow_topics', 'state', b'state', 'synced_shadow_topic_properties', b'synced_shadow_topic_properties', 'task_statuses', b'task_statuses']) -> None:
+    def HasField(self, field_name: typing.Literal['schema_registry_sync_status', b'schema_registry_sync_status']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['schema_registry_sync_status', b'schema_registry_sync_status', 'shadow_topics', b'shadow_topics', 'state', b'state', 'synced_shadow_topic_properties', b'synced_shadow_topic_properties', 'task_statuses', b'task_statuses']) -> None:
         ...
 Global___ShadowLinkStatus: typing_extensions.TypeAlias = ShadowLinkStatus
 
@@ -1201,3 +1555,156 @@ class TopicPartitionInformation(google.protobuf.message.Message):
     def ClearField(self, field_name: typing.Literal['high_watermark', b'high_watermark', 'partition_id', b'partition_id', 'source_high_watermark', b'source_high_watermark', 'source_last_stable_offset', b'source_last_stable_offset', 'source_last_updated_timestamp', b'source_last_updated_timestamp']) -> None:
         ...
 Global___TopicPartitionInformation: typing_extensions.TypeAlias = TopicPartitionInformation
+
+@typing.final
+class SchemaRegistrySyncStatus(google.protobuf.message.Message):
+    """Status of Schema Registry syncing."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    INVENTORY_FIELD_NUMBER: builtins.int
+    CURRENT_SYNC_FIELD_NUMBER: builtins.int
+    LAST_FULL_SYNC_FIELD_NUMBER: builtins.int
+    TOTALS_SINCE_TASK_START_FIELD_NUMBER: builtins.int
+    LAST_ERROR_MESSAGE_FIELD_NUMBER: builtins.int
+    last_error_message: builtins.str
+    'Short sanitized summary of the most recent Schema Registry sync\n    error. Detailed errors are written to broker logs.\n    '
+
+    @property
+    def inventory(self) -> Global___SchemaRegistryInventory:
+        """Last observed source and destination Schema Registry inventory. These
+        counts are updated as sync work observes source and destination state.
+        """
+
+    @property
+    def current_sync(self) -> Global___SchemaRegistryCurrentSync:
+        """Sync currently running. This is unset when no Schema Registry sync is
+        running.
+        """
+
+    @property
+    def last_full_sync(self) -> Global___SchemaRegistrySyncSummary:
+        """Counters from the most recently completed full sync. This is unset until
+        a full sync completes on the current task instance.
+        """
+
+    @property
+    def totals_since_task_start(self) -> Global___SchemaRegistrySyncSummary:
+        """Cumulative counters since the Schema Registry task started. These
+        counters reset after task restart or leadership transfer.
+        """
+
+    def __init__(self, *, inventory: Global___SchemaRegistryInventory | None=..., current_sync: Global___SchemaRegistryCurrentSync | None=..., last_full_sync: Global___SchemaRegistrySyncSummary | None=..., totals_since_task_start: Global___SchemaRegistrySyncSummary | None=..., last_error_message: builtins.str=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['_current_sync', b'_current_sync', '_last_full_sync', b'_last_full_sync', 'current_sync', b'current_sync', 'inventory', b'inventory', 'last_full_sync', b'last_full_sync', 'totals_since_task_start', b'totals_since_task_start']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['_current_sync', b'_current_sync', '_last_full_sync', b'_last_full_sync', 'current_sync', b'current_sync', 'inventory', b'inventory', 'last_error_message', b'last_error_message', 'last_full_sync', b'last_full_sync', 'totals_since_task_start', b'totals_since_task_start']) -> None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_current_sync', b'_current_sync']) -> typing.Literal['current_sync'] | None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_last_full_sync', b'_last_full_sync']) -> typing.Literal['last_full_sync'] | None:
+        ...
+Global___SchemaRegistrySyncStatus: typing_extensions.TypeAlias = SchemaRegistrySyncStatus
+
+@typing.final
+class SchemaRegistryCurrentSync(google.protobuf.message.Message):
+    """A Schema Registry sync that is currently running."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    SYNC_TYPE_FIELD_NUMBER: builtins.int
+    SUMMARY_FIELD_NUMBER: builtins.int
+    sync_type: Global___SchemaRegistrySyncType.ValueType
+    'Type of Schema Registry sync currently running.'
+
+    @property
+    def summary(self) -> Global___SchemaRegistrySyncSummary:
+        """Counters for the sync currently running."""
+
+    def __init__(self, *, sync_type: Global___SchemaRegistrySyncType.ValueType=..., summary: Global___SchemaRegistrySyncSummary | None=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['summary', b'summary']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['summary', b'summary', 'sync_type', b'sync_type']) -> None:
+        ...
+Global___SchemaRegistryCurrentSync: typing_extensions.TypeAlias = SchemaRegistryCurrentSync
+
+@typing.final
+class SchemaRegistryInventory(google.protobuf.message.Message):
+    """Last observed Schema Registry inventory."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    SELECTED_SOURCE_SUBJECTS_FIELD_NUMBER: builtins.int
+    SELECTED_SOURCE_SUBJECT_VERSIONS_FIELD_NUMBER: builtins.int
+    DESTINATION_SUBJECTS_FIELD_NUMBER: builtins.int
+    DESTINATION_SUBJECT_VERSIONS_FIELD_NUMBER: builtins.int
+    selected_source_subjects: builtins.int
+    'Number of source subjects selected for replication after applying source\n    scope context and subject filters.\n    '
+    selected_source_subject_versions: builtins.int
+    'Number of source subject versions selected for replication after\n    applying source scope context and subject filters.\n    '
+    destination_subjects: builtins.int
+    'Number of destination subjects corresponding to the selected source\n    subjects after applying destination context mapping.\n    '
+    destination_subject_versions: builtins.int
+    'Number of destination subject versions corresponding to the selected\n    source subjects after applying destination context mapping.\n    '
+
+    def __init__(self, *, selected_source_subjects: builtins.int=..., selected_source_subject_versions: builtins.int=..., destination_subjects: builtins.int=..., destination_subject_versions: builtins.int=...) -> None:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['destination_subject_versions', b'destination_subject_versions', 'destination_subjects', b'destination_subjects', 'selected_source_subject_versions', b'selected_source_subject_versions', 'selected_source_subjects', b'selected_source_subjects']) -> None:
+        ...
+Global___SchemaRegistryInventory: typing_extensions.TypeAlias = SchemaRegistryInventory
+
+@typing.final
+class SchemaRegistrySyncSummary(google.protobuf.message.Message):
+    """Summary counters for one Schema Registry sync or for a cumulative interval."""
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+    START_TIME_FIELD_NUMBER: builtins.int
+    FINISH_TIME_FIELD_NUMBER: builtins.int
+    SUBJECT_VERSIONS_CHANGED_FIELD_NUMBER: builtins.int
+    COMPATIBILITY_CONFIGS_CHANGED_FIELD_NUMBER: builtins.int
+    MODES_CHANGED_FIELD_NUMBER: builtins.int
+    UNSUPPORTED_FEATURES_REMOVED_FIELD_NUMBER: builtins.int
+    ERRORS_FIELD_NUMBER: builtins.int
+    subject_versions_changed: builtins.int
+    'Number of selected subject versions created, updated, or deleted on the\n    destination.\n    '
+    compatibility_configs_changed: builtins.int
+    'Number of selected compatibility configuration changes applied to the\n    destination.\n    '
+    modes_changed: builtins.int
+    'Number of selected mode changes applied to the destination.'
+    unsupported_features_removed: builtins.int
+    'Number of unsupported fields removed from schemas or schema configs when\n    UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE is used.\n    '
+    errors: builtins.int
+    'Number of errors observed during the sync or cumulative interval.'
+
+    @property
+    def start_time(self) -> google.protobuf.timestamp_pb2.Timestamp:
+        """Time when the sync started. For cumulative counters, this is the time
+        when the Schema Registry task started.
+        """
+
+    @property
+    def finish_time(self) -> google.protobuf.timestamp_pb2.Timestamp:
+        """Time when the sync finished. This is unset for a sync that is still
+        running and for cumulative counters.
+        """
+
+    def __init__(self, *, start_time: google.protobuf.timestamp_pb2.Timestamp | None=..., finish_time: google.protobuf.timestamp_pb2.Timestamp | None=..., subject_versions_changed: builtins.int=..., compatibility_configs_changed: builtins.int=..., modes_changed: builtins.int=..., unsupported_features_removed: builtins.int=..., errors: builtins.int=...) -> None:
+        ...
+
+    def HasField(self, field_name: typing.Literal['_finish_time', b'_finish_time', '_start_time', b'_start_time', 'finish_time', b'finish_time', 'start_time', b'start_time']) -> builtins.bool:
+        ...
+
+    def ClearField(self, field_name: typing.Literal['_finish_time', b'_finish_time', '_start_time', b'_start_time', 'compatibility_configs_changed', b'compatibility_configs_changed', 'errors', b'errors', 'finish_time', b'finish_time', 'modes_changed', b'modes_changed', 'start_time', b'start_time', 'subject_versions_changed', b'subject_versions_changed', 'unsupported_features_removed', b'unsupported_features_removed']) -> None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_finish_time', b'_finish_time']) -> typing.Literal['finish_time'] | None:
+        ...
+
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal['_start_time', b'_start_time']) -> typing.Literal['start_time'] | None:
+        ...
+Global___SchemaRegistrySyncSummary: typing_extensions.TypeAlias = SchemaRegistrySyncSummary

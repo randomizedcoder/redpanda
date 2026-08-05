@@ -16,6 +16,7 @@
 #include "cloud_topics/app.h"
 #include "cloud_topics/test_fixture_cfg.h"
 #include "cluster/archival/fwd.h"
+#include "cluster/cluster_discovery.h"
 #include "cluster/config_manager.h"
 #include "cluster/fwd.h"
 #include "cluster/inventory_service.h"
@@ -33,6 +34,7 @@
 #include "datalake/credential_manager.h"
 #include "datalake/fwd.h"
 #include "debug_bundle/fwd.h"
+#include "features/feature_table_snapshot.h"
 #include "features/fwd.h"
 #include "finjector/stress_fiber.h"
 #include "kafka/client/configuration.h"
@@ -43,6 +45,7 @@
 #include "kafka/server/snc_quota_manager.h"
 #include "metrics/aggregate_metrics_watcher.h"
 #include "metrics/host_metrics_watcher.h"
+#include "metrics/instance_metrics.h"
 #include "metrics/metrics.h"
 #include "net/conn_quota.h"
 #include "pandaproxy/rest/configuration.h"
@@ -86,6 +89,18 @@ inline const auto redpanda_start_time{
   std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::system_clock::now().time_since_epoch())};
 
+// Knobs used to tweak start-up behavior, primarily for tests. In production
+// the defaults apply.
+struct test_cfg {
+    // Cloud-topics test-fixture overrides (flush loop, level-zero GC, etc.).
+    cloud_topics::test_fixture_cfg ct_test_cfg{};
+    // Whether to eagerly pre-allocate the per-shard chunk cache pool on
+    // storage start. Multi-node fixture tests that run several brokers in one
+    // reactor may want to disable it to avoid N-way memory allocations for each
+    // chunk cache.
+    bool chunk_cache_prealloc{true};
+};
+
 class application : public ssx::sharded_service_container {
 public:
     int run(int, char**);
@@ -98,9 +113,7 @@ public:
       std::optional<YAML::Node> audit_log_client_cfg = std::nullopt);
     void check_environment();
     void wire_up_and_start(
-      ::stop_signal&,
-      bool test_mode = false,
-      cloud_topics::test_fixture_cfg ct_test_cfg = {});
+      ::stop_signal&, bool test_mode = false, test_cfg cfg = {});
     void post_start_tasks();
 
     void init_crashtracker(::stop_signal& app_signal);
@@ -215,16 +228,56 @@ public:
         return _datalake_coordinator_fe;
     }
 
+    // At a minimum, we need to construct the feature table and storage systems
+    // in order to properly bootstrap the system. Public for test fixture
+    // access.
+    void wire_up_bootstrap_services();
+
+    // We need the RPC server and bootstrap service (at a minimum) running
+    // before cluster discovery can be performed.
+    void wire_up_and_start_rpc_service();
+
+    // Before we can continue in the bootstrap process, we need to establish
+    // a consistent view of the cluster-wide state - namely, the cluster
+    // configuration and feature table state. We do that by:
+    // 1. Applying any local kvstore snapshots (which contain potentially
+    //    stale config and feature table state, as well as persisted
+    //    node/cluster UUID information).
+    // 2. For a first-time joiner, registering with the cluster and applying the
+    //    controller_join_snapshot from the join reply. This covers non-seed
+    //    joiners and wiped seeds that are rejoining an existing cluster.
+    //    Genuine founders (which need the RPC service for the founder
+    //    handshake) and node-ID overrides are resolved later in
+    //    resolve_node_identity().
+    // 3. For a restarting node with a persisted member set, refreshing that
+    //    view by fetching an authoritative controller_join_snapshot from the
+    //    controller leader via the `fetch_controller_snapshot` RPC.
+    // 4. Marking shard_local_cfg() as ready, after which downstream
+    //    services may safely read cluster configuration.
+    // The abort source (owned by the caller) bounds cluster discovery.
+    // Public for test fixture access.
+    void establish_cluster_view(ss::abort_source&);
+
     // Constructs and starts the services required to provide cryptographic
     // algorithm support to Redpanda. Public for test fixture access.
     void wire_up_and_start_crypto_services();
 
-private:
-    // Constructs services across shards required to get bootstrap metadata.
-    void wire_up_bootstrap_services();
+    // Public for test fixture access.
+    void hydrate_cluster_config(const YAML::Node& config);
 
-    // Starts services across shards required to get bootstrap metadata.
-    void start_bootstrap_services();
+    // Performs recovery on the local kvstore, applies a local feature table
+    // snapshot, and sets in-memory node/cluster UUIDs.
+    // Public for test fixture access.
+    void bootstrap_from_kvstore();
+
+private:
+    // Constructs storage services across shards required early on in the
+    // bootstrap process.
+    void wire_up_storage_services();
+
+    // Starts storage services across shards required early on in the
+    // bootstrap process.
+    void start_storage_services(test_cfg cfg);
 
     // Constructs services across shards meant for Redpanda runtime.
     void wire_up_runtime_services(
@@ -238,24 +291,78 @@ private:
       std::optional<cloud_storage_clients::bucket_name>& bucket_name,
       cloud_topics::test_fixture_cfg ct_test_cfg);
 
-    void load_feature_table_snapshot();
+    // Marks the shard_local_cfg as ready (or not ready) per the provided flag.
+    ss::future<> mark_config_ready(bool ready);
+
+    // Applies the provided feature_table_snapshot directly to the in-memory
+    // feature table state.
+    ss::future<>
+    apply_feature_table_snapshot(const features::feature_table_snapshot& snap);
+    // Attempts to read a local feature table snapshot from the kvstore and
+    // apply it.
+    ss::future<> maybe_apply_local_feature_table_snapshot();
+    // How this node obtains its node ID at startup.
+    enum class node_id_source {
+        // A node ID is already persisted (this node ran a controller before):
+        // reuse it. A restarting node.
+        established,
+        // An operator override supplies the node ID, rewriting the persisted
+        // configuration_invariants.
+        overridden,
+        // No usable node ID yet. The node must register with the cluster to be
+        // assigned one. A first-time founder or joining node.
+        unregistered,
+    };
+    // Returns true if this node is present in the local node config's list of
+    // seed servers, false otherwise.
+    bool is_seed_node() const;
+    // Classifies how this node obtains its node ID from persisted invariants,
+    // node config and node-ID overrides. Reads the kvstore; call once and cache
+    // the result in _node_id_source.
+    node_id_source classify_node_id_source();
+    // Performs cluster discovery for first time cluster joiners, or resolves
+    // node identity from persisted kvstore state. Also persists the node UUID.
+    // No-op for the discovery/snapshot step if identity was already resolved
+    // early via prime_node_identity().
+    ss::future<> resolve_node_identity();
+    // Applies an operator node-ID override: rewrites the persisted
+    // configuration_invariants and returns the overridden node ID.
+    ss::future<model::node_id> apply_node_id_override();
+    // Registers with the cluster per the retry_policy and, if a
+    // controller_join_snapshot is returned in the join reply, applies it and
+    // returns the assigned node ID. When defer_needs_restart is set,
+    // needs_restart configs are applied as pending rather than promoted live.
+    ss::future<std::optional<model::node_id>> register_and_apply_join_snapshot(
+      cluster::cluster_discovery::join_retry_policy policy,
+      cluster::defer_needs_restart = cluster::defer_needs_restart::no);
+    // Resolves node identity early by registering with the cluster and applying
+    // the join snapshot. Used for a first-time joiner (a non-seed, or a seed
+    // that finds an existing cluster).
+    ss::future<> prime_node_identity();
+    // Fetches and applies a view of the controller_stm from the current
+    // controller leader.
+    ss::future<> bootstrap_controller_view();
+    // Refreshes the cluster config and feature table from the provided
+    // snapshot. When defer_needs_restart is set, needs_restart config
+    // properties are applied as pending.
+    ss::future<> apply_controller_snapshot(
+      const cluster::controller_join_snapshot&,
+      cluster::defer_needs_restart = cluster::defer_needs_restart::no);
 
     void trigger_abort_source();
 
     // Starts the services meant for Redpanda runtime. Must be called after
     // having constructed the subsystems via the corresponding `wire_up` calls.
     void start_runtime_services(
-      cluster::cluster_discovery&,
-      ::stop_signal&,
-      cloud_topics::test_fixture_cfg ct_test_cfg);
+      ::stop_signal&, cloud_topics::test_fixture_cfg ct_test_cfg);
     void start_kafka(const model::node_id&, ::stop_signal&);
     void add_runtime_rpc_services(rpc::rpc_server&, bool start_raft_rpc_early);
 
     // All methods are calleds from Seastar thread
-    ss::app_template::config setup_app_config();
+    ss::app_template::seastar_options setup_app_config();
     void validate_arguments(const po::variables_map&);
     YAML::Node hydrate_node_config(const po::variables_map&);
-    void hydrate_cluster_config(const YAML::Node& config);
+    void log_cluster_config();
 
     bool requires_cloud_io();
 
@@ -277,6 +384,12 @@ private:
     // so that the config doesn't walk through all intermediate states
     // in the log during startup.
     cluster::config_manager::preload_result _config_preload;
+
+    std::unique_ptr<cluster::cluster_discovery> _cluster_discovery;
+    // Set once node identity has been resolved, either early via
+    // prime_node_identity() or later via resolve_node_identity().
+    bool _node_identity_resolved{false};
+    std::optional<node_id_source> _node_id_source;
 
     // When joining a cluster, we are tipped off as to the last applied
     // offset of the controller stm from another node.  We will wait for
@@ -344,6 +457,8 @@ private:
     std::unique_ptr<crash_tracker::service> _crash_tracker_service;
 
     std::unique_ptr<metrics::host_metrics_watcher> _host_metrics_watcher;
+
+    std::unique_ptr<instance_info::instance_metrics> _instance_metrics;
 
     ss::sharded<admin::kafka_connections_service> _kafka_connections_service;
 

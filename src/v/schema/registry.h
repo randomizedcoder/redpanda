@@ -15,6 +15,8 @@
 #include "pandaproxy/schema_registry/schema_getter.h"
 #include "pandaproxy/schema_registry/types.h"
 
+#include <seastar/util/noncopyable_function.hh>
+
 namespace schema {
 /**
  * A wrapper around the schema registry implementation within Redpanda.
@@ -39,6 +41,14 @@ public:
     virtual ~registry() = default;
 
     virtual bool is_enabled() const = 0;
+
+    /// Ensures the Schema Registry's internal `_schemas` topic exists,
+    /// creating it if needed. Idempotent, and unlike a full start-up it does
+    /// not load the schema store. Shadow-link SR-API sync calls this so the
+    /// destination `_schemas` topic — and its partition-0 leader, the shard
+    /// the sync task runs on — comes into existence without first requiring
+    /// external Schema Registry traffic.
+    virtual ss::future<> ensure_internal_topic() = 0;
 
     virtual ss::future<pandaproxy::schema_registry::schema_getter*>
     getter() const = 0;
@@ -68,7 +78,91 @@ public:
       get_subject_schema(
         pandaproxy::schema_registry::context_subject,
         std::optional<pandaproxy::schema_registry::schema_version>) const = 0;
+
+    /// Lists every (subject, version) whose subject matches `filter`, each
+    /// carrying its version's soft-delete state. The predicate must be pure; it
+    /// is invoked on each registry shard.
+    virtual ss::future<
+      chunked_vector<pandaproxy::schema_registry::subject_version_deleted>>
+    list_subject_versions(
+      ss::noncopyable_function<
+        bool(const pandaproxy::schema_registry::context_subject&)> filter,
+      pandaproxy::schema_registry::include_deleted) const = 0;
+
+    /// Returns true if \p ctx contains any subject. With include_deleted::yes,
+    /// soft-deleted subjects count. Short-circuits at the first match rather
+    /// than materializing the context's versions.
+    virtual ss::future<bool> has_subjects(
+      pandaproxy::schema_registry::context,
+      pandaproxy::schema_registry::include_deleted) const = 0;
+
+    /// Lists all subjects across all contexts, one entry per subject (no
+    /// version fan-out). With include_deleted::yes, soft-deleted subjects are
+    /// included.
+    virtual ss::future<
+      chunked_vector<pandaproxy::schema_registry::context_subject>>
+      get_subjects(pandaproxy::schema_registry::include_deleted) const = 0;
+
+    /// Lists every materialized context (always includes the default context).
+    /// Mirrors the source's context enumeration so shadow-link sync can detect
+    /// a context that has been deleted at the source.
+    virtual ss::future<chunked_vector<pandaproxy::schema_registry::context>>
+    list_contexts() const = 0;
+
     virtual ss::future<pandaproxy::schema_registry::context_schema_id>
       create_schema(pandaproxy::schema_registry::subject_schema) = 0;
+
+    /// \name Internal sync/import API
+    ///
+    /// Used by shadow-link Schema Registry API sync. These calls preserve
+    /// source ids/versions and bypass public REST write guards: read-only mode,
+    /// mode_mutability, and the API-sync client write blocker. They remain
+    /// blocked while _schemas itself is topic-shadowed.
+    ///
+    /// Deletes are not as idempotent as imports: reference checks still
+    /// apply and permanently deleting an already-deleted target throws, so
+    /// deletes must be replayed in source order.
+    ///
+    /// Do not call these on behalf of a client request.
+    ///@{
+
+    /// Import a schema with source id/version. Identical imports are no-ops;
+    /// conflicts throw.
+    virtual ss::future<pandaproxy::schema_registry::context_schema_id>
+      import_schema(pandaproxy::schema_registry::stored_schema) = 0;
+
+    virtual ss::future<bool> soft_delete_schema(
+      pandaproxy::schema_registry::context_subject,
+      pandaproxy::schema_registry::schema_version) = 0;
+
+    virtual ss::future<
+      chunked_vector<pandaproxy::schema_registry::schema_version>>
+      permanent_delete_schema(
+        pandaproxy::schema_registry::context_subject,
+        std::optional<pandaproxy::schema_registry::schema_version>) = 0;
+
+    virtual ss::future<bool> write_mode(
+      pandaproxy::schema_registry::context_subject,
+      pandaproxy::schema_registry::mode) = 0;
+
+    virtual ss::future<bool>
+      delete_mode(pandaproxy::schema_registry::context_subject) = 0;
+
+    virtual ss::future<bool> write_config(
+      pandaproxy::schema_registry::context_subject,
+      pandaproxy::schema_registry::compatibility_level) = 0;
+
+    virtual ss::future<bool>
+      delete_config(pandaproxy::schema_registry::context_subject) = 0;
+
+    /// Deletes (tombstones) a materialized context, removing only the context
+    /// marker and leaving any context-level mode/config overrides untouched, as
+    /// Confluent's DELETE /contexts does. Throws if the context is not
+    /// materialized or still has subjects (counting soft-deleted ones).
+    /// Redpanda additionally forbids deleting the default context.
+    virtual ss::future<>
+      delete_context(pandaproxy::schema_registry::context) = 0;
+
+    ///@}
 };
 } // namespace schema

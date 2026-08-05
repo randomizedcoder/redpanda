@@ -788,7 +788,13 @@ service::get_factory(model::transform_metadata meta) {
 ss::future<model::cluster_transform_report>
 service::compute_node_local_report() {
     co_return co_await container().map_reduce0(
-      [](service& s) { return s._manager->compute_report(); },
+      [](service& s) {
+          // The internal RPC server starts serving generate_report before the
+          // transform subsystem finishes booting. A peer shard may not have run
+          // service::start() yet, so its _manager may still be null.
+          return s._manager ? s._manager->compute_report()
+                            : model::cluster_transform_report{};
+      },
       model::cluster_transform_report{},
       [](
         model::cluster_transform_report agg,
@@ -911,7 +917,7 @@ ss::future<std::error_code> service::patch_transform_metadata(
 
     transform->paused = patch.paused.value_or(transform->paused);
     if (patch.env.has_value()) {
-        std::exchange(transform->environment, std::move(patch.env).value());
+        transform->environment = std::move(patch.env).value();
     }
     transform->compression_mode = patch.compression_mode.value_or(
       transform->compression_mode);

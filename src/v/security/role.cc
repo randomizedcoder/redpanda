@@ -10,10 +10,15 @@
 
 #include "security/role.h"
 
+#include "container/chunked_hash_map.h"
 #include "security/role_store.h"
+#include "ssx/async_algorithm.h"
+
+#include <seastar/core/future.hh>
 
 #include <algorithm>
 #include <ranges>
+#include <utility>
 
 namespace security {
 
@@ -86,6 +91,72 @@ auto role_store::range(std::function<bool(const role_accessor&)>&& pred) const
                })
                | std::views::filter(std::move(pred)) | std::views::keys;
     return {rng.begin(), rng.end()};
+}
+
+chunked_vector<role_with_members> role_store::roles_with_members(
+  const std::function<bool(const role_name&)>& pred) const {
+    // Seed with every matching role so roles with no members are still
+    // returned (they don't appear in the member store).
+    chunked_hash_map<role_name_view, role::container_type> by_role;
+    by_role.reserve(_roles.size());
+    for (const auto& rn : _roles) {
+        if (pred(rn)) {
+            by_role.try_emplace(role_name_view{rn});
+        }
+    }
+
+    for (const auto& [member, role_names] : _members_store) {
+        for (const auto& role_name : role_names) {
+            if (auto it = by_role.find(role_name); it != by_role.end()) {
+                it->second.insert(member);
+            }
+        }
+    }
+
+    chunked_vector<role_with_members> result;
+    result.reserve(by_role.size());
+    for (auto& [name_view, members] : by_role) {
+        result.push_back(
+          role_with_members{
+            .name = role_name{ss::sstring{name_view()}},
+            .role = role{std::move(members)}});
+    }
+    return result;
+}
+
+ss::future<chunked_vector<role_with_members>>
+role_store::all_roles_with_members() const {
+    // IMPORTANT: intended solely for security_manager::fill_snapshot.
+
+    // One counter spans all three phases so yield accounting is continuous.
+    ssx::async_counter counter;
+
+    chunked_hash_map<role_name_view, role::container_type> by_role;
+    by_role.reserve(_roles.size());
+    co_await ssx::async_for_each_counter(
+      counter, _roles, [&by_role](const role_name& rn) {
+          by_role.try_emplace(role_name_view{rn});
+      });
+
+    for (const auto& [member, role_names] : _members_store) {
+        co_await ssx::async_for_each_counter(
+          counter, role_names, [&by_role, &member](const role_name_view& rn) {
+              if (auto it = by_role.find(rn); it != by_role.end()) {
+                  it->second.insert(member);
+              }
+          });
+    }
+
+    chunked_vector<role_with_members> result;
+    result.reserve(by_role.size());
+    co_await ssx::async_for_each_counter(counter, by_role, [&result](auto& e) {
+        auto& [name_view, members] = e;
+        result.push_back(
+          role_with_members{
+            .name = role_name{ss::sstring{name_view()}},
+            .role = role{std::move(members)}});
+    });
+    co_return result;
 }
 
 } // namespace security

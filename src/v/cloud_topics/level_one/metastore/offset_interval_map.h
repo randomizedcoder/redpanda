@@ -72,8 +72,32 @@ public:
           .second;
     }
 
+    // Updates, in place, the value mapped to the inclusive range [base, last],
+    // but only if a range with exactly those bounds is present. Returns true
+    // iff such a range was found and updated; a range that merely contains or
+    // partially overlaps [base, last] is left untouched. The range itself is
+    // unchanged. The mirror of `insert`.
+    bool assign(kafka::offset base, kafka::offset last, V value) {
+        if (base > last) {
+            return false;
+        }
+        auto len = last() - base() + 1;
+        return map_.assign(
+          typename imap_t::interval{base(), len}, std::move(value));
+    }
+
     bool contains(kafka::offset offset) const {
         return map_.find(offset()) != map_.end();
+    }
+
+    // Returns whether the inclusive range [base, last] overlaps any range
+    // already present.
+    bool overlaps(kafka::offset base, kafka::offset last) const {
+        if (base > last) {
+            return false;
+        }
+        auto len = last() - base() + 1;
+        return map_.overlaps(typename imap_t::interval{base(), len});
     }
 
     // Returns whether every offset in the inclusive range [start, last] is

@@ -390,6 +390,7 @@ redpanda_cc_gtest(
         "//src/v/test_utils:gtest",
         "//src/v/test_utils:random_bytes",
         "@googletest//:gtest",
+        "@seastar",
         "@seastar//:testing",
     ],
 )
@@ -409,6 +410,22 @@ redpanda_cc_gtest(
         "//src/v/storage:record_batch_builder",
         "//src/v/test_utils:gtest",
         "@abseil-cpp//absl/container:btree",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "record_batch_utils_test",
+    timeout = "short",
+    srcs = [
+        "record_batch_utils_test.cc",
+    ],
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/storage:record_batch_utils",
+        "//src/v/test_utils:gtest",
         "@googletest//:gtest",
     ],
 )
@@ -710,6 +727,7 @@ redpanda_cc_gtest(
         "//src/v/storage/tests:storage_test_fixture",
         "//src/v/test_utils:gtest",
         "@boost//:range",
+        "@fmt",
         "@googletest//:gtest",
         "@seastar",
     ],
@@ -767,6 +785,7 @@ redpanda_cc_gtest(
     ],
     deps = [
         "//src/v/model",
+        "//src/v/storage",
         "//src/v/storage/tests:disk_log_builder",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
@@ -945,6 +964,7 @@ redpanda_cc_gtest(
     ],
     cpu = 1,
     deps = [
+        ":disk_log_builder",
         "//src/v/base",
         "//src/v/cluster",
         "//src/v/cluster:client_quota_backend",
@@ -962,6 +982,7 @@ redpanda_cc_gtest(
         "//src/v/features",
         "//src/v/kafka/server/tests:kafka_test_utils",
         "//src/v/model",
+        "//src/v/model:batch_builder",
         "//src/v/model:batch_compression",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",

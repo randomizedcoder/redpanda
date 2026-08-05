@@ -154,6 +154,38 @@ TEST(IntervalMap, InsertWithSparseOverlaps) {
     }
 }
 
+TEST(IntervalMap, Overlaps) {
+    imap map;
+    // An empty map overlaps nothing.
+    EXPECT_FALSE(map.overlaps({0, 10}));
+
+    // [10, 20) [30, 40)
+    EXPECT_TRUE(map.insert({10, 10}, 0).second);
+    EXPECT_TRUE(map.insert({30, 10}, 0).second);
+
+    // A zero-length interval never overlaps.
+    EXPECT_FALSE(map.overlaps({15, 0}));
+
+    // Exact, contained, and partial overlaps of an interval all report true.
+    EXPECT_TRUE(map.overlaps({10, 10}));
+    EXPECT_TRUE(map.overlaps({12, 3}));
+    EXPECT_TRUE(map.overlaps({5, 6}));  // [5, 11) reaches into [10, 20)
+    EXPECT_TRUE(map.overlaps({19, 5})); // [19, 24) reaches into [10, 20)
+
+    // Abutting-but-disjoint, the gap between intervals, and past the end do not
+    // overlap.
+    EXPECT_FALSE(map.overlaps({0, 10}));  // [0, 10) abuts [10, 20)
+    EXPECT_FALSE(map.overlaps({20, 10})); // [20, 30) sits in the gap
+    EXPECT_FALSE(map.overlaps({40, 10})); // [40, 50) past the end
+
+    // A range spanning the gap overlaps both intervals.
+    EXPECT_TRUE(map.overlaps({0, 50}));
+    EXPECT_TRUE(map.overlaps({19, 12})); // [19, 31) touches both
+
+    // overlaps() does not mutate the map.
+    EXPECT_EQ(map.size(), 2);
+}
+
 TEST(IntervalMap, FindInEmptyMapReturnsEnd) {
     const imap map;
     EXPECT_EQ(map.find(0), map.end());
@@ -368,4 +400,31 @@ TEST(IntervalMap, RandomIntervals) {
 
         seastar::maybe_yield().get();
     }
+}
+
+TEST(IntervalMap, AssignExactMatchOnly) {
+    imap map;
+    EXPECT_TRUE(map.insert({0, 10}, 1).second);
+    EXPECT_TRUE(map.insert({10, 10}, 2).second);
+
+    // Exact bounds: updates in place and leaves the interval set unchanged.
+    EXPECT_TRUE(map.assign({0, 10}, 100));
+    EXPECT_EQ(map.find(0)->second, 100);
+    EXPECT_EQ(map.size(), 2);
+    // The neighbouring interval is untouched.
+    EXPECT_EQ(map.find(10)->second, 2);
+
+    // Same base but wrong length (subset / superset) does not match.
+    EXPECT_FALSE(map.assign({0, 5}, 7));
+    EXPECT_FALSE(map.assign({0, 20}, 7));
+    EXPECT_EQ(map.find(0)->second, 100);
+
+    // An offset inside an interval that is not its base does not match.
+    EXPECT_FALSE(map.assign({5, 5}, 7));
+    EXPECT_EQ(map.find(0)->second, 100);
+
+    // Absent range and zero length are no-ops.
+    EXPECT_FALSE(map.assign({100, 10}, 7));
+    EXPECT_FALSE(map.assign({0, 0}, 7));
+    EXPECT_EQ(map.size(), 2);
 }

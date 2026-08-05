@@ -112,7 +112,7 @@ replicate_batcher::cache_and_wait_for_result(
     item_ptr item;
     try {
         auto holder = _bg.hold();
-        item = co_await do_cache(std::move(r), opts);
+        item = co_await do_cache_with_backpressure(std::move(r), opts);
 
         // now request is already enqueued, we can release first
         // stage future
@@ -169,24 +169,15 @@ ss::future<> replicate_batcher::stop() {
     });
 }
 
-ss::future<replicate_batcher::item_ptr> replicate_batcher::do_cache(
-  chunked_vector<model::record_batch> batches, replicate_options opts) {
-    size_t bytes = std::accumulate(
-      batches.cbegin(),
-      batches.cend(),
-      size_t{0},
-      [](size_t sum, const model::record_batch& b) {
-          return sum + b.size_bytes();
-      });
-    co_return co_await do_cache_with_backpressure(
-      std::move(batches), bytes, opts);
-}
-
 ss::future<replicate_batcher::item_ptr>
 replicate_batcher::do_cache_with_backpressure(
-  chunked_vector<model::record_batch> batches,
-  size_t bytes,
-  replicate_options opts) {
+  chunked_vector<model::record_batch> batches, replicate_options opts) {
+    size_t bytes = 0;
+    size_t record_count = 0;
+    for (const auto& b : batches) {
+        bytes += b.size_bytes();
+        record_count += b.record_count();
+    }
     /**
      * Produce a message larger than the internal raft batch accumulator
      * (default 1Mb) the semaphore can't be acquired. Closing
@@ -210,10 +201,6 @@ replicate_batcher::do_cache_with_backpressure(
           _max_batch_size_sem, std::min(bytes, _max_batch_size));
     }
 
-    size_t record_count = 0;
-    for (auto& b : batches) {
-        record_count += b.record_count();
-    }
     auto i = ss::make_lw_shared<item>(
       record_count, std::move(batches), std::move(u), opts);
 
@@ -260,7 +247,7 @@ ss::future<> replicate_batcher::flush(
         auto meta = _ptr->meta();
         const auto term = model::term_id(meta.term);
         chunked_vector<model::record_batch> data;
-        std::vector<item_ptr> notifications;
+        notifications_t notifications;
         ssx::semaphore_units item_memory_units(_max_batch_size_sem, 0);
         auto force_flush_requested = false;
         auto has_quorum_ack_requests = false;
@@ -279,9 +266,16 @@ ss::future<> replicate_batcher::flush(
                 has_quorum_ack_requests
                   = has_quorum_ack_requests
                     || (n->get_consistency_level() == consistency_level::quorum_ack);
-                for (auto& b : batches) {
-                    b.set_term(term);
-                    data.push_back(std::move(b));
+                if (data.empty()) {
+                    data = std::move(batches);
+                    for (auto& b : data) {
+                        b.set_term(term);
+                    }
+                } else {
+                    for (auto& b : batches) {
+                        b.set_term(term);
+                        data.push_back(std::move(b));
+                    }
                 }
                 notifications.push_back(std::move(n));
             } else {
@@ -336,7 +330,7 @@ ss::future<> replicate_batcher::flush(
 template<typename Predicate>
 static void propagate_result(
   result<replicate_result> r,
-  std::vector<replicate_batcher::item_ptr>& notifications,
+  replicate_batcher::notifications_t& notifications,
   const Predicate& pred) {
     if (r.has_error()) {
         // propagate an error
@@ -357,8 +351,8 @@ static void propagate_result(
     }
 }
 
-static void propagate_current_exception(
-  std::vector<replicate_batcher::item_ptr>& notifications) {
+static void
+propagate_current_exception(replicate_batcher::notifications_t& notifications) {
     // iterate backward to calculate last offsets
     auto e = std::current_exception();
     for (auto& n : notifications) {
@@ -367,7 +361,7 @@ static void propagate_current_exception(
 }
 
 ss::future<> replicate_batcher::do_flush(
-  std::vector<replicate_batcher::item_ptr> notifications,
+  replicate_batcher::notifications_t notifications,
   append_entries_request req,
   std::vector<ssx::semaphore_units> u,
   absl::flat_hash_map<vnode, follower_req_seq> seqs) {

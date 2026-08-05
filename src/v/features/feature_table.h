@@ -57,8 +57,12 @@ enum class feature : std::uint64_t {
     cloud_topics = 1ULL << 13U,
     tiered_cloud_topics = 1ULL << 14U,
     batch_mirror_topic_status = 1ULL << 15U,
+    shadow_link_sr_api_sync = 1ULL << 16U,
+    iceberg_extended_mode_config = 1ULL << 17U,
+    fetch_controller_snapshot_rpc = 1ULL << 18U,
     node_isolation = 1ULL << 19U,
     group_offset_retention = 1ULL << 20U,
+    shadow_link_role_sync = 1ULL << 21U,
     membership_change_controller_cmds = 1ULL << 22U,
     controller_snapshots = 1ULL << 23U,
     cloud_storage_manifest_format_v2 = 1ULL << 24U,
@@ -167,7 +171,8 @@ enum class release_version : int64_t {
     v25_3_1 = 17,
     v26_1_1 = 18,
     v26_2_1 = 19,
-    MAX = v26_2_1, // affects the latest_version
+    v26_3_1 = 20,
+    MAX = v26_3_1, // affects the latest_version
 };
 
 constexpr cluster::cluster_version to_cluster_version(release_version rv) {
@@ -189,6 +194,7 @@ constexpr cluster::cluster_version to_cluster_version(release_version rv) {
     case release_version::v25_3_1:
     case release_version::v26_1_1:
     case release_version::v26_2_1:
+    case release_version::v26_3_1:
         return cluster::cluster_version{static_cast<int64_t>(rv)};
     }
     vunreachable("Invalid release_version");
@@ -557,12 +563,36 @@ inline constexpr std::array feature_schema{
     release_version::v26_2_1,
     "tiered_cloud_topics",
     feature::tiered_cloud_topics,
-    feature_spec::available_policy::explicit_only,
+    feature_spec::available_policy::always,
     feature_spec::prepare_policy::always},
   feature_spec{
     release_version::v26_2_1,
     "batch_mirror_topic_status",
     feature::batch_mirror_topic_status,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "shadow_link_sr_api_sync",
+    feature::shadow_link_sr_api_sync,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "shadow_link_role_sync",
+    feature::shadow_link_role_sync,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "iceberg_extended_mode_config",
+    feature::iceberg_extended_mode_config,
+    feature_spec::available_policy::always,
+    feature_spec::prepare_policy::always},
+  feature_spec{
+    release_version::v26_2_1,
+    "fetch_controller_snapshot_rpc",
+    feature::fetch_controller_snapshot_rpc,
     feature_spec::available_policy::always,
     feature_spec::prepare_policy::always},
 };
@@ -637,7 +667,7 @@ public:
      * If the feature never activates (i.e. if shutting down while waiting),
      * the given function is not run.
      */
-    ss::future<> await_feature_then(feature f, std::function<void(void)> fn);
+    ss::future<> await_feature_then(feature f, std::function<void()> fn);
 
     ss::future<> await_feature_preparing(feature f, ss::abort_source& as);
 

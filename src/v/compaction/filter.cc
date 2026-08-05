@@ -9,12 +9,15 @@
 
 #include "filter.h"
 
+#include "base/vassert.h"
 #include "compaction/utils.h"
 #include "container/chunked_vector.h"
 #include "model/batch_compression.h"
 #include "model/record.h"
 
 #include <seastar/core/coroutine.hh>
+
+#include <algorithm>
 
 namespace compaction {
 
@@ -63,19 +66,28 @@ ss::future<std::optional<filter::filtered_batch>> filter::do_filter_batch(
     // filter
     iobuf ret;
     int32_t rec_count = 0;
+    // Re-base surviving records onto the first surviving record's timestamp, as
+    // Kafka does on compaction (MemoryRecordsBuilder.appendWithOffset): the
+    // first kept record sets the new first_timestamp and every kept delta is
+    // re-based relative to it.
     std::optional<int64_t> first_timestamp_delta;
-    int64_t last_timestamp_delta;
+    int64_t max_timestamp_delta = 0;
+    // We expect and enforce that offset_deltas is sorted.
+    dassert(
+      std::ranges::is_sorted(offset_deltas),
+      "offset_deltas must be ascending in record-iteration order");
+    size_t keep_idx = 0;
     co_await b.for_each_record_async([&rec_count,
                                       &first_timestamp_delta,
-                                      &last_timestamp_delta,
+                                      &max_timestamp_delta,
                                       &ret,
+                                      &keep_idx,
                                       &offset_deltas](model::record record) {
         // contains the key
         if (
-          std::count(
-            offset_deltas.begin(),
-            offset_deltas.end(),
-            record.offset_delta())) {
+          keep_idx < offset_deltas.size()
+          && offset_deltas[keep_idx] == record.offset_delta()) {
+            ++keep_idx;
             /*
              * TODO when we further optimize lazy record materialization ot
              * make use of views we can avoid this re-encoding by copying or
@@ -86,7 +98,12 @@ ss::future<std::optional<filter::filtered_batch>> filter::do_filter_batch(
             if (!first_timestamp_delta) {
                 first_timestamp_delta = record.timestamp_delta();
             }
-            last_timestamp_delta = record.timestamp_delta();
+            const auto rebased = record.timestamp_delta()
+                                 - *first_timestamp_delta;
+            if (rebased > max_timestamp_delta) {
+                max_timestamp_delta = rebased;
+            }
+            record.set_timestamp_delta(rebased);
             model::append_record_to_buffer(ret, record);
             ++rec_count;
         }
@@ -96,23 +113,16 @@ ss::future<std::optional<filter::filtered_batch>> filter::do_filter_batch(
         co_return std::nullopt;
     }
 
-    // There is no need to preserve the timestamp from the original
-    // batch after compaction. The FirstTimestamp field therefore always
-    // reflects the timestamp of the first record in the batch. If the batch
-    // is empty, the FirstTimestamp will be set to -1 (NO_TIMESTAMP).
-    //
-    // Similarly, the MaxTimestamp field reflects the maximum timestamp of
-    // the current records if the timestamp type is CREATE_TIME. For
-    // LOG_APPEND_TIME, on the other hand, the MaxTimestamp field reflects
-    // the timestamp set by the broker and is preserved after compaction.
-    // Additionally, the MaxTimestamp of an empty batch always retains the
-    // previous value prior to becoming empty.
+    // FirstTimestamp reflects the first surviving record; the per-record deltas
+    // were re-based onto it above, so absolute timestamps are unchanged.
+    // MaxTimestamp is the greatest surviving timestamp for CREATE_TIME; for
+    // LOG_APPEND_TIME it is the broker-set value and is preserved.
     auto& hdr = b.header();
     const auto first_time = model::timestamp(
       hdr.first_timestamp() + first_timestamp_delta.value());
     auto last_time = hdr.max_timestamp;
     if (hdr.attrs.timestamp_type() == model::timestamp_type::create_time) {
-        last_time = model::timestamp(first_time() + last_timestamp_delta);
+        last_time = model::timestamp(first_time() + max_timestamp_delta);
     }
     auto new_hdr = hdr;
     new_hdr.first_timestamp = first_time;

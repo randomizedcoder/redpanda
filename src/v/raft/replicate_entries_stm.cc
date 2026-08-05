@@ -9,6 +9,7 @@
 
 #include "raft/replicate_entries_stm.h"
 
+#include "absl/container/inlined_vector.h"
 #include "base/outcome.h"
 #include "base/outcome_future_utils.h"
 #include "model/fundamental.h"
@@ -34,21 +35,12 @@ ss::future<chunked_vector<model::record_batch>>
 replicate_entries_stm::share_batches() {
     // one extra copy is needed for retries
     chunked_vector<model::record_batch> batches;
-    batches.reserve(_batches->size());
-    co_await ssx::async_for_each(*_batches, [&batches](model::record_batch& b) {
+    batches.reserve(_batches.size());
+    co_await ssx::async_for_each(_batches, [&batches](model::record_batch& b) {
         batches.push_back(b.share());
     });
 
     co_return batches;
-}
-
-ss::future<> replicate_entries_stm::flush_log() {
-    auto flush_f = ss::now();
-    if (_is_flush_required) {
-        flush_f = _ptr->flush_log().discard_result();
-    }
-    _dispatch_sem.signal();
-    return flush_f;
 }
 
 clock_type::time_point replicate_entries_stm::append_entries_timeout() {
@@ -96,13 +88,25 @@ replicate_entries_stm::send_append_entries_request(
 }
 
 ss::future<> replicate_entries_stm::dispatch_one(vnode id) {
-    return ss::with_gate(
-             _req_bg,
-             [this, id]() mutable {
-                 return id == _ptr->self() ? flush_log()
-                                           : dispatch_remote_append_entries(id);
-             })
-      .handle_exception_type([](const ss::gate_closed_exception&) {});
+    try {
+        auto holder = _req_bg.hold();
+        if (id == _ptr->self()) {
+            // self dispatch means flushing the leader log
+            if (_is_flush_required) {
+                // start the flush before signalling the dispatch semaphore,
+                // the dispatcher only waits for the flush to be started, not
+                // to finish
+                auto flush_f = _ptr->flush_log();
+                _dispatch_sem.signal();
+                co_await std::move(flush_f);
+            } else {
+                _dispatch_sem.signal();
+            }
+        } else {
+            co_await dispatch_remote_append_entries(id);
+        }
+    } catch (const ss::gate_closed_exception&) {
+    }
 }
 
 ss::future<> replicate_entries_stm::dispatch_remote_append_entries(vnode id) {
@@ -235,13 +239,15 @@ inline bool replicate_entries_stm::should_skip_follower_request(vnode id) {
 
 ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
     // first append lo leader log, no flushing
-    auto cfg = _ptr->config();
-    cfg.for_each_replica([this](const vnode& rni) {
+    const auto& config_replicas = _ptr->config().replicas();
+    absl::InlinedVector<vnode, 5> replicas(
+      config_replicas.begin(), config_replicas.end());
+    for (const auto& rni : replicas) {
         // suppress follower heartbeat, before appending to self log
         if (rni != _ptr->_self) {
             _inflight_appends.emplace(rni, _ptr->track_append_inflight(rni));
         }
-    });
+    }
     _units = ss::make_lw_shared<units_t>(std::move(u));
     _append_result = co_await append_to_self();
 
@@ -252,12 +258,12 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
     // store committed offset to check if it advanced
     _initial_committed_offset = _ptr->committed_offset();
     // dispatch requests to followers & leader flush
-    cfg.for_each_replica([this](const vnode& rni) {
+    for (const auto& rni : replicas) {
         // We are not dispatching request to followers that are
         // recovering
         if (should_skip_follower_request(rni)) {
             _inflight_appends[rni].mark_finished();
-            return;
+            continue;
         }
         if (rni != _ptr->self()) {
             auto it = _ptr->_fstates.find(rni);
@@ -268,7 +274,7 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
         }
         ++_requests_count;
         (void)dispatch_one(rni); // background
-    });
+    }
 
     // wait for the requests to be dispatched in background and then release
     // units
@@ -276,7 +282,7 @@ ss::future<result<replicate_result>> replicate_entries_stm::apply(units_t u) {
         // Wait until all RPCs will be dispatched
         return _dispatch_sem.wait(_requests_count).then([this] {
             // release memory reservations, and destroy data
-            _batches.reset();
+            _batches = {};
             _units.release();
         });
     });
@@ -365,9 +371,7 @@ replicate_entries_stm::replicate_entries_stm(
   , _meta(r.metadata())
   , _is_flush_required(r.is_flush_required())
   , _batches_size(r.batches_size())
-  , _batches(
-      std::make_unique<chunked_vector<model::record_batch>>(
-        std::move(r).release_batches()))
+  , _batches(std::move(r).release_batches())
   , _followers_seq(std::move(seqs))
   , _ctxlog(_ptr->_ctxlog) {}
 

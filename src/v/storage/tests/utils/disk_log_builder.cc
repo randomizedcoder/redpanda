@@ -182,7 +182,9 @@ void disk_log_builder::add_closed_segment_bytes(ssize_t bytes) {
 
 ss::future<> disk_log_builder::stop() {
     _log->stm_hookset()->stop();
-    return _storage.stop().then([this]() { return _feature_table.stop(); });
+    co_await _storage.stop();
+    _storage.reset();
+    co_await _feature_table.stop();
 }
 
 // Low lever interface access
@@ -239,7 +241,7 @@ ss::future<> disk_log_builder::write(
     disk_log_appender appender(
       get_disk_log_impl(), config, log_clock::now(), base_offset);
     return std::move(reader)
-      .for_each_ref(std::move(appender), config.timeout)
+      .for_each_ref(std::move(appender), model::no_timeout)
       .then([this, flush](storage::append_result ar) {
           _bytes_written += ar.byte_size;
           if (flush) {

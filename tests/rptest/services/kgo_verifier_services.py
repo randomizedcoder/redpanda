@@ -252,7 +252,7 @@ class KgoVerifierService(Service):
         # it is the one who actually replied to the `await_ready` calls.
         # Check that the PID we just launched is still running as a confirmation
         # that it is the one.
-        self._assert_running(node)
+        self.check_running(node)
         self._stopped = False
 
     def _await_ready(self, node: ClusterNode) -> None:
@@ -278,8 +278,56 @@ class KgoVerifierService(Service):
         else:
             return r.status_code == 200
 
-    def _assert_running(self, node: ClusterNode) -> None:
-        node.account.ssh_output(f"ps -p {self._pid}", allow_fail=False)
+    def _is_pid_running(self, node: ClusterNode) -> bool:
+        assert self._pid is not None, "worker must be started and not yet stopped"
+        return node.account.exists(f"/proc/{self._pid}")
+
+    def check_running(self, node: ClusterNode, classify: bool = False) -> None:
+        """
+        Raise if the remote process is not running.
+
+        When ``classify`` is set, tail the worker log to describe *why* it
+        exited and append that to the error, so the failure is self-diagnosing.
+        Off by default to keep the hot path (spawn confirmation) a cheap pid
+        probe; callers on a failure path (e.g. the status thread) opt in.
+        """
+        if self._is_pid_running(node):
+            return
+        msg = (
+            f"{self.who_am_i()} on {node.name} exited unexpectedly "
+            f"(pid {self._pid} gone)"
+        )
+        if classify:
+            cause = self._classify_exit(node)
+            if cause is not None:
+                msg = f"{msg}: {cause}"
+        raise RuntimeError(msg)
+
+    def _classify_exit(self, node: ClusterNode) -> str | None:
+        """Best-effort cause of a worker exit, from the tail of its log.
+
+        A Go ``panic`` => an unexpected internal client crash; a fatal/error
+        line logged just before exit => a fatal error surfaced through the Kafka
+        protocol (kgo-verifier's ``util.Die`` logs at error level then exits;
+        data-loss detection logs at fatal level). Returns None if the cause
+        can't be determined or the log can't be read.
+        """
+        try:
+            out = node.account.ssh_output(
+                f"tail -n 50 {self.log_path}", timeout_sec=30, allow_fail=True
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"{self.who_am_i()} could not read log to classify exit: {e}"
+            )
+            return None
+        tail = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else out
+        self.logger.warning(f"{self.who_am_i()} exit log tail:\n{tail}")
+        if "panic:" in tail:
+            return "internal client crash (panic)"
+        if "level=fatal" in tail or "level=error" in tail:
+            return "fatal error propagated through the protocol"
+        return None
 
     def stop_node(self, node: ClusterNode, **kwargs: Any) -> None:
         error = None
@@ -358,7 +406,8 @@ class KgoVerifierService(Service):
             return self._do_wait_node(node, timeout_sec)
         except:
             try:
-                self._remote(node, "print_stack")
+                if self._is_pid_running(node):
+                    self._remote(node, "print_stack")
             except Exception as e:
                 self._redpanda.logger.warning(
                     f"{self.who_am_i()} failed to print stacks during wait failure: {e}"
@@ -501,11 +550,19 @@ class StatusThread(threading.Thread):
     def run(self) -> None:
         try:
             self.poll_status()
-        except Exception as ex:
-            self._ex = ex
+        except Exception as poll_ex:
             self.logger.exception(
-                f"Error reading status from {self.who_am_i} on {self._node.name}"
+                f"Error reading status from {self.who_am_i} on {self._node.name}: {poll_ex}"
             )
+            # Prefer the worker-exit error when the status read failed because
+            # the process is already gone; classify the exit cause for a
+            # self-diagnosing error.
+            try:
+                self._parent.check_running(self._node, classify=True)
+            except Exception as crash_ex:
+                self._ex = crash_ex
+            else:
+                self._ex = poll_ex
 
     def _ingest_status(self, worker_statuses: list[dict[str, Any]]) -> None:
         self.logger.debug(f"{self.who_am_i} status: {worker_statuses}")
@@ -1222,7 +1279,7 @@ class ProduceStatus:
         bad_offsets=0,
         max_offsets_produced=dict(),
         restarts=0,
-        latency=None,
+        latency: dict[str, float] | None = None,
         active=False,
         failed_transactions=0,
         aborted_transaction_msgs=0,
@@ -1236,7 +1293,7 @@ class ProduceStatus:
         self.max_offsets_produced = max_offsets_produced
         self.restarts = restarts
         if latency is None:
-            latency = {"p50": 0, "p90": 0, "p99": 0}
+            latency = {"p50": 0.0, "p90": 0.0, "p99": 0.0}
         self.latency = latency
         self.active = active
         self.failed_transactions = failed_transactions

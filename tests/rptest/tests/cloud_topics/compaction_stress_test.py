@@ -19,7 +19,6 @@ from rptest.services.kgo_verifier_services import (
     KgoVerifierProducer,
     KgoVerifierSeqConsumer,
 )
-from rptest.services.redpanda import MetricsEndpoint
 from rptest.tests.cloud_topics.e2e_test import EndToEndCloudTopicsBase
 from rptest.utils.mode_checks import is_debug_mode
 
@@ -55,40 +54,7 @@ class CompactionStressBase(EndToEndCloudTopicsBase):
             environment=environment,
         )
 
-    # ── Metric helpers ──────────────────────────────────────────────
-
-    def _metric_sum(self, metric_name: str) -> float:
-        assert self.redpanda
-        return self.redpanda.metric_sum(
-            metric_name=metric_name,
-            metrics_endpoint=MetricsEndpoint.METRICS,
-            expect_metric=True,
-        )
-
-    def get_log_compactions(self) -> float:
-        return self._metric_sum(
-            "vectorized_cloud_topics_compaction_scheduler_log_compactions"
-        )
-
-    def get_records_removed(self) -> float:
-        return self._metric_sum(
-            "vectorized_cloud_topics_compaction_worker_records_removed"
-        )
-
-    def get_managed_logs(self) -> float:
-        return self._metric_sum(
-            "vectorized_cloud_topics_compaction_scheduler_managed_log_count"
-        )
-
     # ── Wait helpers ────────────────────────────────────────────────
-
-    def wait_for_managed_logs(self, timeout_sec: int = 60):
-        wait_until(
-            lambda: self.get_managed_logs() > 0,
-            timeout_sec=timeout_sec,
-            backoff_sec=1,
-            err_msg="Did not see management of compact-enabled CTPs.",
-        )
 
     def wait_for_compaction_rounds(
         self,
@@ -120,53 +86,6 @@ class CompactionStressBase(EndToEndCloudTopicsBase):
                 f"Expected >= {min_removed} records removed, "
                 f"got {self.get_records_removed()}"
             ),
-        )
-
-    def wait_for_compaction_quiesce(
-        self,
-        stable_sec: int = 30,
-        timeout_sec: int = 360,
-    ):
-        """
-        Wait for records_removed to stabilize, meaning compaction has
-        converged and there is nothing left to remove. The metric must
-        remain unchanged for `stable_sec` consecutive seconds.
-        """
-        import time
-
-        # First wait for at least one removal so we know compaction started.
-        wait_until(
-            lambda: self.get_records_removed() > 0,
-            timeout_sec=60,
-            backoff_sec=2,
-            err_msg="Compaction never started removing records",
-        )
-
-        prev = self.get_records_removed()
-        stable_since = time.time()
-
-        def _stable() -> bool:
-            nonlocal prev, stable_since
-            now_removed = self.get_records_removed()
-            if now_removed != prev:
-                self.logger.info(
-                    f"Compaction still active: records_removed {prev} -> {now_removed}"
-                )
-                prev = now_removed
-                stable_since = time.time()
-            return time.time() - stable_since >= stable_sec
-
-        wait_until(
-            _stable,
-            timeout_sec=timeout_sec,
-            backoff_sec=5,
-            err_msg=lambda: (
-                f"Compaction did not quiesce within {timeout_sec}s "
-                f"(records_removed={self.get_records_removed()})"
-            ),
-        )
-        self.logger.info(
-            f"Compaction quiesced: {self.get_records_removed()} records removed"
         )
 
     def produce_and_wait(
@@ -266,7 +185,7 @@ class CompactionStressKeyCardinalityTest(CompactionStressBase):
         storage_mode = (self.test_context.injected_args or {}).get(
             "storage_mode", TopicSpec.STORAGE_MODE_CLOUD
         )
-        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+        if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.redpanda.set_feature_active(
                 "tiered_cloud_topics", True, timeout_sec=30
             )
@@ -275,7 +194,7 @@ class CompactionStressKeyCardinalityTest(CompactionStressBase):
             partitions=1,
             replicas=3,
             config={
-                TopicSpec.PROPERTY_STORAGE_MODE: storage_mode,
+                **TopicSpec.storage_mode_config(storage_mode),
                 "cleanup.policy": TopicSpec.CLEANUP_COMPACT,
                 "min.cleanable.dirty.ratio": "0.0",
             },
@@ -285,7 +204,7 @@ class CompactionStressKeyCardinalityTest(CompactionStressBase):
     @matrix(
         storage_mode=[
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         ],
     )
     def test_key_cardinality_overflow(self, storage_mode: str):
@@ -463,3 +382,108 @@ class CompactionStressWritePressureTest(CompactionStressBase):
             )
         finally:
             producer.stop()
+
+
+class CompactionPreregistrationTTLTest(CompactionStressBase):
+    """
+    Regression test: a compaction job whose duration exceeds
+    `cloud_topics_preregistered_object_ttl` must still be able to commit.
+
+    A compaction job preregisters its output L1 objects as it creates them,
+    and the metastore GC expires preregistrations older than the TTL. If the
+    job outlives the TTL, its preregistrations are expired mid-flight and
+    every commit is rejected with invalid_request ("object ... not
+    pre-registered"). The job then re-runs for the same duration and fails
+    the same way, forever, so any partition whose compaction takes longer
+    than the TTL livelocks and starves compaction of other partitions.
+
+    We shrink the TTL below the job duration (and speed up the GC that
+    enforces it) and require compaction to make committed progress anyway.
+    """
+
+    TOPIC_NAME = "prereg_ttl_stress"
+    MSG_SIZE = 512
+    # Well below any realistic job duration for this data volume; the GC
+    # enforcing it runs every second.
+    PREREG_TTL_MS = 15_000
+
+    if is_debug_mode():
+        key_set_cardinality = 10_000
+        msg_count = 50_000
+    else:
+        key_set_cardinality = 100_000
+        msg_count = 1_000_000
+
+    def __init__(self, test_context: TestContext):
+        super().__init__(
+            test_context,
+            extra_rp_conf={
+                "cloud_topics_preregistered_object_ttl": self.PREREG_TTL_MS,
+                "cloud_topics_long_term_garbage_collection_interval": 1_000,
+                # Small output objects, source extents, and commit interval
+                # so incremental commits fire frequently: an output object is
+                # preregistered when its builder is created and must be
+                # committed within the TTL, and commits can only happen at
+                # source extent boundaries once a commit interval's worth of
+                # output is pending.
+                "cloud_topics_compaction_max_object_size": 1024 * 1024,
+                "cloud_topics_reconciliation_max_object_size": 8 * 1024 * 1024,
+                "cloud_topics_compaction_commit_interval_bytes": 1024 * 1024,
+                "cloud_topics_leveling_commit_interval_bytes": 1024 * 1024,
+            },
+        )
+
+    def setUp(self):
+        assert self.redpanda
+        self.redpanda.start()
+        self.rpk.create_topic(
+            topic=self.TOPIC_NAME,
+            partitions=1,
+            replicas=3,
+            config={
+                **TopicSpec.storage_mode_config(TopicSpec.STORAGE_MODE_CLOUD),
+                "cleanup.policy": TopicSpec.CLEANUP_COMPACT,
+                "min.cleanable.dirty.ratio": "0.0",
+            },
+        )
+
+    def get_compaction_objects_committed(self) -> float:
+        return self._metric_sum(
+            "vectorized_cloud_topics_compaction_worker_"
+            "compaction_objects_committed_total"
+        )
+
+    @cluster(num_nodes=4)
+    def test_commit_survives_prereg_ttl(self):
+        self.wait_for_managed_logs()
+
+        producer = self.produce_and_wait(
+            topic=self.TOPIC_NAME,
+            msg_size=self.MSG_SIZE,
+            msg_count=self.msg_count,
+            key_set_cardinality=self.key_set_cardinality,
+        )
+
+        # Compaction of this data volume takes far longer than the TTL. If
+        # in-flight preregistrations are not protected from GC expiry, every
+        # commit is rejected and this counter never moves.
+        wait_until(
+            lambda: self.get_compaction_objects_committed() > 0,
+            timeout_sec=600,
+            backoff_sec=10,
+            err_msg=lambda: (
+                "Compaction never committed any objects "
+                f"(committed={self.get_compaction_objects_committed()}, "
+                f"rounds={self.get_log_compactions()}, "
+                f"records_removed={self.get_records_removed()}). "
+                "Check for 'Could not commit' WARNs / 'not pre-registered' "
+                "rejections: compaction jobs outliving "
+                "cloud_topics_preregistered_object_ttl cannot commit."
+            ),
+        )
+
+        self.wait_for_compaction_quiesce()
+        self.consume_and_verify(
+            topic=self.TOPIC_NAME,
+            producer=producer,
+        )

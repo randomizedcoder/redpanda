@@ -104,7 +104,9 @@ public:
       ss::semaphore::time_point timeout) final;
 
     ss::future<std::optional<offset_range_size_result_t>> offset_range_size(
-      model::offset first, offset_range_size_requirements_t target) final;
+      model::offset first,
+      offset_range_size_requirements_t target,
+      ss::semaphore::time_point deadline) final;
 
     bool is_compacted(model::offset first, model::offset last) const final;
 
@@ -138,6 +140,9 @@ public:
 
     std::optional<model::offset>
       retention_offset(storage::gc_config) const final;
+
+    ss::future<std::optional<model::offset>>
+      compute_gc_offset(storage::gc_config) final;
 
     ssize_t dirty_segment_bytes() const final;
     ssize_t closed_segment_bytes() const final;

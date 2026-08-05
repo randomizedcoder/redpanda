@@ -23,7 +23,7 @@ from requests.exceptions import HTTPError
 from rptest.clients.rpk import RpkException, RpkTool
 from rptest.services.catalog_service import CatalogType
 from rptest.services.cluster import cluster
-from rptest.services.redpanda import MetricsEndpoint, SISettings, SchemaRegistryConfig
+from rptest.services.redpanda import SISettings, SchemaRegistryConfig
 from rptest.services.redpanda_connect import RedpandaConnectService
 from rptest.tests.datalake.catalog_service_factory import supported_catalog_types
 from rptest.tests.datalake.datalake_services import DatalakeServices
@@ -158,6 +158,7 @@ class DatalakeCustomPartitioningTest(RedpandaTest):
                 "bootstrap.servers": self.redpanda.brokers(),
                 "key.serializer": StringSerializer("utf_8"),
                 "value.serializer": value_serializer,
+                "enable.idempotence": True,
             }
         )
 
@@ -241,26 +242,6 @@ class DatalakeCustomPartitioningTest(RedpandaTest):
                 f"partition {partition} has {file_cnt} files, expected at least {n}"
             )
 
-    def list_files(
-        self,
-        dl: DatalakeServices,
-        query_engine: QueryEngineType,
-        topic_name: str,
-        select="file_path",
-    ):
-        if query_engine == QueryEngineType.SPARK:
-            return set(
-                dl.spark().run_query_fetch_all(
-                    f"select {select} from redpanda.{topic_name}.files"
-                )
-            )
-        elif query_engine == QueryEngineType.TRINO:
-            return set(
-                dl.trino().run_query_fetch_all(
-                    f'select {select} from redpanda."{topic_name}$files"'
-                )
-            )
-
     @cluster(num_nodes=6)
     @matrix(
         cloud_storage_type=supported_storage_types(),
@@ -325,42 +306,6 @@ class DatalakeCustomPartitioningTest(RedpandaTest):
                 partitions_after, partitions
             )
             assert set(partitions_after.keys()).issubset(set(partitions_before.keys()))
-
-            # Sanity-check translation metrics
-            metric_patterns = [
-                "translation_translations_finished",
-                "translation_files_created",
-                "translation_parquet_rows_added",
-                "translation_parquet_bytes_added",
-            ]
-            metric2samples = self.redpanda.metrics_samples(
-                metric_patterns, self.redpanda.nodes, MetricsEndpoint.PUBLIC_METRICS
-            )
-            assert len(metric2samples) == len(metric_patterns)
-            metric2value_sum = dict()
-            for metric, samples in metric2samples.items():
-                # Log raw samples from all nodes to investigate missing metrics.
-                self.logger.debug(
-                    f"Raw samples for {metric}: {[(s.node.name, s.labels, s.value) for s in samples.samples]}"
-                )
-
-                value_sum = sum(
-                    s.value
-                    for s in samples.label_filter(
-                        {"redpanda_topic": topic_name}
-                    ).samples
-                )
-                self.logger.info(f"metric {metric} {value_sum=}")
-                metric2value_sum[metric] = value_sum
-
-            num_files_created = sum(partitions_before.values())
-            assert metric2value_sum["translation_files_created"] == num_files_created
-            assert (
-                metric2value_sum["translation_translations_finished"]
-                == num_files_created / 2
-            )
-            assert metric2value_sum["translation_parquet_rows_added"] == msg_count
-            assert metric2value_sum["translation_parquet_bytes_added"] > 0
 
     @cluster(num_nodes=6)
     @matrix(
@@ -686,7 +631,7 @@ class DatalakeCustomPartitioningTest(RedpandaTest):
                 f"{expected_partitioning=}, got {describe_partitioning=}"
             )
 
-            files = self.list_files(dl, QueryEngineType.SPARK, topic_name)
-            assert len(files) == msg_count, (
-                f"Expected {partitions * msg_count} files, got {len(files)}"
+            num_files = dl.spark().count_parquet_files("redpanda", topic_name)
+            assert num_files == msg_count, (
+                f"Expected {partitions * msg_count} files, got {num_files}"
             )

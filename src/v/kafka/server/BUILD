@@ -70,6 +70,7 @@ redpanda_cc_library(
         "//src/v/pandaproxy/schema_registry:types",
         "//src/v/security",
         "//src/v/serde:chrono",
+        "//src/v/ssx:sformat",
         "//src/v/strings:string_switch",
         "//src/v/utils:absl_sstring_hash",
         "//src/v/utils:tristate",
@@ -104,6 +105,18 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "roles",
+    hdrs = [
+        "handlers/details/roles.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/kafka/protocol/schemata:describe_redpanda_roles_response",
+        "//src/v/security",
+    ],
+)
+
+redpanda_cc_library(
     name = "server",
     srcs = [
         "client_quota_translator.cc",
@@ -111,6 +124,7 @@ redpanda_cc_library(
         "data_migration_group_proxy_impl.cc",
         "fetch_memory_units.cc",
         "fetch_pid_controller.cc",
+        "fetch_read_coalescer.cc",
         "fetch_session_cache.cc",
         "group.cc",
         "group_initializer.cc",
@@ -133,6 +147,7 @@ redpanda_cc_library(
         "handlers/describe_configs.cc",
         "handlers/describe_log_dirs.cc",
         "handlers/describe_producers.cc",
+        "handlers/describe_redpanda_roles.cc",
         "handlers/describe_transactions.cc",
         "handlers/describe_user_scram_credentials.cc",
         "handlers/fetch.cc",
@@ -167,6 +182,7 @@ redpanda_cc_library(
         "fetch_memory_units.h",
         "fetch_metadata_cache.h",
         "fetch_pid_controller.h",
+        "fetch_read_coalescer.h",
         "fetch_session.h",
         "fetch_session_cache.h",
         "fwd.h",
@@ -201,6 +217,7 @@ redpanda_cc_library(
         "handlers/describe_groups.h",
         "handlers/describe_log_dirs.h",
         "handlers/describe_producers.h",
+        "handlers/describe_redpanda_roles.h",
         "handlers/describe_transactions.h",
         "handlers/describe_user_scram_credentials.h",
         "handlers/details/alter_config_utils.h",
@@ -270,6 +287,7 @@ redpanda_cc_library(
         ":datalake_usage_api",
         ":logger",
         ":qdc_monitor_config",
+        ":roles",
         ":security",
         ":topic_config_utils",
         "//proto/redpanda/core/admin/v2:kafka_connections_redpanda_proto",
@@ -303,6 +321,7 @@ redpanda_cc_library(
         "//src/v/cluster:shard_table",
         "//src/v/cluster:state_machine_registry",
         "//src/v/cluster:tm_stm",
+        "//src/v/cluster:topic_configuration",
         "//src/v/cluster:topic_table",
         "//src/v/cluster:tx_protocol_types",
         "//src/v/cluster:types",
@@ -313,6 +332,7 @@ redpanda_cc_library(
         "//src/v/container:intrusive",
         "//src/v/datalake:partition_spec_parser",
         "//src/v/features",
+        "//src/v/hashing:combine",
         "//src/v/hashing:jump_consistent",
         "//src/v/hashing:xx",
         "//src/v/kafka/data:partition_proxy",
@@ -338,6 +358,7 @@ redpanda_cc_library(
         "//src/v/kafka/protocol:describe_groups",
         "//src/v/kafka/protocol:describe_log_dirs",
         "//src/v/kafka/protocol:describe_producers",
+        "//src/v/kafka/protocol:describe_redpanda_roles",
         "//src/v/kafka/protocol:describe_transactions",
         "//src/v/kafka/protocol:describe_user_scram_credentials",
         "//src/v/kafka/protocol:end_txn",
@@ -441,6 +462,7 @@ redpanda_cc_library(
         "//src/v/strings:string_switch",
         "//src/v/strings:utf8",
         "//src/v/utils:absl_sstring_hash",
+        "//src/v/utils:chunked_kv_cache",
         "//src/v/utils:ema",
         "//src/v/utils:log_hist",
         "//src/v/utils:moving_average",

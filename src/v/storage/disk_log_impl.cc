@@ -90,6 +90,14 @@ namespace storage {
  * driven / constrained by historical reads. Similarly for transactions and
  * idempotence. Controller topic should space can be managed by snapshots.
  *
+ * Topics listed in the log_eviction_exempt_topics cluster property are also
+ * exempt. It defaults to the schema registry topic (kafka/_schemas) for the
+ * same reason: the schema registry replays the full topic on startup, so
+ * trimming its local log to the cloud tier (via local retention or space
+ * management on a tiered topic) would make recovery dependent on cloud
+ * reads. Its size is bounded by compaction, so retaining it locally is
+ * cheap.
+ *
  * Note on unsafe_enable_consumer_offsets_delete_retention: This a special
  * configuration some select users can use to enable retention on CO topic
  * because the compaction logic is ineffective and they would like to use
@@ -105,8 +113,14 @@ bool deletion_exempt(const model::ntp& ntp) {
                                      == model::kafka_consumer_offsets_nt.ns()
                                    && ntp.tp.topic
                                         == model::kafka_consumer_offsets_nt.tp;
+    bool is_eviction_exempt_topic
+      = ntp.ns() == model::kafka_namespace
+        && std::ranges::contains(
+          config::shard_local_cfg().log_eviction_exempt_topics(),
+          ntp.tp.topic());
     return (!is_tx_manager_ntp && is_internal_namespace)
-           || (is_consumer_offsets_ntp && !config::shard_local_cfg().unsafe_enable_consumer_offsets_delete_retention());
+           || (is_consumer_offsets_ntp && !config::shard_local_cfg().unsafe_enable_consumer_offsets_delete_retention())
+           || is_eviction_exempt_topic;
 }
 
 // Meant for reading batches from a single `segment`. This does not consider any
@@ -1226,8 +1240,11 @@ disk_log_impl::maybe_apply_local_storage_overrides(gc_config cfg) const {
         return cfg;
     }
 
-    // cloud_retention is disabled, do not override
-    if (!is_cloud_retention_active()) {
+    // cloud_retention is disabled, do not override. Cloud-topic partitions
+    // (storage.mode in {cloud, tiered_cloud}) bypass this gate:
+    // is_archival_active() is false for them, but ctp_stm still needs
+    // the local-target override to engage under retention_local_strict.
+    if (!is_archival_active() && !config().cloud_topic_enabled()) {
         return cfg;
     }
 
@@ -1307,9 +1324,13 @@ gc_config disk_log_impl::apply_local_storage_overrides(gc_config cfg) const {
     return cfg;
 }
 
-bool disk_log_impl::is_cloud_retention_active() const {
+bool disk_log_impl::is_archival_active() const {
     return config::shard_local_cfg().cloud_storage_enabled()
            && (config().is_archival_enabled());
+}
+
+bool disk_log_impl::is_cloud_gc_active() const {
+    return is_archival_active() || config().is_tiered_cloud();
 }
 
 /*
@@ -1697,7 +1718,7 @@ ss::future<> disk_log_impl::rewrite_segment_with_offset_map(
       tmpname);
 
     auto rdr_holder = co_await _readers_cache->evict_segment_readers(seg);
-    auto write_lock = co_await seg->write_lock();
+    auto write_lock = co_await seg->write_lock(*cfg.asrc);
     if (initial_generation_id != seg->get_generation_id()) {
         throw std::runtime_error(
           fmt::format(
@@ -1766,6 +1787,10 @@ ss::future<> disk_log_impl::gc(gc_config cfg) {
 
 ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
     vassert(!_closed, "gc on closed log - {}", *this);
+    vassert(
+      !config().cloud_topic_enabled(),
+      "[{}] gc on cloud topic partition",
+      config().ntp());
 
     cfg = apply_overrides(cfg);
 
@@ -1780,7 +1805,7 @@ ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
         const auto offset = _cloud_gc_offset.value();
         _cloud_gc_offset.reset();
 
-        if (!is_cloud_retention_active()) {
+        if (!is_archival_active()) {
             vlog(
               gclog.warn,
               "[{}] expected remote retention to be active",
@@ -1809,7 +1834,7 @@ ss::future<std::optional<model::offset>> disk_log_impl::do_gc(gc_config cfg) {
       config().ntp(),
       cfg);
 
-    auto max_offset = co_await maybe_adjusted_retention_offset(cfg);
+    auto max_offset = co_await compute_gc_offset(cfg);
 
     if (max_offset) {
         co_return request_eviction_until_offset(*max_offset);
@@ -1904,6 +1929,24 @@ ss::future<> disk_log_impl::maybe_adjust_retention_timestamps() {
 ss::future<std::optional<model::offset>>
 disk_log_impl::maybe_adjusted_retention_offset(gc_config cfg) {
     co_await maybe_adjust_retention_timestamps();
+    co_return retention_offset(cfg);
+}
+
+ss::future<std::optional<model::offset>>
+disk_log_impl::compute_gc_offset(gc_config cfg) {
+    // Single GC-offset computation shared by gc() housekeeping and by
+    // ctp_stm for cloud-topic partitions. The offset is retention-driven
+    // unless space management has pinned _cloud_gc_offset, which then takes
+    // precedence. maybe_apply_local_storage_overrides
+    // bypasses the is_archival_active() gate for cloud-topic partitions
+    // (the gate is false for storage.mode in {cloud, tiered_cloud}), so the
+    // local-target override engages there under retention_local_strict.
+    cfg = apply_kafka_retention_overrides(cfg);
+    if (_cloud_gc_offset.has_value()) {
+        co_return std::exchange(_cloud_gc_offset, std::nullopt);
+    }
+    co_await maybe_adjust_retention_timestamps();
+    cfg = maybe_apply_local_storage_overrides(cfg);
     co_return retention_offset(cfg);
 }
 
@@ -2090,7 +2133,6 @@ model::offset get_next_append_offset(const offset_stats& offsets) {
 }
 } // namespace
 
-// config timeout is for the one calling reader consumer
 log_appender disk_log_impl::make_appender(log_append_config cfg) {
     throw_if_closed();
     auto now = log_clock::now();
@@ -2754,7 +2796,9 @@ disk_log_impl::offset_range_size(
 
 ss::future<std::optional<log::offset_range_size_result_t>>
 disk_log_impl::offset_range_size(
-  model::offset first, offset_range_size_requirements_t target) {
+  model::offset first,
+  offset_range_size_requirements_t target,
+  ss::semaphore::time_point deadline) {
     vlog(
       stlog.debug,
       "Offset range size, first: {}, target size: {}/{}, lstat: {}",
@@ -2806,7 +2850,7 @@ disk_log_impl::offset_range_size(
         model::offset last_locked_offset;
         for (auto& s : _segs) {
             locked_range_size += s->size_bytes();
-            f_locks.emplace_back(s->read_lock());
+            f_locks.emplace_back(s->read_lock(deadline));
             segments.emplace_back(s);
             last_locked_offset = s->offsets().get_committed_offset();
             if (locked_range_size > (target.target_size + first_segment_size)) {
@@ -3901,7 +3945,7 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
           && seg->offsets().get_dirty_offset() <= retention_offset.value()) {
             retention_segments.push_back(seg);
         } else if (
-          is_cloud_retention_active()
+          is_cloud_gc_active()
           && seg->offsets().get_dirty_offset() <= max_removable) {
             available_segments.push_back(seg);
         } else {
@@ -3917,8 +3961,8 @@ disk_log_impl::disk_usage_and_reclaimable_space(gc_config input_cfg) {
          * get_reclaimable_offsets is going to be merged together.
          */
         if (
-          !config().is_read_replica_mode_enabled()
-          && is_cloud_retention_active() && seg != _segs.back()
+          !config().is_read_replica_mode_enabled() && is_cloud_gc_active()
+          && seg != _segs.back()
           && seg->offsets().get_dirty_offset() <= max_removable
           && local_retention_offset.has_value()
           && seg->offsets().get_dirty_offset()
@@ -4227,8 +4271,10 @@ ss::future<usage_report> disk_log_impl::disk_usage(gc_config cfg) {
           usage{},
           [](usage acc, usage u) { return acc + u; });
 
-        vlog(
-          gclog.warn,
+        vlogl(
+          gclog,
+          ssx::is_shutdown_exception(e) ? ss::log_level::debug
+                                        : ss::log_level::warn,
           "Unable to collect disk usage for ntp {}: {}, reporting usage of {} "
           "with no reclaimable bytes",
           config().ntp(),
@@ -4259,8 +4305,8 @@ ss::future<usage_report> disk_log_impl::disk_usage(gc_config cfg) {
 chunked_vector<ss::lw_shared_ptr<segment>>
 disk_log_impl::cloud_gc_eligible_segments() {
     vassert(
-      is_cloud_retention_active(),
-      "Expected {} to have cloud retention enabled",
+      is_cloud_gc_active(),
+      "Expected cloud GC to be active for {}",
       config().ntp());
 
     constexpr size_t keep_segs = 1;
@@ -4293,7 +4339,7 @@ disk_log_impl::cloud_gc_eligible_segments() {
 }
 
 void disk_log_impl::set_cloud_gc_offset(model::offset offset) {
-    if (!is_cloud_retention_active()) {
+    if (!is_cloud_gc_active()) {
         vlog(
           stlog.debug,
           "Ignoring request to set GC offset on non-cloud enabled partition "
@@ -4318,7 +4364,7 @@ disk_log_impl::get_reclaimable_offsets(gc_config cfg) {
 
     reclaimable_offsets res;
 
-    if (!is_cloud_retention_active()) {
+    if (!is_cloud_gc_active()) {
         vlog(
           stlog.debug,
           "Reporting no reclaimable offsets for non-cloud partition {}",
@@ -4520,7 +4566,7 @@ size_t disk_log_impl::reclaimable_size_bytes() const {
      * local retention size may change. catch these before reporting potentially
      * stale information.
      */
-    if (!is_cloud_retention_active()) {
+    if (!is_cloud_gc_active()) {
         return 0;
     }
     if (config().is_read_replica_mode_enabled()) {

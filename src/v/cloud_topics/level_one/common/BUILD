@@ -20,9 +20,13 @@ redpanda_cc_library(
     ],
     deps = [
         "//src/v/base",
+        "//src/v/model",
+        "//src/v/serde",
+        "//src/v/serde:enum",
         "//src/v/utils:named_type",
         "//src/v/utils:uuid",
         "@fmt",
+        "@seastar",
     ],
 )
 
@@ -77,7 +81,7 @@ redpanda_cc_library(
     deps = [
         ":object_id",
         "//src/v/bytes:iobuf",
-        "//src/v/cloud_io:scheduler_types",
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/cloud_storage_clients",
         "//src/v/container:chunked_vector",
         "//src/v/utils:named_type",
@@ -86,9 +90,30 @@ redpanda_cc_library(
 )
 
 redpanda_cc_library(
+    name = "single_flight",
+    srcs = ["single_flight.cc"],
+    hdrs = ["single_flight.h"],
+    deps = [
+        ":abstract_io",
+        "//src/v/base",
+        "//src/v/container:chunked_hash_map",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
     name = "file_io",
-    srcs = ["file_io.cc"],
-    hdrs = ["file_io.h"],
+    srcs = [
+        "file_io.cc",
+        "file_io_probe.cc",
+    ],
+    hdrs = [
+        "file_io.h",
+        "file_io_probe.h",
+    ],
+    implementation_deps = [
+        "//src/v/base",
+    ],
     visibility = [
         "//src/v/cloud_topics:__pkg__",
         "//src/v/cloud_topics/level_one:__subpackages__",
@@ -98,13 +123,16 @@ redpanda_cc_library(
         ":abstract_io",
         ":object_id",
         ":object_utils",
+        ":single_flight",
         "//src/v/cloud_io:cache",
         "//src/v/cloud_io:io_result",
         "//src/v/cloud_io:remote",
         "//src/v/cloud_storage_clients",
         "//src/v/cloud_topics:logger",
         "//src/v/config",
+        "//src/v/metrics",
         "//src/v/model",
+        "//src/v/utils:retry_chain_node",
         "@seastar",
     ],
 )
@@ -121,6 +149,16 @@ redpanda_cc_library(
         "//src/v/bytes:iostream",
         "//src/v/cloud_storage_clients",
         "@abseil-cpp//absl/container:btree",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "chunk_data_source",
+    hdrs = ["chunk_data_source.h"],
+    deps = [
+        "//src/v/base",
+        "@fmt",
         "@seastar",
     ],
 )

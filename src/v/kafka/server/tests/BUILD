@@ -164,6 +164,8 @@ redpanda_cc_btest(
         "//src/v/cluster:data_migration_table",
         "//src/v/cluster:feature_backend",
         "//src/v/cluster:plugin_backend",
+        "//src/v/kafka/protocol:describe_redpanda_roles",
+        "//src/v/kafka/protocol:produce",
         "//src/v/kafka/server",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
@@ -243,6 +245,24 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
+    name = "fetch_read_coalescer_test",
+    timeout = "short",
+    srcs = [
+        "fetch_read_coalescer_test.cc",
+    ],
+    cpu = 2,
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/config",
+        "//src/v/kafka/server",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
     name = "consumer_group_recovery_test",
     timeout = "short",
     srcs = [
@@ -253,6 +273,7 @@ redpanda_cc_gtest(
         "//src/v/cluster:tx_protocol_types",
         "//src/v/container:chunked_circular_buffer",
         "//src/v/container:chunked_hash_map",
+        "//src/v/container:chunked_vector",
         "//src/v/kafka/protocol",
         "//src/v/kafka/server",
         "//src/v/model",
@@ -318,6 +339,7 @@ redpanda_cc_btest(
         "//src/v/model:timeout_clock",
         "//src/v/redpanda/tests:fixture",
         "//src/v/security",
+        "//src/v/ssx:sformat",
         "//src/v/test_utils:scoped_config",
         "//src/v/test_utils:seastar_boost",
         "//src/v/utils:base64",
@@ -447,6 +469,9 @@ redpanda_cc_btest(
         "//src/v/cluster:node_status_backend",
         "//src/v/cluster:self_test",
         "//src/v/cluster:topic_metrics_watcher",
+        "//src/v/features",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:describe_redpanda_roles",
         "//src/v/kafka/server",
         "//src/v/redpanda/tests:fixture",
         "//src/v/test_utils:seastar_boost",
@@ -782,6 +807,7 @@ redpanda_cc_btest(
         "//src/v/cluster:client_quota_store",
         "//src/v/config",
         "//src/v/kafka/server",
+        "//src/v/test_utils:metrics",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar",
@@ -857,6 +883,7 @@ redpanda_cc_btest(
     cpu = "1",
     deps = [
         ":kafka_test_utils",
+        "//src/v/bytes:iobuf_parser",
         "//src/v/cluster:cluster_link_table",
         "//src/v/cluster:cluster_link_types",
         "//src/v/cluster:controller_log_limiter",
@@ -874,6 +901,7 @@ redpanda_cc_btest(
         "//src/v/kafka/protocol:produce",
         "//src/v/kafka/server",
         "//src/v/model",
+        "//src/v/model:batch_compression",
         "//src/v/random:generators",
         "//src/v/redpanda/tests:fixture",
         "//src/v/storage:record_batch_builder",
@@ -1077,6 +1105,7 @@ redpanda_cc_bench(
         "//src/v/cluster:self_test",
         "//src/v/cluster:topic_metrics_watcher",
         "//src/v/container:chunked_vector",
+        "//src/v/kafka/protocol",
         "//src/v/kafka/protocol/schemata:produce_request",
         "//src/v/kafka/server",
         "//src/v/model",
@@ -1204,6 +1233,38 @@ redpanda_cc_btest(
 )
 
 redpanda_cc_btest(
+    name = "describe_redpanda_roles_test",
+    timeout = "short",
+    srcs = [
+        "describe_redpanda_roles_test.cc",
+    ],
+    env = {"RP_FIXTURE_ENV": "1"},
+    deps = [
+        "//src/v/cluster",
+        "//src/v/cluster:client_quota_backend",
+        "//src/v/cluster:commands",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:node_status_backend",
+        "//src/v/cluster:self_test",
+        "//src/v/cluster:topic_metrics_watcher",
+        "//src/v/container:chunked_vector",
+        "//src/v/kafka/client:transport",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:describe_redpanda_roles",
+        "//src/v/kafka/server",
+        "//src/v/model",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/security",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
+redpanda_cc_btest(
     name = "produce_invalid_batch_test",
     timeout = "short",
     srcs = [
@@ -1249,5 +1310,45 @@ redpanda_cc_gtest(
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "throughput_controlled_api_keys_test",
+    timeout = "short",
+    srcs = [
+        "throughput_controlled_api_keys_test.cc",
+    ],
+    deps = [
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:describe_redpanda_roles",
+        "//src/v/kafka/protocol:fetch",
+        "//src/v/kafka/protocol:produce",
+        "//src/v/kafka/server",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+    ],
+)
+
+redpanda_cc_btest(
+    name = "describe_redpanda_roles_dispatch_test",
+    timeout = "short",
+    srcs = [
+        "describe_redpanda_roles_dispatch_test.cc",
+    ],
+    env = {"RP_FIXTURE_ENV": "1"},
+    deps = [
+        "//src/v/cluster",
+        "//src/v/cluster:client_quota_backend",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
+        "//src/v/kafka/protocol",
+        "//src/v/kafka/protocol:describe_redpanda_roles",
+        "//src/v/kafka/server",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/test_utils:seastar_boost",
+        "@seastar",
+        "@seastar//:testing",
     ],
 )

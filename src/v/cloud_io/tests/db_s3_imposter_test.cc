@@ -124,6 +124,41 @@ public:
           .get();
     }
 
+    // Downloads via download_stream (rather than download_object), reading
+    // the streamed body to a string. download_stream requires a
+    // Content-Length on the response.
+    std::pair<download_result, ss::sstring> download_via_stream(
+      std::string_view key,
+      std::optional<cloud_storage_clients::http_byte_range> range
+      = std::nullopt) {
+        retry_chain_node rtc(never_abort, 5s, 100ms);
+        ss::sstring out;
+        auto res = remote()
+                     .download_stream(
+                       {.bucket = bucket_name,
+                        .key = object_key(key),
+                        .parent_rtc = rtc},
+                       [&out](
+                         this auto,
+                         uint64_t content_length,
+                         ss::input_stream<char> in) -> ss::future<uint64_t> {
+                           while (true) {
+                               auto buf = co_await in.read();
+                               if (buf.empty()) {
+                                   break;
+                               }
+                               out.append(buf.get(), buf.size());
+                           }
+                           co_await in.close();
+                           co_return content_length;
+                       },
+                       "test-download-stream",
+                       /*acquire_hydration_units=*/true,
+                       range)
+                     .get();
+        return {res, out};
+    }
+
 private:
     std::unique_ptr<scoped_remote> _scoped;
 };
@@ -254,9 +289,6 @@ TEST_F(db_s3_imposter_test, multipart_upload) {
     mp->put(make_part('A')).get();
     mp->put(make_part('B')).get();
     mp->complete().get();
-    // The multipart handle holds a client pool lease. The pool has one
-    // client, so we must release it before download() can acquire one.
-    mp = {};
 
     auto [res, content] = download("multi/assembled");
     ASSERT_EQ(res, download_result::success);
@@ -281,7 +313,68 @@ TEST_F(db_s3_imposter_test, multipart_abort) {
     part.append(data.data(), data.size());
     mp->put(std::move(part)).get();
     mp->abort().get();
-    mp = {};
 
     EXPECT_EQ(head("aborted/obj"), download_result::notfound);
+}
+
+TEST_F(db_s3_imposter_test, concurrent_open_multipart_uploads) {
+    // Regression: the client pool has a single connection. A multipart upload
+    // leases a client per request rather than pinning one for its whole
+    // lifetime, so a second upload opened while the first is still in flight
+    // can still acquire a client. Pinning a client across the upload's
+    // lifetime would wedge the one-connection pool here.
+    constexpr size_t part_size = 5 * 1024 * 1024;
+
+    auto open_upload = [&](std::string_view key) {
+        auto mp_result = remote()
+                           .initiate_multipart_upload(
+                             bucket_name, object_key(key), part_size, 30s)
+                           .get();
+        EXPECT_FALSE(mp_result.has_error());
+        return std::move(mp_result.value());
+    };
+
+    auto make_part = [](char fill) {
+        iobuf buf;
+        ss::sstring data(part_size, fill);
+        buf.append(data.data(), data.size());
+        return buf;
+    };
+
+    // Both uploads are open at once over the single-connection pool.
+    auto a = open_upload("multi/a");
+    auto b = open_upload("multi/b");
+
+    a->put(make_part('A')).get();
+    b->put(make_part('B')).get();
+    a->complete().get();
+    b->complete().get();
+
+    auto [res_a, content_a] = download("multi/a");
+    ASSERT_EQ(res_a, download_result::success);
+    EXPECT_EQ(content_a.size(), part_size);
+    EXPECT_EQ(content_a[0], 'A');
+
+    auto [res_b, content_b] = download("multi/b");
+    ASSERT_EQ(res_b, download_result::success);
+    EXPECT_EQ(content_b.size(), part_size);
+    EXPECT_EQ(content_b[0], 'B');
+}
+
+// download_stream needs a Content-Length, which the imposter can only set on
+// its small-body inline path -- see k_small_response_threshold in
+// db_s3_imposter_fixture.cc for why. These keep payloads small to stay on it.
+TEST_F(db_s3_imposter_test, download_stream_whole_object) {
+    ASSERT_EQ(upload("ds/whole", "hello world"), upload_result::success);
+    auto [res, content] = download_via_stream("ds/whole");
+    EXPECT_EQ(res, download_result::success);
+    EXPECT_EQ(content, "hello world");
+}
+
+TEST_F(db_s3_imposter_test, download_stream_byte_range) {
+    ASSERT_EQ(upload("ds/range", "0123456789"), upload_result::success);
+    auto [res, content] = download_via_stream(
+      "ds/range", cloud_storage_clients::http_byte_range{2, 5});
+    EXPECT_EQ(res, download_result::success);
+    EXPECT_EQ(content, "2345");
 }

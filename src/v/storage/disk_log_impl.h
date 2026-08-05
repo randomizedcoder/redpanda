@@ -108,7 +108,10 @@ public:
     /// contains size requirements. The desired target size and smallest
     /// acceptable size.
     ss::future<std::optional<offset_range_size_result_t>> offset_range_size(
-      model::offset first, offset_range_size_requirements_t target) override;
+      model::offset first,
+      offset_range_size_requirements_t target,
+      ss::semaphore::time_point deadline
+      = ss::semaphore::time_point::max()) override;
 
     /// Return true if the offset range contains compacted data
     bool is_compacted(model::offset first, model::offset last) const override;
@@ -206,6 +209,15 @@ public:
     size_t reclaimable_size_bytes() const override;
 
     std::optional<model::offset> retention_offset(gc_config) const final;
+
+    /// Applies retention overrides (callers need not pre-apply them) and
+    /// adjusts bogus (future) retention timestamps, mutating segment indexes
+    /// when an entire segment is bogus, then returns the offset GC would
+    /// evict to. Usually derived from local retention; when space management
+    /// has set _cloud_gc_offset, that offset is returned and consumed (reset)
+    /// here, so the caller is responsible for acting on it.
+    ss::future<std::optional<model::offset>>
+    compute_gc_offset(gc_config cfg) final;
 
     // Collects an iterable list of segments over which to perform sliding
     // window compaction. This can include segments which have already had their
@@ -412,7 +424,11 @@ private:
     gc_config maybe_apply_local_storage_overrides(gc_config) const;
     gc_config apply_local_storage_overrides(gc_config) const;
 
-    bool is_cloud_retention_active() const;
+    bool is_archival_active() const;
+    // True when local segments are a reclaimable cache of cloud-resident data
+    // (legacy tiered storage or tiered_cloud); broader than
+    // is_archival_active(), which is archival-only.
+    bool is_cloud_gc_active() const;
 
     // returns retention_offset(cfg) but may also first apply adjustments to
     // future timestamps if this option is turned on in configuration.

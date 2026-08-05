@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import typing
+import yaml
 from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Literal, Optional, overload
@@ -363,6 +364,16 @@ class AclList:
                 for l in self._acls.get(principal, [])
             ]
         )
+
+
+class RpkUpgradeFinalizationState:
+    """State strings reported by `rpk cluster upgrade status`: the admin v2
+    FinalizationState enum names, lowercased with underscores as spaces (see
+    src/go/rpk/pkg/cli/cluster/upgrade/status.go)."""
+
+    FINALIZED = "finalized"
+    READY_TO_FINALIZE = "ready to finalize"
+    UPGRADE_IN_PROGRESS = "upgrade in progress"
 
 
 class RpkTool:
@@ -719,6 +730,7 @@ class RpkTool:
         schema_key_id: int | None = None,
         proto_msg: str | None = None,
         proto_key_msg: str | None = None,
+        schema_context: str | None = None,
         tombstone: bool = False,
     ) -> int:
         if timeout is None:
@@ -761,6 +773,10 @@ class RpkTool:
             use_schema_registry = True
         if proto_key_msg is not None:
             cmd += ["--schema-key-type", proto_key_msg]
+            use_schema_registry = True
+        if schema_context is not None:
+            # "" or "." selects the default context; a name (e.g. ".team") selects that context.
+            cmd += [f"--schema-context={schema_context}"]
             use_schema_registry = True
         if tombstone:
             cmd += ["--tombstone"]
@@ -943,6 +959,20 @@ class RpkTool:
                 pass
         return res
 
+    def describe_storage(self, topic: str, timeout: int | None = None) -> str:
+        """Run `rpk topic describe-storage <topic>` and return the raw output.
+
+        The command talks to both the Kafka API (topic metadata) and the admin
+        API (cloud storage status), so the admin endpoints are passed too.
+        """
+        cmd = [
+            "describe-storage",
+            topic,
+            "--api-urls",
+            self._redpanda.admin_endpoints(),
+        ]
+        return self._run_topic(cmd, timeout=timeout)
+
     def alter_topic_config(self, topic: str, set_key: str, set_value: Any) -> None:
         cmd = ["alter-config", topic, "--set", f"{set_key}={set_value}", "--no-confirm"]
         out = self._run_topic(cmd)
@@ -984,6 +1014,7 @@ class RpkTool:
         format: str | None = None,
         timeout: float | None = None,
         use_schema_registry: str | None = None,
+        schema_context: str | None = None,
         read_committed: bool = False,
         fetch_max_wait: float | None = None,
     ) -> str:
@@ -1011,6 +1042,8 @@ class RpkTool:
             cmd += ["--use-schema-registry=" + use_schema_registry]
         elif format is not None:
             cmd += ["-f", format]
+        if schema_context is not None:
+            cmd += [f"--schema-context={schema_context}"]
         if read_committed:
             cmd += ["--read-committed"]
 
@@ -1032,7 +1065,7 @@ class RpkTool:
             cmd += ["--allow-new-topics"]
         self._run_group(cmd)
 
-    def group_describe(self, group, summary=False, tolerant=False):
+    def group_describe(self, group: str, summary: bool = False, tolerant: bool = False):
         def parse_field(field_name, string):
             pattern = re.compile(f" *{field_name} +(?P<value>.+)")
             m = pattern.match(string)
@@ -1089,7 +1122,7 @@ class RpkTool:
                 )
                 wait_until(
                     lambda: "__consumer_offsets" in self.list_topics(internal=True),
-                    timeout_sec=10,
+                    timeout_sec=30,
                     backoff_sec=1,
                     err_msg="__consumer_offsets topic not created",
                 )
@@ -1324,6 +1357,54 @@ class RpkTool:
         output = self._execute(cmd)
         return json.loads(output) if output_format == "json" else output
 
+    def _run_shadow(
+        self,
+        args: list[str],
+        output_format: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> Any:
+        cmd = [
+            self._rpk_binary(),
+            "-X",
+            "admin.hosts=" + self._admin_host(),
+            "shadow",
+        ] + args
+        if output_format is not None:
+            cmd += ["--format", output_format]
+        output = self._execute(cmd, env=env)
+        return json.loads(output) if output_format == "json" else output
+
+    def shadow_create(self, config: dict[str, Any], no_confirm: bool = True) -> str:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as tf:
+            yaml.safe_dump(config, tf)
+            tf.flush()
+            args = ["create", "-c", tf.name]
+            if no_confirm:
+                args.append("--no-confirm")
+            return self._run_shadow(args)
+
+    def shadow_update(self, name: str, config: dict[str, Any]) -> str:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as tf:
+            yaml.safe_dump(config, tf)
+            tf.flush()
+            return self._run_shadow(["update", name, "-c", tf.name])
+
+    def shadow_update_editor(self, name: str, editor: str) -> str:
+        """Run 'rpk shadow update' in editor mode. rpk seeds a temp file with
+        the current configuration and invokes `editor <tmpfile>` ($EDITOR is
+        not shell-parsed, so it must be a single executable); the edited file
+        is submitted when the editor exits."""
+        return self._run_shadow(["update", name], env={"EDITOR": editor})
+
+    def shadow_status(self, name: str, output_format: str = "json") -> Any:
+        return self._run_shadow(["status", name, "--print-all"], output_format)
+
+    def shadow_describe(self, name: str, output_format: str = "json") -> Any:
+        return self._run_shadow(["describe", name, "--print-all"], output_format)
+
+    def shadow_list(self, output_format: str = "json") -> Any:
+        return self._run_shadow(["list"], output_format)
+
     def _run_topic(self, cmd, stdin=None, timeout=None, use_schema_registry=False):
         cmd = [self._rpk_binary(), "topic"] + self._kafka_conn_settings() + cmd
         if use_schema_registry:
@@ -1504,7 +1585,9 @@ class RpkTool:
             self._redpanda.logger.debug("Executing command: %s", cmd)
 
         if env is not None:
-            env.update(os.environ.copy())
+            # Caller-provided variables take precedence over the inherited
+            # environment.
+            env = os.environ | env
 
         p = subprocess.Popen(
             cmd,
@@ -1553,6 +1636,37 @@ class RpkTool:
             "rp_install_path_root", None
         )
         return f"{rp_install_path_root}/bin/rpk"
+
+    def _cluster_brokers(self, subcommand, node, wait, wait_timeout, timeout):
+        node_id = (
+            self._redpanda.node_id(node) if isinstance(node, ClusterNode) else node
+        )
+        cmd = [
+            self._rpk_binary(),
+            "--api-urls",
+            self._admin_host(),
+            "cluster",
+            "brokers",
+            subcommand,
+            str(node_id),
+        ]
+        if wait:
+            cmd.append("--wait")
+        if wait_timeout is not None:
+            cmd += ["--wait-timeout", wait_timeout]
+        return self._execute(cmd, timeout=timeout)
+
+    def cluster_decommission_broker(
+        self, node, wait=False, wait_timeout=None, timeout=None
+    ):
+        return self._cluster_brokers("decommission", node, wait, wait_timeout, timeout)
+
+    def cluster_decommission_status(
+        self, node, wait=False, wait_timeout=None, timeout=None
+    ):
+        return self._cluster_brokers(
+            "decommission-status", node, wait, wait_timeout, timeout
+        )
 
     def cluster_maintenance_enable(self, node, wait=False):
         node_id = (
@@ -1637,6 +1751,44 @@ class RpkTool:
 
         output = self._execute(cmd)
         return list(filter(None, map(parse, output.splitlines())))
+
+    def cluster_upgrade_status(self) -> dict[str, Any]:
+        """
+        Run `rpk cluster upgrade status` and return the parsed JSON response:
+        state (an RpkUpgradeFinalizationState string), active_version,
+        version_after_finalization, auto_finalization_enabled, and members
+        (per-broker node_id, release_version, logical_version, version_known,
+        alive).
+        """
+        cmd = [
+            self._rpk_binary(),
+            "-X",
+            "admin.hosts=" + self._admin_host(),
+            "cluster",
+            "upgrade",
+            "status",
+            "--format",
+            "json",
+        ]
+        return json.loads(self._execute(cmd))
+
+    def cluster_upgrade_finalize(self, no_confirm: bool = True) -> str:
+        """
+        Run `rpk cluster upgrade finalize` and return its output. The command
+        validates upfront (via the upgrade status) and only sends the finalize
+        request when the cluster is ready to finalize.
+        """
+        cmd = [
+            self._rpk_binary(),
+            "-X",
+            "admin.hosts=" + self._admin_host(),
+            "cluster",
+            "upgrade",
+            "finalize",
+        ]
+        if no_confirm:
+            cmd.append("--no-confirm")
+        return self._execute(cmd)
 
     def cluster_connections_list(
         self, limit: int, filter_raw: str | None = None, order_by: str | None = None
@@ -2175,9 +2327,16 @@ class RpkTool:
         return self._run_registry(cmd)
 
     def create_schema(
-        self, subject, schema_path, references=None, id=None, version=None
+        self, subject, schema_path, references=None, id=None, version=None, context=None
     ):
-        cmd = ["schema", "create", subject, "--schema", schema_path]
+        # --schema-context / --skip-context-check are persistent flags on the `registry`
+        # group, so they precede the subcommand. We skip the admin-API context-support check
+        # because the test harness only wires up the Schema Registry connection, not the admin
+        # API (and the cluster has qualified subjects enabled regardless).
+        cmd = []
+        if context is not None:
+            cmd += ["--schema-context", context, "--skip-context-check"]
+        cmd += ["schema", "create", subject, "--schema", schema_path]
 
         if references is not None:
             cmd += ["--references", references]

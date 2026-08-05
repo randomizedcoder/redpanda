@@ -78,6 +78,9 @@ public:
     ss::future<std::expected<void, errc>>
     set_start_offset(const model::topic_id_partition&, kafka::offset) override;
 
+    ss::future<std::expected<void, errc>>
+    set_migrating(const model::topic_id_partition&, bool) override;
+
     ss::future<std::expected<topic_removal_response, errc>>
     remove_topics(const chunked_vector<model::topic_id>&) override;
 
@@ -102,6 +105,8 @@ public:
       const object_metadata_builder&, const compaction_map_t&) override;
     ss::future<std::expected<void, errc>> compact_objects(
       const chunked_vector<object_metadata>&, const compaction_map_t&);
+    ss::future<std::expected<void, errc>>
+    commit_compaction_metadata(const compaction_map_t&) override;
 
     void preregister_objects(const chunked_vector<object_id>&);
 

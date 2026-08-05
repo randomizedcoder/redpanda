@@ -9,7 +9,9 @@
  */
 #include "cloud_topics/level_zero/stm/placeholder.h"
 
+#include "model/record.h"
 #include "model/record_batch_types.h"
+#include "model/record_utils.h"
 #include "storage/record_batch_builder.h"
 
 namespace cloud_topics {
@@ -48,7 +50,8 @@ model::record_batch encode_placeholder_batch(
         builder.add_raw_kv(std::nullopt, std::nullopt);
     }
 
-    auto ph = std::move(builder).build();
+    auto ph = std::move(builder).build(
+      storage::record_batch_builder::reset_size_checksum::no);
     // In order for timequeries to work correctly, we need to ensure we never
     // look inside the batch to answer the query. If the time is append time we
     // don't need to unpack the batch, but instead all records have the
@@ -60,6 +63,7 @@ model::record_batch encode_placeholder_batch(
     ph.header().max_timestamp = header.max_timestamp;
     ph.header().attrs.set_timestamp_type(model::timestamp_type::append_time);
     ph.header().base_sequence = header.base_sequence;
+    ph.header().last_offset_delta = header.last_offset_delta;
     ph.header().reset_size_checksum_metadata(ph.data());
     return ph;
 }
@@ -77,13 +81,15 @@ ctp_placeholder parse_placeholder_batch(model::record_batch batch) {
 model::record_batch apply_placeholder_to_batch(
   const model::record_batch_header& placeholder_batch_header,
   model::record_batch uploaded_batch) {
-    // crcs and sizes are set later in reset_size_checksum_metadata
     model::record_batch_header merged_header{
       .header_crc = 0,
       .size_bytes = 0,
       .base_offset = placeholder_batch_header.base_offset,
       .type = uploaded_batch.header().type,
-      .crc = 0,
+      // The produce-time value, which has to reach the consumer unchanged so
+      // that corruption in the records stays detectable. Every field it covers
+      // is reproduced below from the same batch it was computed over.
+      .crc = uploaded_batch.header().crc,
       // We need to use the same attributes for compression and timestamp types
       // which are changed in the placeholder batch
       .attrs = uploaded_batch.header().attrs,
@@ -100,7 +106,11 @@ model::record_batch apply_placeholder_to_batch(
       .record_count = placeholder_batch_header.record_count,
       .ctx = placeholder_batch_header.ctx,
     };
-    merged_header.reset_size_checksum_metadata(uploaded_batch.data());
+    // size_bytes and header_crc describe the merged header, so both are
+    // derived here; .crc is the produce-time value set above and stands.
+    merged_header.size_bytes = model::packed_record_batch_header_size
+                               + uploaded_batch.data().size_bytes();
+    merged_header.header_crc = model::internal_header_only_crc(merged_header);
     return model::record_batch(
       merged_header,
       std::move(uploaded_batch).release_data(),

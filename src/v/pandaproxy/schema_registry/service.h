@@ -59,6 +59,9 @@ public:
     request_authenticator& authenticator() { return _auth; }
     security::authorizer& authorizor();
     ss::future<> ensure_started() { return _ensure_started(); }
+    /// Creates the internal `_schemas` topic if it does not exist, without
+    /// running the full start-up (no store load). Idempotent.
+    ss::future<> ensure_internal_topic();
     security::audit::audit_log_manager& audit_mgr() {
         return _audit_mgr.local();
     }
@@ -66,10 +69,15 @@ public:
     std::unique_ptr<cluster::controller>& controller() { return _controller; }
 
 private:
+    // Only ever invoked on the reader shard, via _load_once.
     ss::future<> do_start();
+    /// Route every shard's start-up through a single one_shot on the reader
+    /// shard, so the `_schemas` topic is replayed exactly once regardless of
+    /// how many shards receive their first request concurrently. See the
+    /// definition for why the per-shard one_shots would otherwise race.
+    ss::future<> ensure_topic_loaded();
     ss::future<> create_internal_topic();
     ss::future<> fetch_internal_topic();
-    bool active_sr_mirroring() const;
     configuration _config;
     ssx::semaphore _mem_sem;
     adjustable_semaphore _inflight_sem;
@@ -86,9 +94,14 @@ private:
     ss::sharded<security::audit::audit_log_manager>& _audit_mgr;
     ss::abort_source _as;
 
+    // Per-shard: caches that start-up has completed on this shard, giving a
+    // cheap fast path for subsequent requests. Its action delegates to
+    // `_load_once` on the reader shard.
     one_shot _ensure_started;
+    // Reader shard only: the single authority that runs `do_start()` exactly
+    // once, no matter how many shards enter start-up concurrently.
+    one_shot _load_once;
     request_authenticator _auth;
-    bool _is_started{false};
 };
 
 } // namespace pandaproxy::schema_registry

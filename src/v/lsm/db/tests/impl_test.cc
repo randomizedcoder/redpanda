@@ -33,8 +33,8 @@ public:
       : _p(p) {}
 
     ss::future<io::optional_pointer<io::random_access_file_reader>>
-    open_random_access_reader(file_handle h) override {
-        return _p->open_random_access_reader(h);
+    open_random_access_reader(file_handle h, uint64_t file_size) override {
+        return _p->open_random_access_reader(h, file_size);
     }
 
     ss::future<std::unique_ptr<io::sequential_file_writer>>
@@ -84,9 +84,9 @@ public:
       : _underlying(underlying) {}
 
     ss::future<io::optional_pointer<io::random_access_file_reader>>
-    open_random_access_reader(file_handle h) override {
+    open_random_access_reader(file_handle h, uint64_t file_size) override {
         _opened_files.insert(h);
-        return _underlying->open_random_access_reader(h);
+        return _underlying->open_random_access_reader(h, file_size);
     }
 
     ss::future<std::unique_ptr<io::sequential_file_writer>>
@@ -531,13 +531,17 @@ TEST_F(ImplTest, PreOpenFiles) {
     _options->max_pre_open_fibers = 0;
     restart();
 
+    // Warming, if any, runs in the background; drain to give it a chance.
+    tests::drain_task_queue().get();
     EXPECT_EQ(opened_files().size(), 0);
     EXPECT_TRUE(matches_shadow());
 
-    // Restart with max_pre_open_fibers > 0 (enabled)
+    // Restart with max_pre_open_fibers > 0 (enabled). Warming is a background
+    // fiber, so wait for the reactor to drain.
     _options->max_pre_open_fibers = 4;
     restart();
 
+    tests::drain_task_queue().get();
     EXPECT_EQ(opened_files().size(), files.size());
     for (const auto& file : files) {
         EXPECT_TRUE(opened_files().contains(file))

@@ -907,6 +907,28 @@ class Admin:
     def get_features(self, node: MaybeNode = None):
         return self._request("GET", "features", node=node).json()
 
+    def await_active_version_settled(
+        self,
+        node: MaybeNode = None,
+        timeout_sec: int = 60,
+        backoff_sec: int = 1,
+    ) -> None:
+        """
+        Wait until the cluster's active version has caught up to the
+        queried node's binary (cluster_version == node_latest_version).
+        """
+
+        def settled():
+            features = self.get_features(node=node)
+            return features["cluster_version"] == features["node_latest_version"]
+
+        wait_until(
+            settled,
+            timeout_sec=timeout_sec,
+            backoff_sec=backoff_sec,
+            err_msg="active version did not settle after upgrade",
+        )
+
     def get_cloud_storage_lifecycle_markers(self, node: MaybeNode = None):
         return self._request("GET", "cloud_storage/lifecycle", node=node).json()
 
@@ -1305,12 +1327,17 @@ class Admin:
         *,
         namespace: str = "kafka",
         node: MaybeNode = None,
+        evil_mode: bool = False,
     ) -> Response:
         """
         [ {"node_id": 0, "core": 1}, ... ]
+
+        evil_mode opts in to forcing a reconfiguration of the controller
+        (redpanda/controller/0) group, which is otherwise rejected.
         """
         path = f"debug/partitions/{namespace}/{topic}/{partition}/force_replicas"
-        return self._request("post", path, node=node, json=replicas)
+        params = {"evil_mode": "true"} if evil_mode else None
+        return self._request("post", path, node=node, json=replicas, params=params)
 
     def toggle_failure_injection(
         self,
@@ -1405,7 +1432,14 @@ class Admin:
     ):
         def user_exists():
             for node in self.redpanda.started_nodes():
-                users = self.list_users(node=node)
+                try:
+                    users = self.list_users(node=node)
+                except RequestException as e:
+                    self.redpanda.logger.debug(
+                        f"await_user_exists: transient error listing users on "
+                        f"{node.account.hostname}, retrying: {e}"
+                    )
+                    return False
                 if username not in users:
                     return False
             return True
@@ -1613,7 +1647,7 @@ class Admin:
         url = "debug/reset_leaders"
         return self._request("post", url, node=node)
 
-    def get_leaders_info(self, node: MaybeNode = None) -> dict[str, Any]:
+    def get_leaders_info(self, node: MaybeNode = None) -> list[dict[str, Any]]:
         """
         Get info for leaders on node
         """
@@ -1645,7 +1679,7 @@ class Admin:
     def get_peer_status(self, node: ClusterNode, peer_id: int) -> dict[str, Any]:
         return self._request("GET", f"debug/peer_status/{peer_id}", node=node).json()
 
-    def get_controller_status(self, node: MaybeNode) -> dict[str, Any]:
+    def get_controller_status(self, node: MaybeNode = None) -> dict[str, Any]:
         return self._request("GET", "debug/controller_status", node=node).json()
 
     def get_cluster_uuid(self, node: MaybeNode = None) -> str | None:

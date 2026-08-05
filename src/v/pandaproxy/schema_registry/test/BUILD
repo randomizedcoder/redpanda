@@ -147,6 +147,7 @@ redpanda_cc_btest(
         ":compatibility_avro",
         "//src/v/pandaproxy/schema_registry:store",
         "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/test_utils:metrics",
         "//src/v/test_utils:seastar_boost",
         "@boost//:test",
         "@seastar//:testing",
@@ -198,6 +199,7 @@ redpanda_cc_btest(
     cpu = 1,
     deps = [
         ":compatibility_protobuf",
+        "//src/v/container:chunked_vector",
         "//src/v/pandaproxy/schema_registry:exceptions",
         "//src/v/pandaproxy/schema_registry:seq_writer",
         "//src/v/pandaproxy/schema_registry:store",
@@ -231,6 +233,7 @@ redpanda_cc_btest(
     cpu = 1,
     deps = [
         ":utils",
+        "//src/v/bytes:iobuf_parser",
         "//src/v/model",
         "//src/v/pandaproxy/schema_registry:avro",
         "//src/v/pandaproxy/schema_registry:seq_writer",
@@ -486,6 +489,34 @@ redpanda_cc_btest(
     ],
 )
 
+redpanda_cc_gtest(
+    name = "internal_writes_test",
+    timeout = "short",
+    srcs = [
+        "internal_writes.cc",
+    ],
+    cpu = 1,
+    deps = [
+        "//src/v/cluster:cluster_utils",
+        "//src/v/cluster:controller_log_limiter",
+        "//src/v/cluster:data_migration_table",
+        "//src/v/cluster:feature_backend",
+        "//src/v/cluster:fwd",
+        "//src/v/cluster:leader_balancer_strategy",
+        "//src/v/cluster:node_status_backend",
+        "//src/v/cluster:self_test",
+        "//src/v/cluster:topic_metrics_watcher",
+        "//src/v/pandaproxy/schema_registry:exceptions",
+        "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/redpanda/tests:fixture",
+        "//src/v/schema:registry",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+        "@seastar//:testing",
+    ],
+)
+
 redpanda_cc_btest(
     name = "delete_subject_endpoints",
     timeout = "short",
@@ -596,6 +627,33 @@ redpanda_cc_bench(
         "//src/v/pandaproxy/schema_registry:types",
         "//src/v/pandaproxy/test:fixture",
         "@abseil-cpp//absl/strings",
+        "@seastar//:benchmark",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "recovery_rpbench",
+    timeout = "moderate",
+    srcs = [
+        "recovery_bench.cc",
+    ],
+    # The cross-shard costs this benchmark exercises need more than one
+    # shard to exist.
+    cpu = 2,
+    # recovery_inline compiles every replayed record; keep test mode to
+    # the cheap marked variant.
+    test_regex = ".*marked_replay",
+    deps = [
+        ":utils",
+        "//src/v/bytes:iobuf",
+        "//src/v/container:chunked_vector",
+        "//src/v/model",
+        "//src/v/pandaproxy/schema_registry:seq_writer",
+        "//src/v/pandaproxy/schema_registry:store",
+        "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/storage:record_batch_builder",
+        "@fmt",
+        "@seastar",
         "@seastar//:benchmark",
     ],
 )

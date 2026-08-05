@@ -275,6 +275,7 @@ redpanda_cc_library(
         "//src/v/iceberg:schema",
         "//src/v/iceberg:values",
         "//src/v/model",
+        "//src/v/strings:utf8",
         "@seastar",
     ],
 )
@@ -429,6 +430,7 @@ redpanda_cc_library(
         "//src/v/iceberg/conversion:values_json",
         "//src/v/iceberg/conversion:values_protobuf",
         "//src/v/metrics",
+        "//src/v/strings:utf8",
         "@abseil-cpp//absl/container:flat_hash_set",
         "@avro",
         "@protobuf",
@@ -495,7 +497,7 @@ redpanda_cc_library(
     ],
     visibility = [":__subpackages__"],
     deps = [
-        ":schema_identifier",
+        ":record_translator",
         "//src/v/base",
     ],
 )

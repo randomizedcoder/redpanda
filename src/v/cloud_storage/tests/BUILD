@@ -73,7 +73,6 @@ redpanda_cc_btest(
         "segment_meta_cstore_test.cc",
     ],
     deps = [
-        ":common",
         "//src/v/base",
         "//src/v/cloud_storage:segment_meta_cstore",
         "//src/v/cloud_storage:types",
@@ -83,6 +82,7 @@ redpanda_cc_btest(
         "//src/v/utils:delta_for",
         "//src/v/utils:human",
         "@boost//:test",
+        "@seastar",
         "@seastar//:testing",
     ],
 )

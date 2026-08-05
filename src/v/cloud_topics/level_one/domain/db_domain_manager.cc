@@ -72,7 +72,7 @@ rpc::errc log_and_convert(const db_update_error& e, std::string_view prefix) {
         break;
     case invalid_update:
         ret = rpc::errc::concurrent_requests;
-        lvl = ss::log_level::debug;
+        lvl = ss::log_level::warn;
         break;
     }
     vlogl(cd_log, lvl, "{}{}", prefix, e);
@@ -240,6 +240,7 @@ db_domain_manager::entity_locks::acquire_objects(
 db_domain_manager::db_domain_manager(
   model::term_id expected_term,
   ss::shared_ptr<stm> stm,
+  ss::lw_shared_ptr<raft::consensus> raft,
   cloud_io::cache* cache,
   cloud_io::remote* remote,
   cloud_storage_clients::bucket_name bucket,
@@ -253,6 +254,7 @@ db_domain_manager::db_domain_manager(
   , object_io_(object_io)
   , sg_(sg)
   , stm_(std::move(stm))
+  , raft_(std::move(raft))
   , gc_interval_(
       config::shard_local_cfg()
         .cloud_topics_long_term_garbage_collection_interval)
@@ -743,6 +745,7 @@ db_domain_manager::get_offsets(rpc::get_offsets_request req) {
       .ec = rpc::errc::ok,
       .start_offset = metadata.start_offset,
       .next_offset = metadata.next_offset,
+      .migrating = metadata.migrating,
     };
 }
 
@@ -1141,6 +1144,44 @@ db_domain_manager::set_start_offset(rpc::set_start_offset_request req) {
     co_return co_await do_set_start_offset(locks_res.value(), req);
 }
 
+ss::future<rpc::set_migrating_reply>
+db_domain_manager::set_migrating(rpc::set_migrating_request req) {
+    auto locks_res = co_await gate_and_open_writes({
+      .topic_read_locks = {req.tp.topic_id},
+      .partition_locks = {req.tp},
+    });
+    if (!locks_res.has_value()) {
+        co_return rpc::set_migrating_reply{
+          .ec = locks_res.error(),
+        };
+    }
+
+    auto reader = state_reader(db_->db().create_snapshot());
+    auto update = set_migrating_db_update{
+      .tp = req.tp,
+      .migrating = req.migrating,
+    };
+    chunked_vector<write_batch_row> rows;
+    bool is_no_op = false;
+    auto build_res = co_await update.build_rows(reader, rows, &is_no_op);
+    if (!build_res.has_value()) {
+        co_return rpc::set_migrating_reply{
+          .ec = log_and_convert(
+            build_res.error(), "Rejecting request to set migration phase: "),
+        };
+    }
+    if (is_no_op) {
+        co_return rpc::set_migrating_reply{.ec = rpc::errc::ok};
+    }
+    auto apply_res = co_await write_rows(locks_res.value(), std::move(rows));
+    if (!apply_res.has_value()) {
+        co_return rpc::set_migrating_reply{
+          .ec = apply_res.error(),
+        };
+    }
+    co_return rpc::set_migrating_reply{.ec = rpc::errc::ok};
+}
+
 ss::future<
   std::expected<db_domain_manager::set_partitions_empty_result, rpc::errc>>
 db_domain_manager::set_partitions_empty(
@@ -1453,6 +1494,9 @@ db_domain_manager::do_get_leveling_info(
             }
             builder.process_extent(
               base, extent.val.last_offset, extent.val.len);
+            if (builder.is_full()) {
+                break;
+            }
         }
     }
     co_return rpc::get_leveling_info_reply{
@@ -1559,6 +1603,8 @@ db_domain_manager::get_extent_metadata(rpc::get_extent_metadata_request req) {
               .oid = extent.val.oid,
               .footer_pos = object.footer_pos,
               .object_size = object.object_size,
+              .imported = to_imported_ts_info(
+                object.imported_ts_location, extent.val.imported_ts_info),
             };
         }
         extents.push_back(std::move(em));
@@ -1743,7 +1789,7 @@ db_domain_manager::write_rows_no_lock(chunked_vector<write_batch_row> rows) {
     }
     if (needs_step_down) {
         auto step_down_fut = co_await ss::coroutine::as_future(
-          stm_->raft()->step_down_in_term(
+          raft_->step_down_in_term(
             expected_term_, "Failed to write to database"));
         if (step_down_fut.failed()) {
             // Only throws at shutdown.
@@ -1760,7 +1806,7 @@ ss::future<std::expected<void, rpc::errc>> db_domain_manager::maybe_open_db() {
     if (db_ && !db_->needs_reopen()) {
         co_return std::expected<void, rpc::errc>{};
     }
-    auto cur_term = stm_->raft()->term();
+    auto cur_term = raft_->term();
     if (cur_term != expected_term_) {
         vlog(
           cd_log.debug,
@@ -1790,7 +1836,7 @@ ss::future<std::expected<void, rpc::errc>> db_domain_manager::maybe_open_db() {
     vlog(
       cd_log.debug, "Opening database with expected term {}", expected_term_);
     auto db_res = co_await replicated_database::open(
-      expected_term_, stm_.get(), cache_, remote_, bucket_, as_, sg_);
+      expected_term_, stm_.get(), raft_, cache_, remote_, bucket_, as_, sg_);
     if (!db_res.has_value()) {
         co_return std::unexpected(
           log_and_convert(db_res.error(), "Failed to open database: "));
@@ -1805,7 +1851,7 @@ ss::future<> db_domain_manager::gc_loop() {
         co_return;
     }
 
-    auto ntp = stm_->raft()->log()->config().ntp();
+    auto ntp = raft_->log()->config().ntp();
     db_garbage_collector gc(object_io_, probe_);
     while (!as_.abort_requested()) {
         // NOTE: even though the garbage collector will remove objects and
@@ -1926,7 +1972,7 @@ db_domain_manager::restore_domain(rpc::restore_domain_request req) {
     cloud_storage_clients::object_key domain_prefix{
       domain_cloud_prefix(req.new_uuid)};
     auto meta_persist = co_await lsm::io::open_cloud_metadata_persistence(
-      remote_, bucket_, domain_prefix);
+      remote_, bucket_, domain_prefix, cloud_io::group_id::metastore);
 
     // When reading the manifest this will find the latest manifest at or below
     // the given epoch. So to find the latest, supply the max epoch.
@@ -1974,7 +2020,7 @@ db_domain_manager::restore_domain(rpc::restore_domain_request req) {
       "Re-opening database with expected term {}",
       expected_term_);
     auto db_res = co_await replicated_database::open(
-      expected_term_, stm_.get(), cache_, remote_, bucket_, as_, sg_);
+      expected_term_, stm_.get(), raft_, cache_, remote_, bucket_, as_, sg_);
     if (!db_res.has_value()) {
         co_return rpc::restore_domain_reply{
           .ec = log_and_convert(db_res.error(), "Failed to reopen database: "),

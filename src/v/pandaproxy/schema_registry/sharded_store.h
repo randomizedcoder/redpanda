@@ -16,6 +16,7 @@
 #include "pandaproxy/schema_registry/types.h"
 
 #include <seastar/core/sharded.hh>
+#include <seastar/util/noncopyable_function.hh>
 
 namespace pandaproxy::schema_registry {
 
@@ -53,14 +54,25 @@ public:
     };
     ss::future<insert_result> project_ids(stored_schema schema);
 
+    ///\brief Upsert a schema and its subject version.
+    ///
+    /// With defer_processing::no the schema is canonicalised inline (on the
+    /// calling shard); a schema that fails to canonicalise is stored raw and
+    /// marked for reprocessing. With defer_processing::yes canonicalisation
+    /// is skipped entirely and the schema is stored raw and marked; used by
+    /// the initial topic replay so that process_marked_schemas() can
+    /// canonicalise the store's final state in parallel across shards
+    /// instead of compiling every replayed record on the reader shard.
     ss::future<bool> upsert(
       seq_marker marker,
       subject_schema schema,
       schema_id id,
       schema_version version,
-      is_deleted deleted);
+      is_deleted deleted,
+      defer_processing defer = defer_processing::no);
 
-    // This function will try to compile all marked schemas.
+    // This function will try to compile all marked schemas, each on the
+    // shard that owns it, concurrently across shards.
     // It should be called every time new schemas are loaded from
     // the topic into the store.
     ss::future<> process_marked_schemas();
@@ -107,6 +119,14 @@ public:
     ss::future<chunked_vector<context_subject>> get_subjects(
       include_deleted inc_del,
       std::optional<ss::sstring> subject_prefix = std::nullopt);
+
+    ///\brief Return every (subject, version) whose subject matches `filter`,
+    /// in a single scatter-gather across shards. Each result carries its
+    /// version's soft-delete state, so an include_deleted scan reports both the
+    /// live and deleted nodes in one pass.
+    ss::future<chunked_vector<subject_version_deleted>> list_subject_versions(
+      ss::noncopyable_function<bool(const context_subject&)> filter,
+      include_deleted inc_del);
 
     ///\brief Return whether there are any subjects.
     ss::future<bool> has_subjects(context ctx, include_deleted inc_del);
@@ -227,8 +247,8 @@ public:
 
     ss::future<bool> has_version(context_subject, schema_id, include_deleted);
 
-    //// \brief Throw if the store is not mutable
-    void check_mode_mutability(force f) const;
+    //// \brief Throw if mode changes are not allowed for this write source.
+    void check_mode_mutable(write_source src) const;
 
     ///\brief Look up the id of a schema by definition
     ss::future<std::optional<schema_id>>

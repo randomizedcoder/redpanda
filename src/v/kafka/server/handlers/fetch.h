@@ -24,9 +24,9 @@
 
 #include <seastar/core/smp.hh>
 
-#include <memory>
-
 namespace kafka {
+
+class fetch_read_coalescer;
 
 std::optional<ss::scheduling_group>
 fetch_scheduling_group_provider(const connection_context&);
@@ -50,9 +50,7 @@ struct op_context {
     public:
         response_placeholder(fetch_response::iterator, op_context* ctx);
 
-        void set(
-          fetch_response::partition_response&&,
-          std::optional<fetch_memory_units>&&);
+        void set(fetch_response::partition_response&&, fetch_units_holder&&);
 
         const model::topic& topic() { return _it->partition->topic; }
         model::partition_id partition_id() {
@@ -85,18 +83,16 @@ struct op_context {
 
         // Returns the number of memory units held for this ntp.
         size_t num_memory_units() const {
-            return _response_memory_units ? _response_memory_units->num_units()
-                                          : 0;
+            return _response_memory_units.num_units();
         }
 
         // Adds/replaces the memory units that are held for this ntp.
-        void
-        replace_or_add_memory_units(std::optional<fetch_memory_units>&& units) {
+        void replace_or_add_memory_units(fetch_units_holder&& units) {
             _response_memory_units = std::move(units);
         }
 
         // Releases/returns the memory units that are held for this ntp.
-        std::optional<fetch_memory_units> release_memory_units() {
+        fetch_units_holder release_memory_units() {
             return std::move(_response_memory_units);
         }
 
@@ -104,8 +100,9 @@ struct op_context {
         fetch_response::iterator _it;
         op_context* _ctx;
         const model::ktp_with_hash _ktp;
-        // Tracks memory used by response data in `_it`.
-        std::optional<fetch_memory_units> _response_memory_units;
+        // Tracks memory used by response data in `_it`. A coalesced read result
+        // hands each of its responses a shared handle to the same units.
+        fetch_units_holder _response_memory_units;
     };
 
     using iteration_order_t
@@ -269,6 +266,7 @@ struct ntp_fetch_config {
     fetch_config cfg;
 
     const model::ktp& ktp() const { return _ktp; }
+    const model::ktp_with_hash& ktp_with_hash() const { return _ktp; }
 
     fmt::iterator format_to(fmt::iterator it) const {
         return fmt::format_to(it, R"({{"{}": {}}})", ktp(), cfg);
@@ -279,7 +277,7 @@ struct ntp_fetch_config {
  * Simple type aggregating either data or an error
  */
 struct read_result {
-    using data_t = std::unique_ptr<iobuf>;
+    using data_t = std::optional<iobuf>;
 
     explicit read_result(error_code e)
       : start_offset(-1)
@@ -337,12 +335,23 @@ struct read_result {
       , preferred_replica(preferred_replica)
       , error(error_code::none) {}
 
-    bool has_data() const { return data != nullptr; }
+    bool has_data() const { return data.has_value(); }
 
     const iobuf& get_data() const { return *data; }
 
+    // share() only bumps fragment refcounts, leaving logical contents
+    // untouched, so the const_cast is safe; callers must not mutate the
+    // shared data.
+    data_t share_data() const {
+        if (!data.has_value()) {
+            return std::nullopt;
+        }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+        return const_cast<iobuf&>(*data).share();
+    }
+
     size_t data_size_bytes() const {
-        return data == nullptr ? 0 : data->size_bytes();
+        return data.has_value() ? data->size_bytes() : 0;
     }
 
     iobuf release_data() && { return std::move(*data); }
@@ -367,7 +376,7 @@ struct read_result {
     error_code error;
     model::partition_id partition;
     std::vector<cluster::tx::tx_range> aborted_transactions;
-    std::optional<fetch_memory_units> memory_units;
+    fetch_units_holder memory_units;
 };
 // struct aggregating fetch requests and corresponding response iterators for
 // the same shard
@@ -452,7 +461,8 @@ ss::future<read_result> read_from_ntp(
   fetch_config,
   std::optional<model::timeout_clock::time_point>,
   bool obligatory_batch_read,
-  fetch_memory_units_manager& units_mgr);
+  fetch_memory_units_manager& units_mgr,
+  fetch_read_coalescer& coalescer);
 
 /**
  * Create a fetch plan with the simple fetch planner.

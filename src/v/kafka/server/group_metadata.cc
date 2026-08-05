@@ -182,7 +182,7 @@ group_metadata_value group_metadata_value::decode(protocol::decoder& reader) {
         ret.state_timestamp = model::timestamp(reader.read_int64());
     }
 
-    ret.members = reader.read_array(
+    ret.members = reader.read_array<chunked_vector>(
       [](protocol::decoder& reader) { return member_state::decode(reader); });
 
     return ret;
@@ -245,14 +245,6 @@ offset_metadata_value offset_metadata_value::decode(protocol::decoder& reader) {
 }
 
 namespace {
-template<typename T>
-std::optional<T> read_optional_value(std::optional<protocol::decoder>& reader) {
-    if (!reader) {
-        return std::nullopt;
-    }
-    return T::decode(*reader);
-}
-
 template<typename T>
 iobuf metadata_to_iobuf(const T& t) {
     iobuf buffer;

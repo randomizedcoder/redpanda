@@ -530,6 +530,14 @@ class ResourceSettings:
     def num_cpus(self) -> int | None:
         return self._num_cpus
 
+    @property
+    def core_dump_limit(self) -> str | None:
+        return self._core_dump_limit
+
+    @core_dump_limit.setter
+    def core_dump_limit(self, value: str | None) -> None:
+        self._core_dump_limit = value
+
     def to_cli(self, *, dedicated_node: bool) -> Tuple[str, str]:
         """
 
@@ -995,6 +1003,20 @@ class SISettings:
 
         if self.cloud_storage_max_connections:
             conf["cloud_storage_max_connections"] = self.cloud_storage_max_connections
+            # The reservation policy (the default) asserts that the sum of
+            # per-group target_reserved values fits under the pool capacity.
+            # The cluster default sums to 6; shrink to a 1+1+1=3 override when
+            # the pool fits that but not the default. For pools smaller than 3
+            # we leave the override unset so build_admission_control_config's clamp
+            # falls back to no reservation (every admit through the common
+            # pool) — at cap<3 there isn't enough room to keep a per-group
+            # floor under the assertion.
+            if 3 <= self.cloud_storage_max_connections < 6:
+                conf["cloud_io_admission_control_reservation"] = [
+                    "producer_upload:1",
+                    "consumer_fetch:1",
+                    "default_group:1",
+                ]
         if self.cloud_storage_readreplica_manifest_sync_timeout_ms:
             conf["cloud_storage_readreplica_manifest_sync_timeout_ms"] = (
                 self.cloud_storage_readreplica_manifest_sync_timeout_ms
@@ -1255,7 +1277,7 @@ class SchemaRegistryConfig(TlsConfig):
     SR_TLS_CLIENT_KEY_FILE = "/etc/redpanda/sr_client.key"
     SR_TLS_CLIENT_CRT_FILE = "/etc/redpanda/sr_client.crt"
 
-    mode_mutability = False
+    mode_mutability = True
 
     def __init__(self) -> None:
         super(SchemaRegistryConfig, self).__init__()
@@ -1284,6 +1306,18 @@ class RedpandaServiceConstants:
     SUPERUSER_CREDENTIALS: SaslCredentials = SaslCredentials(
         "admin", "admin1234567890", "SCRAM-SHA-256"
     )
+
+    # Internal namespace (model::kafka_internal_namespace) hosting system topics
+    # such as the cloud-topics L1 metastore, transactions, id allocator, etc.
+    KAFKA_INTERNAL_NAMESPACE = "kafka_internal"
+    # Cloud-topics L1 metastore topic (model::l1_metastore_nt). Created eagerly
+    # at bootstrap with rf=1 and reconfigured up to
+    # internal_topic_replication_factor as nodes join.
+    CLOUD_TOPICS_METASTORE_TOPIC = "ct_l1_domain"
+    # ID allocator topic (model::id_allocator_nt). Created lazily on the first
+    # init_producer_id request, so it may appear in the data directory even on
+    # an otherwise-idle cluster.
+    ID_ALLOCATOR_TOPIC = "id_allocator"
 
 
 class RedpandaServiceABC(ABC, RedpandaServiceConstants):
@@ -3468,7 +3502,10 @@ class RedpandaService(Service, RedpandaServiceABC):
                     "_redpanda.audit_log",
                     "_redpanda.transform_logs",
                 },
-                "kafka_internal": {"ct_l1_domain"},
+                self.KAFKA_INTERNAL_NAMESPACE: {
+                    self.CLOUD_TOPICS_METASTORE_TOPIC,
+                    self.ID_ALLOCATOR_TOPIC,
+                },
             }
             expected["l1_staging"] = set()  # make type deduction happy
 
@@ -3731,6 +3768,28 @@ class RedpandaService(Service, RedpandaServiceABC):
         finally:
             self.signal_redpanda(node, signal=signal.SIGCONT)
             self.add_to_started_nodes(node)
+
+    @contextmanager
+    def core_dumps_disabled(self):
+        """Context manager that disables core dumps for redpanda processes
+        started within the block, restoring the prior limit on exit.
+
+        Intended for tests that deliberately abort a node -- e.g. a startup that
+        is expected to fail -- where the SIGILL from vassert's __builtin_trap()
+        would otherwise trigger a core dump. Flushing a multi-GB core on a loaded
+        host can take longer than the start/termination timeout and flake the
+        test; the abort reason is already captured in the log and the
+        crash_tracker crash file, so the kernel core adds no diagnostic value.
+
+        The limit is a shared resource setting, so this affects every node
+        started while the block is active -- fine for the sequential single-node
+        starts these tests perform."""
+        prev = self._resource_settings.core_dump_limit
+        self._resource_settings.core_dump_limit = "0"
+        try:
+            yield
+        finally:
+            self._resource_settings.core_dump_limit = prev
 
     def sockets_clear(self, node: RemoteClusterNode):
         """
@@ -4309,8 +4368,12 @@ class RedpandaService(Service, RedpandaServiceABC):
         cur_state = self.get_feature_state(feature_name)
         if active and cur_state == "unavailable":
             # If we have just restarted after an upgrade, wait for cluster version
-            # to progress and for the feature to become available.
-            self.await_feature(feature_name, "available", timeout_sec=timeout_sec)
+            # to progress and for the feature to become available. Features with
+            # available_policy::always auto-activate as soon as they become
+            # available, so accept "active" too.
+            self.await_feature(
+                feature_name, {"available", "active"}, timeout_sec=timeout_sec
+            )
         self._admin.put_feature(feature_name, {"state": target_state})
         self.await_feature(feature_name, target_state, timeout_sec=timeout_sec)
 
@@ -4326,7 +4389,7 @@ class RedpandaService(Service, RedpandaServiceABC):
     def await_feature(
         self,
         feature_name: str,
-        await_state: str,
+        await_state: str | set[str],
         *,
         timeout_sec: int,
         nodes: list[ClusterNode] | None = None,
@@ -4338,16 +4401,18 @@ class RedpandaService(Service, RedpandaServiceABC):
         if nodes is None:
             nodes = self.started_nodes()
 
+        await_states = {await_state} if isinstance(await_state, str) else await_state
+
         def is_awaited_state():
             for n in nodes:
                 state = self.get_feature_state(feature_name, node=n)
-                if state != await_state:
+                if state not in await_states:
                     self.logger.info(
-                        f"Feature {feature_name} not yet {await_state} on {n.name} (state {state})"
+                        f"Feature {feature_name} not yet in {await_states} on {n.name} (state {state})"
                     )
                     return False
 
-            self.logger.info(f"Feature {feature_name} is now {await_state}")
+            self.logger.info(f"Feature {feature_name} is now in {await_states}")
             return True
 
         wait_until(is_awaited_state, timeout_sec=timeout_sec, backoff_sec=1)
@@ -4802,15 +4867,38 @@ class RedpandaService(Service, RedpandaServiceABC):
         env_preamble = self.redpanda_env_preamble()
         version_cmd = f"{env_preamble} {self.find_binary('redpanda')} --version"
         VERSION_LINE_RE = re.compile(".*(v\\d+\\.\\d+\\.\\d+).*")
+
+        def read_version_lines():
+            # `redpanda --version` is occasionally slow to respond over SSH on a
+            # loaded node, surfacing as a socket read timeout. The output is not
+            # latency-sensitive, so retry only that transient stall (CORE-9724);
+            # every other failure must surface immediately rather than spin until
+            # the wait_until_result timeout. Note socket.timeout is referenced
+            # explicitly because TimeoutError is shadowed by the ducktape import.
+            # ssh_capture yields lazily, so the read (and any timeout) happens
+            # while iterating -- keep the loop inside the try.
+            try:
+                version_lines = [
+                    l
+                    for l in node.account.ssh_capture(
+                        version_cmd, allow_fail=True, timeout_sec=30
+                    )
+                    if VERSION_LINE_RE.match(l)
+                ]
+            except socket.timeout:
+                return False, None
+
+            return True, version_lines
+
+        version_lines = wait_until_result(
+            read_version_lines,
+            timeout_sec=90,
+            backoff_sec=1,
+            err_msg="redpanda --version did not respond over SSH within 90s",
+        )
+
         # NOTE: not all versions of Redpanda support the --version field, even
         # though they print out the version.
-        version_lines = [
-            l
-            for l in node.account.ssh_capture(
-                version_cmd, allow_fail=True, timeout_sec=10
-            )
-            if VERSION_LINE_RE.match(l)
-        ]
         assert len(version_lines) == 1, version_lines
         return VERSION_LINE_RE.findall(version_lines[0])[0]
 
@@ -6328,7 +6416,14 @@ class RedpandaService(Service, RedpandaServiceABC):
                 # transfer we end up waiting for the next full scrub cycle,
                 # see CORE-14424
                 "cloud_storage_partial_scrub_interval_ms": 100,
-                "cloud_storage_full_scrub_interval_ms": 10 * 1000,
+                # Effectively disable periodic re-scrubs for the lifetime
+                # of this helper: once a partition completes its full
+                # scrub it must stay "done" until the wait succeeds,
+                # otherwise it gets re-enqueued on every housekeeping
+                # cycle and starves the laggards of the shared op quota
+                # (CORE-15146). 24h is well past any plausible test
+                # runtime, so the value is effectively infinite here.
+                "cloud_storage_full_scrub_interval_ms": 24 * 60 * 60 * 1000,
                 "cloud_storage_scrubbing_interval_jitter_ms": 100,
                 "cloud_storage_background_jobs_quota": 5000,
                 "cloud_storage_housekeeping_interval_ms": 100,

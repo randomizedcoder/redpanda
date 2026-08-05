@@ -9,7 +9,7 @@
  */
 #include "cloud_topics/frontend/frontend.h"
 
-#include "cloud_io/scheduler_types.h"
+#include "cloud_io/admission_control_types.h"
 #include "cloud_storage/types.h"
 #include "cloud_topics/data_plane_api.h"
 #include "cloud_topics/frontend/errc.h"
@@ -253,18 +253,42 @@ ss::future<storage::translating_reader>
 frontend::make_reader(cloud_topic_log_reader_config cfg) {
     vassert(_data_plane != nullptr, "cloud topics api not initialized");
 
-    const auto lro = _ctp_stm_api->get_last_reconciled_offset();
+    bool level_one = false;
+    if (_partition->get_ntp_config().is_tiered_cloud()) {
+        // In tiered_cloud mode writes go straight to the local raft log; the
+        // authoritative copy of trimmed-away data lives in L1. Local retention
+        // prefix-truncates the local log, the min_allowed_local_threshold
+        // defines what's safe to read from it.
+        auto ot_state = _partition->get_offset_translator_state();
+        const auto local_start = model::offset_cast(
+          ot_state->from_log_offset(_partition->raft_start_offset()));
+        auto min_allowed_start_threshold
+          = _ctp_stm_api->get_min_allowed_local_threshold();
+        auto local_floor = std::max(local_start, min_allowed_start_threshold);
+        level_one = cfg.start_offset < local_floor;
 
-    const auto level_one = lro > kafka::offset::min()
-                           && cfg.start_offset <= lro;
+        vlog(
+          cd_log.debug,
+          "Building {} reader for {} from {} local floor {}, local start {}, "
+          "min allowed {}",
+          (level_one ? "L1" : "L0"),
+          _partition->ntp(),
+          cfg.start_offset,
+          local_floor,
+          local_start,
+          min_allowed_start_threshold);
+    } else {
+        const auto lro = _ctp_stm_api->get_last_reconciled_offset();
+        level_one = lro > kafka::offset::min() && cfg.start_offset <= lro;
 
-    vlog(
-      cd_log.debug,
-      "Building {} reader for {} from {} lro {}",
-      (level_one ? "L1" : "L0"),
-      _partition->ntp(),
-      cfg.start_offset,
-      lro);
+        vlog(
+          cd_log.debug,
+          "Building {} reader for {} from {} lro {}",
+          (level_one ? "L1" : "L0"),
+          _partition->ntp(),
+          cfg.start_offset,
+          lro);
+    }
 
     if (level_one) {
         // For L1, we return a `null` translator because control batches
@@ -432,13 +456,19 @@ frontend::timequery(storage::timequery_config cfg) {
       "metadata timequery for L1: {}, for L0: {}",
       l1_result,
       l0_result);
+    auto min_offset = model::offset_cast(cfg.min_offset);
     if (l1_result) {
-        co_return co_await refine_timequery_result(
-          *l1_result, cfg.abort_source);
+        auto refined = co_await refine_timequery_result(
+          *l1_result, min_offset, cfg.abort_source);
+        // The L1 candidate can be clamped away entirely (its whole range is
+        // below the kafka start offset); the L0 candidate may still answer.
+        if (refined.has_value()) {
+            co_return refined;
+        }
     }
     if (l0_result) {
         co_return co_await refine_timequery_result(
-          *l0_result, cfg.abort_source);
+          *l0_result, min_offset, cfg.abort_source);
     }
     co_return std::nullopt;
 }
@@ -479,12 +509,23 @@ frontend::l1_timequery(storage::timequery_config cfg) {
 
 ss::future<std::optional<frontend::coarse_grained_timequery_result>>
 frontend::l0_timequery(storage::timequery_config cfg) {
+    // The query bounds are kafka offsets while the local reader operates on
+    // log offsets. Clamp the lower bound to the local log start first, then
+    // translate into log offset space. Data below the local log start has been
+    // reconciled and is answered by the L1 query.
+    auto ot_state = _partition->get_offset_translator_state();
+    auto local_start_offset = ot_state->from_log_offset(
+      _partition->raft_start_offset());
+    auto min_offset = std::max(cfg.min_offset, local_start_offset);
+    if (min_offset > cfg.max_offset) {
+        co_return std::nullopt;
+    }
     // Read L0 metadata to find the right batch. We can't use
     // _partition->timequery because it will filter for only data batches, not
     // placeholder batches.
     auto reader = co_await _partition->make_local_reader({
-      /*start_offset=*/cfg.min_offset,
-      /*max_offset=*/cfg.max_offset,
+      /*start_offset=*/ot_state->to_log_offset(min_offset),
+      /*max_offset=*/ot_state->to_log_offset(cfg.max_offset),
       /*max_bytes=*/std::numeric_limits<size_t>::max(),
       /*type_filter=*/std::nullopt,
       /*time=*/cfg.time,
@@ -495,33 +536,56 @@ frontend::l0_timequery(storage::timequery_config cfg) {
       model::record_batch_type::raft_data,
       model::record_batch_type::ctp_placeholder,
     });
-    auto gen = std::move(reader).generator(model::no_timeout);
-    while (auto batch_opt = co_await gen()) {
-        auto& batch = batch_opt->get();
-        if (!std::ranges::contains(type_filter, batch.header().type)) {
-            continue;
+
+    struct coarse_consumer {
+        model::timestamp time;
+        ss::lw_shared_ptr<const storage::offset_translator_state> ot_state;
+        std::optional<coarse_grained_timequery_result> result;
+
+        ss::future<ss::stop_iteration> operator()(model::record_batch& batch) {
+            if (!std::ranges::contains(type_filter, batch.header().type)) {
+                co_return ss::stop_iteration::no;
+            }
+            if (batch.header().max_timestamp < time) {
+                co_return ss::stop_iteration::no;
+            }
+            // NOTE: we can't just return this offset verbatim, since we
+            // don't record the same timestamp deltas inside batches for
+            // placeholder batches (this would require unpacking batches
+            // during produce).
+            result = coarse_grained_timequery_result{
+              .time = time,
+              .start_offset = model::offset_cast(
+                ot_state->from_log_offset(batch.base_offset())),
+              .last_offset = model::offset_cast(
+                ot_state->from_log_offset(batch.last_offset())),
+            };
+            co_return ss::stop_iteration::yes;
         }
-        if (batch.header().max_timestamp < cfg.time) {
-            continue;
+
+        std::optional<coarse_grained_timequery_result> end_of_stream() {
+            return result;
         }
-        // NOTE: we can't just return this offset verbatim, since we don't
-        // record the same timestamp deltas inside batches for placeholder
-        // batches (this would require unpacking batches during produce).
-        auto ot_state = _partition->get_offset_translator_state();
-        co_return coarse_grained_timequery_result{
-          .time = cfg.time,
-          .start_offset = model::offset_cast(
-            ot_state->from_log_offset(batch.base_offset())),
-          .last_offset = model::offset_cast(
-            ot_state->from_log_offset(batch.last_offset())),
-        };
-    }
-    co_return std::nullopt;
+    };
+
+    co_return co_await std::move(reader).for_each_ref(
+      coarse_consumer{
+        .time = cfg.time,
+        .ot_state = _partition->get_offset_translator_state(),
+      },
+      model::no_timeout);
 }
 ss::future<std::optional<storage::timequery_result>>
 frontend::refine_timequery_result(
   coarse_grained_timequery_result input,
+  kafka::offset min_offset,
   model::opt_abort_source_t abort_source) {
+    // Clamp the scan in offset space so records below the start offset can
+    // never answer the query
+    auto clamped_start = std::max(input.start_offset, min_offset);
+    if (clamped_start > input.last_offset) {
+        co_return std::nullopt;
+    }
     // Pass the timestamp so the L1 reader can use the footer's timestamp
     // index to seek directly to the relevant position, avoiding unnecessary
     // cloud IO. In the case of L0, we should only need to materialize a
@@ -529,36 +593,54 @@ frontend::refine_timequery_result(
     // a batch (but not within a batch due to placeholders).
     cloud_topic_log_reader_config reader_cfg(
       /*group=*/cloud_io::group_id::consumer_fetch,
-      /*start_offset=*/input.start_offset,
+      /*start_offset=*/clamped_start,
       /*max_offset=*/input.last_offset,
       /*first_timestamp=*/input.time,
       /*as=*/abort_source,
       /*client_addr=*/std::nullopt);
     auto reader = co_await make_reader(reader_cfg);
-    auto generator = std::move(reader.reader).generator(model::no_timeout);
-    auto query_interval = model::bounded_offset_interval::checked(
-      kafka::offset_cast(input.start_offset),
-      kafka::offset_cast(input.last_offset));
-    while (auto batch_opt = co_await generator()) {
-        auto& batch = batch_opt->get();
-        auto batch_interval = model::bounded_offset_interval::checked(
-          batch.base_offset(), batch.last_offset());
-        if (!query_interval.overlaps(batch_interval)) {
-            if (batch_interval.min() > query_interval.max()) {
-                break;
+
+    struct timequery_consumer {
+        model::offset start_offset;
+        model::offset last_offset;
+        model::timestamp time;
+        model::bounded_offset_interval query_interval;
+        std::optional<storage::timequery_result> result;
+
+        ss::future<ss::stop_iteration> operator()(model::record_batch batch) {
+            auto batch_interval = model::bounded_offset_interval::checked(
+              batch.base_offset(), batch.last_offset());
+            if (!query_interval.overlaps(batch_interval)) {
+                if (batch_interval.min() > query_interval.max()) {
+                    co_return ss::stop_iteration::yes;
+                }
+                co_return ss::stop_iteration::no;
             }
-            continue;
+            if (time > batch.header().max_timestamp) {
+                co_return ss::stop_iteration::no;
+            }
+            result = co_await storage::batch_timequery(
+              std::move(batch), start_offset, time, last_offset);
+            co_return ss::stop_iteration::yes;
         }
-        if (input.time > batch.header().max_timestamp) {
-            continue;
+
+        std::optional<storage::timequery_result> end_of_stream() {
+            return result;
         }
-        co_return co_await storage::batch_timequery(
-          std::move(batch),
-          kafka::offset_cast(input.start_offset),
-          input.time,
-          kafka::offset_cast(input.last_offset));
-    }
-    co_return std::nullopt;
+    };
+
+    auto start_offset = kafka::offset_cast(clamped_start);
+    auto last_offset = kafka::offset_cast(input.last_offset);
+    co_return co_await std::move(reader.reader)
+      .consume(
+        timequery_consumer{
+          .start_offset = start_offset,
+          .last_offset = last_offset,
+          .time = input.time,
+          .query_interval = model::bounded_offset_interval::checked(
+            start_offset, last_offset),
+        },
+        model::no_timeout);
 }
 
 namespace {
@@ -814,6 +896,70 @@ ss::future<result<raft::replicate_result>> do_upload_and_replicate(
       .last_term = res.value().last_term,
     };
 }
+
+/// Replicate a raft_data batch directly through raft (tiered_cloud mode),
+/// ordered behind the producer's requests that are still in the cloud
+/// produce pipeline.
+///
+/// A request admitted in cloud mode reaches the raft layer only after an L0
+/// upload, so after a cloud -> tiered_cloud storage-mode flip a request from
+/// the same producer admitted in tiered_cloud mode could otherwise overtake
+/// it and draw a spurious out-of-order-sequence error. The client recovers
+/// from that by bumping the producer epoch and re-sending its in-doubt
+/// batches; if the overtaken request's append lands before the epoch bump
+/// reaches the partition, the re-send appends a second copy of the same
+/// records. Redeeming a producer-queue ticket here serializes this request
+/// behind the producer's in-flight cloud-path requests, which closes the
+/// window. The queue is empty in steady state so this adds no waiting
+/// outside of a mode transition.
+ss::future<result<raft::replicate_result>> do_tiered_replicate(
+  ss::lw_shared_ptr<cluster::partition> partition,
+  l0::producer_ticket ticket,
+  model::batch_identity batch_id,
+  model::record_batch batch,
+  raft::replicate_options opts,
+  ss::promise<> enqueued) {
+    // Wait for all previous requests from this producer to be enqueued
+    // into raft.
+    ss::future<> redeem_fut = opts.as ? ticket.redeem(opts.as->get())
+                                      : ticket.redeem();
+    auto redeemed = co_await ss::coroutine::as_future(std::move(redeem_fut));
+    if (redeemed.failed()) {
+        // The ticket releases itself on destruction; resolve the enqueued
+        // stage and deliver the error through the finished stage, matching
+        // the cloud path.
+        enqueued.set_value();
+        co_await ss::coroutine::return_exception_ptr(redeemed.get_exception());
+    }
+
+    auto stages = partition->replicate_in_stages(
+      batch_id, std::move(batch), opts);
+    auto enq = co_await ss::coroutine::as_future(
+      std::move(stages.request_enqueued));
+
+    ticket.release(); // always release the ticket
+
+    if (enq.failed()) {
+        auto ex = enq.get_exception();
+        vlog(
+          cd_log.trace,
+          "failed to enqueue replicate request into raft ({}): {}",
+          partition->ntp(),
+          ex);
+        // fallthrough - we expect the finish stage to fail as well and we
+        // don't want to abandon the replicate_finished future
+    }
+    enqueued.set_value();
+
+    auto res = co_await std::move(stages.replicate_finished);
+    if (res.has_error()) {
+        co_return res.error();
+    }
+    co_return raft::replicate_result{
+      .last_offset = kafka::offset_cast(res.value().last_offset),
+      .last_term = res.value().last_term,
+    };
+}
 } // namespace
 
 ss::future<std::expected<kafka::offset, std::error_code>> frontend::replicate(
@@ -959,22 +1105,24 @@ raft::replicate_stages frontend::replicate(
     // Use partition->replicate_in_stages which returns kafka_stages (with
     // kafka-translated offsets), then adapt to raft::replicate_stages.
     // The client's requested acks level is passed through.
+    //
+    // The ticket must be reserved before this call returns: the produce
+    // handler dispatches the producer's next request once the enqueued
+    // stage resolves, and that request has to land behind this one in the
+    // queue.
     if (_partition->get_ntp_config().is_tiered_cloud()) {
-        auto ks = _partition->replicate_in_stages(
-          batch_id, std::move(batch), opts);
+        auto ticket = _ctp_stm_api->producer_queue().reserve(
+          batch_id.pid.get_id());
         raft::replicate_stages out(raft::errc::success);
-        out.request_enqueued = std::move(ks.request_enqueued);
-        out.replicate_finished = ks.replicate_finished.then(
-          [](
-            result<cluster::kafka_result> r) -> result<raft::replicate_result> {
-              if (!r) {
-                  return r.error();
-              }
-              return raft::replicate_result{
-                .last_offset = kafka::offset_cast(r.value().last_offset),
-                .last_term = r.value().last_term,
-              };
-          });
+        ss::promise<> enqueued;
+        out.request_enqueued = enqueued.get_future();
+        out.replicate_finished = do_tiered_replicate(
+          _partition,
+          std::move(ticket),
+          batch_id,
+          std::move(batch),
+          opts,
+          std::move(enqueued));
         return out;
     }
 

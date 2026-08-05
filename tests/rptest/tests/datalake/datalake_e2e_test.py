@@ -508,6 +508,7 @@ class DatalakeE2ETests(RedpandaTest):
                     {
                         "bootstrap.servers": self.redpanda.brokers(),
                         "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                        "enable.idempotence": True,
                     },
                     default_value_schema=raw_schema,
                 )
@@ -721,10 +722,11 @@ class DatalakeE2ETests(RedpandaTest):
                 {
                     "bootstrap.servers": self.redpanda.brokers(),
                     "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                    "enable.idempotence": True,
                 },
                 default_value_schema=avro.loads(schema_str),
             )
-            producer.produce(topic=topic, value=record)
+            producer.produce(topic=topic, value=record, headers=[("h", b"hello")])
             producer.flush()
             dl.wait_for_translation(topic, msg_count=1)
 
@@ -739,6 +741,14 @@ class DatalakeE2ETests(RedpandaTest):
                 assert got == c.pyiceberg, (
                     f"pyiceberg {c.name}: expected={c.pyiceberg!r} got={got!r}"
                 )
+
+            # Verify headers are present and stored as binary (default mode).
+            hdrs = pydict["redpanda"][0]["headers"]
+            assert len(hdrs) == 1, f"expected 1 header, got {hdrs!r}"
+            assert hdrs[0]["key"] == "h", f"unexpected header key: {hdrs[0]['key']!r}"
+            assert hdrs[0]["value"] == b"hello", (
+                f"unexpected header value: {hdrs[0]['value']!r}"
+            )
 
             # Engine readback — one SQL projection, each column is a bool
             # check. All should be True.
@@ -758,6 +768,25 @@ class DatalakeE2ETests(RedpandaTest):
                 assert got is True, (
                     f"engine {c.name} check failed ({sql_check(c)}): got={got!r}"
                 )
+
+            # Verify header key and binary value via SQL.
+            hdr_key_sql = _engine_sql(
+                default="element_at(redpanda.headers, 1).key = 'h'",
+                duckdb_py="redpanda.headers[1].key = 'h'",
+            )(query_engine)
+            hdr_val_sql = _engine_sql(
+                default="element_at(redpanda.headers, 1).value = X'68656c6c6f'",
+                duckdb_py="redpanda.headers[1].value = '\\x68\\x65\\x6c\\x6c\\x6f'::BLOB",
+            )(query_engine)
+            hdr_rows = engine.run_query_fetch_all(
+                f"SELECT ({hdr_key_sql}) AS hdr_key_ok,"
+                f" ({hdr_val_sql}) AS hdr_val_ok FROM {table}"
+            )
+            assert len(hdr_rows) == 1
+            assert hdr_rows[0][0] is True, f"header key check failed: {hdr_rows[0]}"
+            assert hdr_rows[0][1] is True, (
+                f"header binary value check failed: {hdr_rows[0]}"
+            )
 
     @cluster(num_nodes=3)
     @matrix(
@@ -779,6 +808,264 @@ class DatalakeE2ETests(RedpandaTest):
     )
     def test_avro_all_iceberg_types_duckdb(self, cloud_storage_type, catalog_type):
         self._run_avro_all_iceberg_types(QueryEngineType.DUCKDB_PY, catalog_type)
+
+    @cluster(num_nodes=3)
+    @matrix(
+        cloud_storage_type=supported_storage_types(),
+        query_engine=[QueryEngineType.SPARK],
+        catalog_type=[CatalogType.REST_JDBC],
+    )
+    def test_header_string_mode(self, cloud_storage_type, query_engine, catalog_type):
+        """Verify that headers:value_type=string stores header values as UTF-8
+        strings, sanitizing invalid byte sequences to U+FFFD."""
+        topic = "header_string_mode"
+        table = f"redpanda.{topic}"
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[query_engine],
+            catalog_type=catalog_type,
+        ) as dl:
+            dl.create_iceberg_enabled_topic(
+                topic, iceberg_mode="headers:value_type=string"
+            )
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
+            # One header with valid UTF-8, one with a leading invalid byte so
+            # we verify sanitization fires end-to-end.
+            producer.produce(
+                topic,
+                value=b"v",
+                headers=[("ascii", b"hello"), ("bad_utf8", b"\x80world")],
+            )
+            producer.flush()
+            dl.wait_for_translation(topic, msg_count=1)
+
+            # pyiceberg: verify values and types (comes back as str, not bytes).
+            tbl = dl.catalog_client().load_table(("redpanda", topic))
+            pydict = tbl.scan().to_arrow().to_pydict()
+            hdrs = pydict["redpanda"][0]["headers"]
+            assert len(hdrs) == 2, f"expected 2 headers, got {hdrs!r}"
+            by_key = {h["key"]: h["value"] for h in hdrs}
+            assert by_key["ascii"] == "hello", f"unexpected value: {by_key['ascii']!r}"
+            # Invalid leading byte sanitized to U+FFFD.
+            assert by_key["bad_utf8"] == "\ufffdworld", (
+                f"unexpected value: {by_key['bad_utf8']!r}"
+            )
+
+            # Verify table structure: header values should be string, not binary.
+            spark = dl.spark()
+            spark_expected_out = [
+                (
+                    "redpanda",
+                    "struct<partition:int,offset:bigint,timestamp:timestamp,headers:array<struct<key:string,value:string>>,key:binary,timestamp_type:int>",
+                    None,
+                ),
+                ("value", "binary", None),
+                ("", "", ""),
+                ("# Partitioning", "", ""),
+                ("Part 0", "hours(redpanda.timestamp)", ""),
+            ]
+            spark_describe_out = spark.run_query_fetch_all(f"describe {table}")
+            assert spark_describe_out == spark_expected_out, str(spark_describe_out)
+
+            # SQL engine: verify the header value column is queryable as a
+            # string literal.
+            engine = dl.query_engine(query_engine)
+            rows = engine.run_query_fetch_all(
+                f"SELECT (element_at(redpanda.headers, 1).value = 'hello') AS ok"
+                f" FROM {table}"
+            )
+            assert len(rows) == 1
+            assert rows[0][0] is True, f"SQL string header check failed: {rows[0]}"
+
+    @cluster(num_nodes=3)
+    @matrix(
+        cloud_storage_type=supported_storage_types(),
+        query_engine=[QueryEngineType.SPARK],
+        catalog_type=[CatalogType.REST_JDBC],
+    )
+    def test_key_schema_mode(self, cloud_storage_type, query_engine, catalog_type):
+        """Verify that key:mode=schema_id_prefix decodes Avro-encoded keys via
+        the schema registry and promotes the decoded struct into the
+        redpanda.key iceberg field (replacing the default binary type)."""
+        topic = "key_schema_mode"
+        table = f"redpanda.{topic}"
+        key_schema_str = json.dumps(
+            {
+                "type": "record",
+                "name": "Key",
+                "namespace": "com.test",
+                "fields": [{"name": "id", "type": "long"}],
+            }
+        )
+        val_schema_str = json.dumps(
+            {
+                "type": "record",
+                "name": "Value",
+                "namespace": "com.test",
+                "fields": [{"name": "name", "type": "string"}],
+            }
+        )
+        key_record = {"id": 42}
+        val_record = {"name": "hello"}
+
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[query_engine],
+            catalog_type=catalog_type,
+        ) as dl:
+            dl.create_iceberg_enabled_topic(
+                topic,
+                iceberg_mode="key:mode=schema_id_prefix;value:mode=schema_id_prefix",
+            )
+            sr_url = self.redpanda.schema_reg().split(",")[0]
+            producer = AvroProducer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "schema.registry.url": sr_url,
+                    "enable.idempotence": True,
+                },
+                default_key_schema=avro.loads(key_schema_str),
+                default_value_schema=avro.loads(val_schema_str),
+            )
+            producer.produce(topic=topic, key=key_record, value=val_record)
+            producer.flush()
+            dl.wait_for_translation(topic, msg_count=1)
+
+            # pyiceberg: verify that the key column is a struct (not bytes) and
+            # that the decoded value round-trips correctly.
+            tbl = dl.catalog_client().load_table(("redpanda", topic))
+            pydict = tbl.scan().to_arrow().to_pydict()
+            rp_row = pydict["redpanda"][0]
+            key_val = rp_row["key"]
+            assert isinstance(key_val, dict), (
+                f"expected redpanda.key to be a dict (decoded struct), got {key_val!r}"
+            )
+            assert key_val.get("id") == 42, (
+                f"expected redpanda.key.id == 42, got {key_val!r}"
+            )
+            assert pydict.get("name", [None])[0] == "hello", (
+                f"expected top-level 'name' column == 'hello', got {pydict.get('name')!r}"
+            )
+
+            # Verify table structure: redpanda.key should be a struct (not
+            # binary) and the value schema fields should be top-level columns.
+            spark = dl.spark()
+            spark_expected_out = [
+                (
+                    "redpanda",
+                    "struct<partition:int,offset:bigint,timestamp:timestamp,headers:array<struct<key:string,value:binary>>,key:struct<id:bigint>,timestamp_type:int>",
+                    None,
+                ),
+                ("name", "string", None),
+                ("", "", ""),
+                ("# Partitioning", "", ""),
+                ("Part 0", "hours(redpanda.timestamp)", ""),
+            ]
+            spark_describe_out = spark.run_query_fetch_all(f"describe {table}")
+            assert spark_describe_out == spark_expected_out, str(spark_describe_out)
+
+            # SQL engine: verify key.id is queryable as a numeric value.
+            engine = dl.query_engine(query_engine)
+            rows = engine.run_query_fetch_all(
+                f"SELECT (redpanda.key.id = 42) AS key_ok,"
+                f" (name = 'hello') AS val_ok FROM {table}"
+            )
+            assert len(rows) == 1
+            assert rows[0][0] is True, f"key.id SQL check failed: {rows[0]}"
+            assert rows[0][1] is True, f"name SQL check failed: {rows[0]}"
+
+    @cluster(num_nodes=3)
+    @matrix(
+        cloud_storage_type=supported_storage_types(),
+        query_engine=[QueryEngineType.SPARK],
+        catalog_type=[CatalogType.REST_JDBC],
+    )
+    def test_string_mode(self, cloud_storage_type, query_engine, catalog_type):
+        """Verify that key:mode=string and value:mode=string store plain
+        bytes as UTF-8 strings in Iceberg, sanitizing invalid sequences
+        to U+FFFD."""
+        topic = "string_mode"
+        table = f"redpanda.{topic}"
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[query_engine],
+            catalog_type=catalog_type,
+        ) as dl:
+            dl.create_iceberg_enabled_topic(
+                topic,
+                iceberg_mode="key:mode=string;value:mode=string",
+            )
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
+            # Record with valid UTF-8 key and value.
+            producer.produce(topic, key=b"hello-key", value=b"hello-val")
+            # Record with invalid UTF-8 in key and value (bare continuation
+            # byte) to verify sanitization fires end-to-end.
+            producer.produce(topic, key=b"\x80key", value=b"\x80val")
+            producer.flush()
+            dl.wait_for_translation(topic, msg_count=2)
+
+            # pyiceberg: verify types and values.
+            tbl = dl.catalog_client().load_table(("redpanda", topic))
+            pydict = tbl.scan().to_arrow().to_pydict()
+
+            # Key column should be string (not bytes).
+            keys = sorted([row["key"] for row in pydict["redpanda"]])
+            assert all(isinstance(k, str) for k in keys), (
+                f"expected string keys, got {keys!r}"
+            )
+            assert "hello-key" in keys, f"missing valid key: {keys!r}"
+            assert "\ufffdkey" in keys, f"missing sanitized key: {keys!r}"
+
+            # Value column should be string (not bytes).
+            vals = sorted(pydict["value"])
+            assert all(isinstance(v, str) for v in vals), (
+                f"expected string values, got {vals!r}"
+            )
+            assert "hello-val" in vals, f"missing valid value: {vals!r}"
+            assert "\ufffdval" in vals, f"missing sanitized value: {vals!r}"
+
+            # Verify table structure: key should be string, value should be
+            # string.
+            spark = dl.spark()
+            spark_expected_out = [
+                (
+                    "redpanda",
+                    "struct<partition:int,offset:bigint,timestamp:timestamp,"
+                    "headers:array<struct<key:string,value:binary>>,"
+                    "key:string,timestamp_type:int>",
+                    None,
+                ),
+                ("value", "string", None),
+                ("", "", ""),
+                ("# Partitioning", "", ""),
+                ("Part 0", "hours(redpanda.timestamp)", ""),
+            ]
+            spark_describe_out = spark.run_query_fetch_all(f"describe {table}")
+            assert spark_describe_out == spark_expected_out, str(spark_describe_out)
+
+            # SQL engine: verify key and value are queryable as string
+            # literals.
+            engine = dl.query_engine(query_engine)
+            rows = engine.run_query_fetch_all(
+                f"SELECT redpanda.key, value FROM {table}"
+                f" WHERE redpanda.key = 'hello-key'"
+            )
+            assert len(rows) == 1
+            assert rows[0][0] == "hello-key", f"key SQL check failed: {rows[0]}"
+            assert rows[0][1] == "hello-val", f"value SQL check failed: {rows[0]}"
 
     # Note: nothing unique about this test so run it with single catalog/query engine.
     @cluster(num_nodes=3)
@@ -813,7 +1100,12 @@ class DatalakeE2ETests(RedpandaTest):
                 )
 
                 self.logger.info(f"Producing records for topic {test_case_topic_name}")
-                producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+                producer = Producer(
+                    {
+                        "bootstrap.servers": self.redpanda.brokers(),
+                        "enable.idempotence": True,
+                    }
+                )
                 for i in range(count):
                     t = time.time()
                     producer.produce(
@@ -910,7 +1202,12 @@ class DatalakeE2ETests(RedpandaTest):
             )
 
             self.logger.info(f"Producing records for topic {self.topic_name}")
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             for _ in range(count):
                 t = time.time()
                 record = record_generator(t)
@@ -993,7 +1290,12 @@ class DatalakeE2ETests(RedpandaTest):
                 )
 
                 self.logger.info(f"Producing records for topic {test_case_topic_name}")
-                producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+                producer = Producer(
+                    {
+                        "bootstrap.servers": self.redpanda.brokers(),
+                        "enable.idempotence": True,
+                    }
+                )
                 for i in range(count):
                     t = time.time()
                     producer.produce(
@@ -1118,7 +1420,12 @@ message_type {
         count = 100
 
         def produce_protos():
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             for i in range(count):
                 record = json.dumps(
                     {
@@ -1446,6 +1753,7 @@ message_type {
                 {
                     "bootstrap.servers": self.redpanda.brokers(),
                     "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                    "enable.idempotence": True,
                 },
                 default_value_schema=schema,
             )
@@ -1494,6 +1802,100 @@ message_type {
             for f_tuple in files:
                 f_name = f_tuple[0]
                 validate_data_file_path(f_name)
+
+    @cluster(num_nodes=3)
+    @matrix(
+        cloud_storage_type=supported_storage_types(),
+        catalog_type=[CatalogType.REST_JDBC],
+    )
+    def test_iceberg_value_layout(self, cloud_storage_type, catalog_type):
+        """Verify layout=flat and layout=nested produce the expected Iceberg
+        schema shapes and that values are queryable via Spark SQL.
+
+        Flat layout (default): user schema fields are promoted to the top
+        level of the row alongside the 'redpanda' system struct.
+
+        Nested layout: all user fields are wrapped inside a top-level
+        'value' struct, keeping the user schema separate from system fields.
+        """
+        layout_schema_str = json.dumps(
+            {
+                "type": "record",
+                "name": "LayoutTest",
+                "fields": [
+                    {"name": "mynum", "type": "int"},
+                    {"name": "mylong", "type": "long"},
+                ],
+            }
+        )
+        flat_topic = "flat_layout"
+        nested_topic = "nested_layout"
+        record = {"mynum": 42, "mylong": 99}
+
+        with DatalakeServices(
+            self.test_ctx,
+            redpanda=self.redpanda,
+            include_query_engines=[QueryEngineType.SPARK],
+            catalog_type=catalog_type,
+        ) as dl:
+            dl.create_iceberg_enabled_topic(
+                flat_topic,
+                iceberg_mode="value:mode=schema_id_prefix",
+            )
+            dl.create_iceberg_enabled_topic(
+                nested_topic,
+                iceberg_mode="value:mode=schema_id_prefix,layout=nested",
+            )
+
+            schema = avro.loads(layout_schema_str)
+            producer = AvroProducer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "schema.registry.url": self.redpanda.schema_reg().split(",")[0],
+                },
+                default_value_schema=schema,
+            )
+            producer.produce(topic=flat_topic, value=record)
+            producer.produce(topic=nested_topic, value=record)
+            producer.flush()
+
+            dl.wait_for_translation(flat_topic, msg_count=1)
+            dl.wait_for_translation(nested_topic, msg_count=1)
+
+            # Flat: mynum and mylong are top-level fields; no 'value' wrapper.
+            flat_tbl = dl.catalog_client().load_table(("redpanda", flat_topic))
+            flat_names = [f.name for f in flat_tbl.schema().fields]
+            assert "mynum" in flat_names, flat_names
+            assert "mylong" in flat_names, flat_names
+            assert "value" not in flat_names, flat_names
+
+            # Nested: a top-level 'value' struct holds the user fields.
+            nested_tbl = dl.catalog_client().load_table(("redpanda", nested_topic))
+            nested_top = [f.name for f in nested_tbl.schema().fields]
+            assert "value" in nested_top, nested_top
+            assert "mynum" not in nested_top, nested_top
+            assert "mylong" not in nested_top, nested_top
+            value_field = next(
+                f for f in nested_tbl.schema().fields if f.name == "value"
+            )
+            nested_value_names = [f.name for f in value_field.field_type.fields]
+            assert "mynum" in nested_value_names, nested_value_names
+            assert "mylong" in nested_value_names, nested_value_names
+
+            # SQL: flat fields accessible at top level.
+            spark = dl.spark()
+            flat_rows = spark.run_query_fetch_all(
+                f"SELECT mynum, mylong FROM redpanda.{flat_topic}"
+            )
+            assert len(flat_rows) == 1, flat_rows
+            assert flat_rows[0] == (42, 99), flat_rows[0]
+
+            # SQL: nested fields accessible via the 'value' struct.
+            nested_rows = spark.run_query_fetch_all(
+                f"SELECT value.mynum, value.mylong FROM redpanda.{nested_topic}"
+            )
+            assert len(nested_rows) == 1, nested_rows
+            assert nested_rows[0] == (42, 99), nested_rows[0]
 
 
 class DatalakeMultiBrokerE2ETest(RedpandaTest):
@@ -1590,7 +1992,12 @@ class DatalakeMultiBrokerE2ETest(RedpandaTest):
         Person = factory.GetPrototype(person_desc)
 
         def produce_protos():
-            producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+            producer = Producer(
+                {
+                    "bootstrap.servers": self.redpanda.brokers(),
+                    "enable.idempotence": True,
+                }
+            )
             for i in range(count):
                 record = json.dumps(
                     {

@@ -11,9 +11,9 @@
 #include "cloud_io/remote.h"
 
 #include "bytes/iostream.h"
+#include "cloud_io/admission_control_types.h"
 #include "cloud_io/logger.h"
 #include "cloud_io/provider.h"
-#include "cloud_io/scheduler_types.h"
 #include "cloud_io/transfer_details.h"
 #include "cloud_storage_clients/bucket_name_parts.h"
 #include "cloud_storage_clients/client_pool.h"
@@ -99,51 +99,6 @@ ErrT throw_if_not_timeout(const std::exception_ptr& e, ErrT on_timeout) {
     }
 }
 
-/// \brief Multipart upload state wrapper that holds a client lease
-///
-/// This wrapper holds a client lease for the entire duration of the
-/// multipart upload operation, ensuring the client remains available
-/// and is not returned to the pool prematurely.
-class multipart_upload_state_with_lease final
-  : public cloud_storage_clients::multipart_upload_state {
-public:
-    multipart_upload_state_with_lease(
-      cloud_storage_clients::client_pool::client_lease lease,
-      ss::shared_ptr<cloud_storage_clients::multipart_upload_state> inner)
-      : _lease(std::move(lease))
-      , _inner(std::move(inner)) {}
-
-    ss::future<> initialize_multipart() override {
-        return _inner->initialize_multipart();
-    }
-
-    ss::future<> upload_part(size_t part_num, iobuf data) override {
-        return _inner->upload_part(part_num, std::move(data));
-    }
-
-    ss::future<> complete_multipart_upload() override {
-        return _inner->complete_multipart_upload();
-    }
-
-    ss::future<> abort_multipart_upload() override {
-        return _inner->abort_multipart_upload();
-    }
-
-    ss::future<> upload_as_single_object(iobuf data) override {
-        return _inner->upload_as_single_object(std::move(data));
-    }
-
-    bool is_multipart_initialized() const override {
-        return _inner->is_multipart_initialized();
-    }
-
-    ss::sstring upload_id() const override { return _inner->upload_id(); }
-
-private:
-    cloud_storage_clients::client_pool::client_lease _lease;
-    ss::shared_ptr<cloud_storage_clients::multipart_upload_state> _inner;
-};
-
 } // namespace
 
 namespace cloud_io {
@@ -225,7 +180,8 @@ ss::future<upload_result> remote::upload_stream(
   const reset_input_stream& reset_str,
   lazy_abort_source& lazy_abort_source,
   const std::string_view stream_label,
-  std::optional<size_t> max_retries) {
+  std::optional<size_t> max_retries,
+  group_id gid) {
     const auto& path = transfer_details.key;
     const auto& bucket = transfer_details.bucket;
     const auto bucket_parts = cloud_storage_clients::parse_bucket_name(bucket);
@@ -255,7 +211,11 @@ ss::future<upload_result> remote::upload_stream(
         }
         auto fut = co_await ss::coroutine::as_future(
           _pool.local().acquire_with_timeout(
-            *bucket_parts, fib.root_abort_source(), _lease_timeout(), fib()));
+            *bucket_parts,
+            gid,
+            fib.root_abort_source(),
+            _lease_timeout(),
+            fib()));
         if (fut.failed()) {
             co_return throw_if_not_timeout(
               fut.get_exception(), upload_result::timedout);
@@ -707,7 +667,7 @@ ss::future<download_result> remote::object_exists(
 }
 
 ss::future<upload_result>
-remote::delete_object(transfer_details transfer_details) {
+remote::delete_object(transfer_details transfer_details, group_id gid) {
     const auto& bucket = transfer_details.bucket;
     const auto bucket_parts = cloud_storage_clients::parse_bucket_name(bucket);
     if (!bucket_parts) {
@@ -729,7 +689,11 @@ remote::delete_object(transfer_details transfer_details) {
     while (!_gate.is_closed() && permit.is_allowed && !result) {
         auto fut = co_await ss::coroutine::as_future(
           _pool.local().acquire_with_timeout(
-            *bucket_parts, fib.root_abort_source(), _lease_timeout(), fib()));
+            *bucket_parts,
+            gid,
+            fib.root_abort_source(),
+            _lease_timeout(),
+            fib()));
         if (fut.failed()) {
             co_return throw_if_not_timeout(
               fut.get_exception(), upload_result::timedout);
@@ -809,7 +773,8 @@ ss::future<upload_result> remote::delete_objects(
   const cloud_storage_clients::bucket_name& bucket,
   R keys,
   retry_chain_node& parent,
-  std::function<void(size_t)> req_cb) {
+  std::function<void(size_t)> req_cb,
+  group_id gid) {
     ss::gate::holder gh{_gate};
     retry_chain_logger ctxlog(log, parent);
 
@@ -822,7 +787,7 @@ ss::future<upload_result> remote::delete_objects(
 
     if (!is_batch_delete_supported()) {
         co_return co_await delete_objects_sequentially(
-          bucket, std::forward<R>(keys), parent, std::move(req_cb));
+          bucket, std::forward<R>(keys), parent, std::move(req_cb), gid);
     }
 
     const auto batches_to_delete = num_chunks(keys, delete_objects_max_keys());
@@ -832,7 +797,7 @@ ss::future<upload_result> remote::delete_objects(
     co_await ss::max_concurrent_for_each(
       boost::irange(batches_to_delete),
       concurrency(),
-      [this, bucket, &keys, &parent, &results, cb = std::move(req_cb)](
+      [this, bucket, &keys, &parent, &results, gid, cb = std::move(req_cb)](
         auto chunk_ix) -> ss::future<> {
           auto chunk_start_offset = (chunk_ix * delete_objects_max_keys());
 
@@ -857,7 +822,8 @@ ss::future<upload_result> remote::delete_objects(
             key_batch.size() > 0,
             "The chunking logic must always produce non-empty batches.");
 
-          return delete_object_batch(bucket, std::move(key_batch), parent, cb)
+          return delete_object_batch(
+                   bucket, std::move(key_batch), parent, cb, gid)
             .then([&results](auto result) { results.push_back(result); });
       });
 
@@ -883,7 +849,8 @@ ss::future<upload_result> remote::delete_object_batch(
   const cloud_storage_clients::bucket_name& bucket,
   chunked_vector<cloud_storage_clients::object_key> keys,
   retry_chain_node& parent,
-  std::function<void(size_t)> req_cb) {
+  std::function<void(size_t)> req_cb,
+  group_id gid) {
     const auto bucket_parts = cloud_storage_clients::parse_bucket_name(bucket);
     if (!bucket_parts) {
         vlog(
@@ -904,7 +871,11 @@ ss::future<upload_result> remote::delete_object_batch(
     while (!_gate.is_closed() && permit.is_allowed && !result) {
         auto fut = co_await ss::coroutine::as_future(
           _pool.local().acquire_with_timeout(
-            *bucket_parts, fib.root_abort_source(), _lease_timeout(), fib()));
+            *bucket_parts,
+            gid,
+            fib.root_abort_source(),
+            _lease_timeout(),
+            fib()));
         if (fut.failed()) {
             co_return throw_if_not_timeout(
               fut.get_exception(), upload_result::timedout);
@@ -990,21 +961,24 @@ remote::delete_objects<std::vector<cloud_storage_clients::object_key>>(
   const cloud_storage_clients::bucket_name& bucket,
   std::vector<cloud_storage_clients::object_key> keys,
   retry_chain_node& parent,
-  std::function<void(size_t)>);
+  std::function<void(size_t)>,
+  group_id);
 
 template ss::future<upload_result>
 remote::delete_objects<std::deque<cloud_storage_clients::object_key>>(
   const cloud_storage_clients::bucket_name& bucket,
   std::deque<cloud_storage_clients::object_key> keys,
   retry_chain_node& parent,
-  std::function<void(size_t)>);
+  std::function<void(size_t)>,
+  group_id);
 
 template ss::future<upload_result>
 remote::delete_objects<chunked_vector<cloud_storage_clients::object_key>>(
   const cloud_storage_clients::bucket_name& bucket,
   chunked_vector<cloud_storage_clients::object_key> keys,
   retry_chain_node& parent,
-  std::function<void(size_t)>);
+  std::function<void(size_t)>,
+  group_id);
 
 template<typename R>
 requires std::ranges::range<R>
@@ -1015,7 +989,8 @@ ss::future<upload_result> remote::delete_objects_sequentially(
   const cloud_storage_clients::bucket_name& bucket,
   R keys,
   retry_chain_node& parent,
-  std::function<void(size_t)> req_cb) {
+  std::function<void(size_t)> req_cb,
+  group_id gid) {
     retry_chain_logger ctxlog(log, parent);
 
     vlog(
@@ -1044,13 +1019,15 @@ ss::future<upload_result> remote::delete_objects_sequentially(
         key_nodes.begin(),
         key_nodes.end(),
         concurrency(),
-        [this, &bucket, &results, ctxlog, req_cb = std::move(req_cb)](
+        [this, &bucket, &results, ctxlog, gid, req_cb = std::move(req_cb)](
           auto& kn) -> ss::future<> {
             vlog(ctxlog.trace, "Deleting key {}", kn.key);
-            return delete_object({.bucket = bucket,
-                                  .key = kn.key,
-                                  .parent_rtc = *kn.node,
-                                  .on_req_cb = req_cb})
+            return delete_object(
+                     {.bucket = bucket,
+                      .key = kn.key,
+                      .parent_rtc = *kn.node,
+                      .on_req_cb = req_cb},
+                     gid)
               .then([&results](auto result) { results.push_back(result); });
         }));
     if (fut.failed()) {
@@ -1092,7 +1069,8 @@ ss::future<list_result> remote::list_objects(
   std::optional<char> delimiter,
   std::optional<cloud_storage_clients::client::item_filter> item_filter,
   std::optional<size_t> max_keys,
-  std::optional<ss::sstring> continuation_token) {
+  std::optional<ss::sstring> continuation_token,
+  group_id gid) {
     const auto bucket_parts = cloud_storage_clients::parse_bucket_name(bucket);
     if (!bucket_parts) {
         vlog(
@@ -1125,7 +1103,11 @@ ss::future<list_result> remote::list_objects(
     while (!_gate.is_closed() && permit.is_allowed && !result) {
         auto fut = co_await ss::coroutine::as_future(
           _pool.local().acquire_with_timeout(
-            *bucket_parts, fib.root_abort_source(), _lease_timeout(), fib()));
+            *bucket_parts,
+            gid,
+            fib.root_abort_source(),
+            _lease_timeout(),
+            fib()));
         if (fut.failed()) {
             co_return throw_if_not_timeout(
               fut.get_exception(), cloud_storage_clients::error_outcome::retry);
@@ -1362,9 +1344,28 @@ remote::initiate_multipart_upload(
         co_return cloud_storage_clients::error_outcome::fail;
     }
 
-    // Acquire a client lease from the pool
+    // The upload issues each request through `provider`, which leases a client
+    // from the pool per request. This avoids pinning a single client (and its
+    // admission slot) for the upload's whole lifetime, which can deadlock the
+    // pool against the reads that feed the upload.
+    auto provider
+      = ss::make_shared<cloud_storage_clients::pooled_client_provider>(
+        _pool.local(),
+        *bucket_parts,
+        group_id::default_group,
+        _lease_timeout(),
+        _as,
+        _gate.hold());
+
+    // Creating the backend state issues no request; it only needs a client of
+    // the right backend type to dispatch on, so lease one briefly.
     auto fut = co_await ss::coroutine::as_future(
-      _pool.local().acquire(*bucket_parts, _as));
+      _pool.local().acquire_with_timeout(
+        *bucket_parts,
+        group_id::default_group,
+        _as,
+        _lease_timeout(),
+        "multipart_init"));
     if (fut.failed()) {
         vlog(
           log.warn,
@@ -1373,26 +1374,14 @@ remote::initiate_multipart_upload(
         co_return cloud_storage_clients::error_outcome::fail;
     }
     auto lease = std::move(fut).get();
-
-    // Get the multipart upload state from the client
     auto state_result = co_await lease.client->initiate_multipart_upload(
-      bucket_parts->name, key, part_size, timeout);
-
+      std::move(provider), bucket_parts->name, key, part_size, timeout);
     if (!state_result) {
-        // Failed to initiate - lease will be automatically returned
         co_return state_result.error();
     }
 
-    // Wrap the state with the lease to keep the client alive
-    // for the entire duration of the upload operation
-    auto wrapped_state = ss::make_shared<multipart_upload_state_with_lease>(
-      std::move(lease), std::move(state_result.value()));
-
-    // Create the multipart_upload with the wrapped state
-    auto upload = ss::make_shared<cloud_storage_clients::multipart_upload>(
-      std::move(wrapped_state), part_size, log);
-
-    co_return upload;
+    co_return ss::make_shared<cloud_storage_clients::multipart_upload>(
+      std::move(state_result.value()), part_size, log);
 }
 
 } // namespace cloud_io

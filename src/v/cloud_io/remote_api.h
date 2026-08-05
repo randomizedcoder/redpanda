@@ -10,8 +10,8 @@
 
 #pragma once
 
+#include "cloud_io/admission_control_types.h"
 #include "cloud_io/io_result.h"
-#include "cloud_io/scheduler_types.h"
 #include "cloud_io/transfer_details.h"
 #include "cloud_storage_clients/client.h"
 #include "utils/lazy_abort_source.h"
@@ -97,7 +97,8 @@ public:
       const reset_input_stream& reset_str,
       lazy_abort_source& lazy_abort_source,
       const std::string_view stream_label,
-      std::optional<size_t> max_retries) = 0;
+      std::optional<size_t> max_retries,
+      group_id gid = group_id::default_group) = 0;
 
     virtual ss::future<download_result> download_stream(
       transfer_details transfer_details,

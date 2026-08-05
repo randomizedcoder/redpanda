@@ -147,6 +147,7 @@ server::server(
   ss::sharded<cluster::id_allocator_frontend>& id_allocator_frontend,
   ss::sharded<security::credential_store>& credentials,
   ss::sharded<security::authorizer>& authorizer,
+  ss::sharded<security::role_store>& role_store,
   ss::sharded<security::audit::audit_log_manager>& audit_mgr,
   ss::sharded<security::oidc::service>& oidc_service,
   ss::sharded<cluster::security_frontend>& sec_fe,
@@ -185,6 +186,7 @@ server::server(
   , _recovery_mode_enabled(config::node().recovery_mode_enabled.value())
   , _credentials(credentials)
   , _authorizer(authorizer)
+  , _role_store(role_store)
   , _audit_mgr(audit_mgr)
   , _oidc_service(oidc_service)
   , _security_frontend(sec_fe)
@@ -209,6 +211,10 @@ server::server(
           return container().local().fetch_units_manager();
       },
       config::shard_local_cfg().kafka_max_message_size_upper_limit_bytes.bind())
+  , _fetch_read_coalescer(
+      // ~0.5 MB/shard when coalescing is enabled.
+      {.cache_size = 1024, .small_size = 128},
+      config::shard_local_cfg().kafka_fetch_read_coalescing_enabled.bind())
   , _probe(std::make_unique<class kafka_probe>())
   , _sasl_probe(std::make_unique<class sasl_probe>())
   , _read_dist_probe(std::make_unique<read_distribution_probe>())
@@ -335,13 +341,12 @@ ss::future<security::tls::mtls_state> get_mtls_principal_state(
       });
 }
 
-/*static*/ std::vector<bool> server::convert_api_names_to_key_bitmap(
+/*static*/ api_key_table<bool> server::convert_api_names_to_key_bitmap(
   const std::vector<ss::sstring>& api_names) {
-    std::vector<bool> res;
-    res.resize(max_api_key() + 1);
+    api_key_table<bool> res{};
     for (const ss::sstring& api_name : api_names) {
         if (const auto api_key = api_name_to_key(api_name); api_key) {
-            res.at(*api_key) = true;
+            res[*api_key] = true;
             continue;
         }
         vlog(klog.warn, "Unrecognized Kafka API name: {}", api_name);
@@ -385,7 +390,7 @@ ss::future<> server::apply(ss::lw_shared_ptr<net::connection> conn) {
       mtls_state,
       config::shard_local_cfg().kafka_request_max_bytes.bind(),
       config::shard_local_cfg()
-        .kafka_throughput_controlled_api_keys.bind<std::vector<bool>>(
+        .kafka_throughput_controlled_api_keys.bind<api_key_table<bool>>(
           &convert_api_names_to_key_bitmap));
 
     std::exception_ptr eptr;
@@ -1904,11 +1909,20 @@ ss::future<response_ptr> init_producer_id_handler::handle(
               });
         }
 
+        // probe whether the client has write on any topic, as a fall back
+        // to the idempotent_write cluster ACL check below. quiet the authz
+        // log and skip auditing for this broker-internal probe on both
+        // allow and deny. the client asked for an idempotent producer ID,
+        // not to write to any specific topic, so neither outcome is a
+        // user-initiated access decision.
         bool permitted = false;
         auto topics = ctx.metadata_cache().all_topics();
         for (auto& tp_ns : topics) {
             permitted = ctx.authorized(
-              security::acl_operation::write, tp_ns.tp, authz_quiet{true});
+              security::acl_operation::write,
+              tp_ns.tp,
+              authz_quiet{true},
+              audit_authz_check::no);
             if (permitted) {
                 break;
             }

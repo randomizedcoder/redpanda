@@ -125,9 +125,16 @@ redpanda_thread_fixture::redpanda_thread_fixture(
               return std::make_optional(proxy_client_config(kafka_port));
           }),
           audit_log_client_config(kafka_port));
-        app.check_environment();
         app.wire_up_and_start_crypto_services();
-        app.wire_up_and_start(*app_signal, true, ct_test_cfg);
+        app.wire_up_bootstrap_services();
+        app.hydrate_cluster_config(make_minimal_cfg());
+        app.bootstrap_from_kvstore();
+        app.establish_cluster_view(app_signal->abort_source());
+        app.check_environment();
+        app.wire_up_and_start(
+          *app_signal,
+          true,
+          test_cfg{.ct_test_cfg = ct_test_cfg, .chunk_cache_prealloc = false});
     } catch (...) {
         // shutdown half-initialized app nicely so that its destructor doesn't
         // assert and the exception bubbles up
@@ -165,6 +172,7 @@ redpanda_thread_fixture::redpanda_thread_fixture(
         std::ref(app.id_allocator_frontend),
         std::ref(app.controller->get_credential_store()),
         std::ref(app.controller->get_authorizer()),
+        std::ref(app.controller->get_role_store()),
         std::ref(app.audit_mgr),
         std::ref(app.controller->get_oidc_service()),
         std::ref(app.controller->get_security_frontend()),
@@ -346,9 +354,16 @@ void redpanda_thread_fixture::restart(should_wipe w) {
         config.get("disable_metrics").set_value(false);
     }).get();
     app.initialize(proxy_config(), proxy_client_config());
-    app.check_environment();
     app.wire_up_and_start_crypto_services();
-    app.wire_up_and_start(*app_signal, true, ct_test_cfg);
+    app.wire_up_bootstrap_services();
+    app.hydrate_cluster_config(make_minimal_cfg());
+    app.bootstrap_from_kvstore();
+    app.establish_cluster_view(app_signal->abort_source());
+    app.check_environment();
+    app.wire_up_and_start(
+      *app_signal,
+      true,
+      test_cfg{.ct_test_cfg = ct_test_cfg, .chunk_cache_prealloc = false});
 }
 
 void redpanda_thread_fixture::configure(
@@ -453,6 +468,16 @@ void redpanda_thread_fixture::configure(
             config.get("cloud_storage_enable_remote_write").set_value(true);
             config.get("cloud_storage_max_connections")
               .set_value(static_cast<int16_t>(cloud_cfg->connection_limit()));
+            // Test fixtures run with single-digit pool capacities and
+            // exercise housekeeping (default_group) operations
+            // concurrently. The cluster default reservation
+            // ([2,2,2] = 6) would either trip the
+            // target_reserved-sum-fits-cap assertion or starve groups
+            // without their own lane; an empty reservation keeps the
+            // policy active while routing every admit through the
+            // common pool.
+            config.get("cloud_io_admission_control_reservation")
+              .set_value(std::vector<ss::sstring>{});
         }
 
         config.get("data_transforms_enabled")
@@ -789,9 +814,7 @@ redpanda_thread_fixture::make_data(std::optional<model::timestamp> base_ts) {
             model::offset(0),
             20,
             maybe_compress_batches::yes,
-            log_append_config{
-              .should_fsync = log_append_config::fsync::yes,
-              .timeout = model::no_timeout},
+            log_append_config{.should_fsync = log_append_config::fsync::yes},
             disk_log_builder::should_flush_after::yes,
             base_ts)
           | stop();
@@ -845,7 +868,7 @@ conn_ptr redpanda_thread_fixture::make_connection_context(bool use_authz) {
       std::nullopt,
       config::mock_property<uint32_t>(100_MiB).bind(),
       config::mock_property<std::vector<ss::sstring>>({"produce", "fetch"})
-        .bind<std::vector<bool>>(
+        .bind<kafka::api_key_table<bool>>(
           &kafka::server::convert_api_names_to_key_bitmap));
 }
 

@@ -70,6 +70,13 @@ consumer_offset_sync_options:
 security_sync_options:
   interval: "30s"
   paused: false
+role_sync_options:
+  interval: "30s"
+  paused: false
+  role_name_filters:
+    - pattern_type: "PREFIX"
+      filter_type: "INCLUDE"
+      name: "team-"
 `,
 			want: ShadowLinkConfig{
 				Name: "test-shadow-link",
@@ -120,6 +127,17 @@ security_sync_options:
 				SecuritySyncOptions: &SecuritySettingsSyncOptions{
 					Interval: 30 * time.Second,
 					Paused:   false,
+				},
+				RoleSyncOptions: &RoleSyncOptions{
+					Interval: 30 * time.Second,
+					Paused:   false,
+					RoleNameFilters: []*NameFilter{
+						{
+							PatternType: "PREFIX",
+							FilterType:  "INCLUDE",
+							Name:        "team-",
+						},
+					},
 				},
 			},
 		},
@@ -190,6 +208,81 @@ client_options:
 				},
 			},
 		},
+		{
+			name: "schema registry API mode",
+			yamlData: `
+name: "sr-api-test"
+client_options:
+  bootstrap_servers:
+    - "broker1:9092"
+schema_registry_sync_options:
+  shadow_schema_registry_api:
+    source_url: "https://source-sr.example.com:8081"
+    paused: true
+    auth_options:
+      basic:
+        username: "sr-user"
+        password: "sr-pass"
+    tls_settings:
+      enabled: true
+      tls_file_settings:
+        ca_path: "/path/to/ca.crt"
+    tail_interval: "10s"
+    full_sync_interval: "5m"
+    max_source_requests_per_second: 30
+    source_filter:
+      contexts:
+        - "."
+        - ".prod"
+      subjects:
+        - "orders-value"
+    destination:
+      exact:
+        mappings:
+          - source: "."
+            destination: ".shadow"
+    unsupported_schema_feature_policy: "REMOVE"
+`,
+			want: ShadowLinkConfig{
+				Name: "sr-api-test",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr.example.com:8081",
+						Paused:    true,
+						AuthOptions: &SchemaRegistryAuthOptions{
+							Basic: &HTTPBasicAuthOptions{
+								Username: "sr-user",
+								Password: "sr-pass",
+							},
+						},
+						TLSSettings: &TLSSettings{
+							Enabled: true,
+							TLSFileSettings: &TLSFileSettings{
+								CAPath: "/path/to/ca.crt",
+							},
+						},
+						TailInterval:               10 * time.Second,
+						FullSyncInterval:           5 * time.Minute,
+						MaxSourceRequestsPerSecond: 30,
+						SourceFilter: &SchemaRegistrySourceFilter{
+							Contexts: []string{".", ".prod"},
+							Subjects: []string{"orders-value"},
+						},
+						Destination: &SchemaRegistryContextDestination{
+							Exact: &SchemaRegistryExactContextMappings{
+								Mappings: []*SchemaRegistryContextMap{
+									{Source: ".", Destination: ".shadow"},
+								},
+							},
+						},
+						UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyRemove,
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -255,6 +348,15 @@ func TestShadowLinkConfigUnmarshalJSON(t *testing.T) {
 				"security_sync_options": {
 					"interval": 30000000000,
 					"paused": false
+				},
+				"role_sync_options": {
+					"interval": 30000000000,
+					"paused": false,
+					"role_name_filters": [{
+						"pattern_type": "PREFIX",
+						"filter_type": "INCLUDE",
+						"name": "team-"
+					}]
 				}
 			}`,
 			want: ShadowLinkConfig{
@@ -306,6 +408,17 @@ func TestShadowLinkConfigUnmarshalJSON(t *testing.T) {
 				SecuritySyncOptions: &SecuritySettingsSyncOptions{
 					Interval: 30 * time.Second,
 					Paused:   false,
+				},
+				RoleSyncOptions: &RoleSyncOptions{
+					Interval: 30 * time.Second,
+					Paused:   false,
+					RoleNameFilters: []*NameFilter{
+						{
+							PatternType: "PREFIX",
+							FilterType:  "INCLUDE",
+							Name:        "team-",
+						},
+					},
 				},
 			},
 		},
@@ -367,6 +480,67 @@ func TestShadowLinkConfigUnmarshalJSON(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "schema registry API mode",
+			jsonData: `{
+				"name": "sr-api-test",
+				"client_options": {
+					"bootstrap_servers": ["broker1:9092"]
+				},
+				"schema_registry_sync_options": {
+					"shadow_schema_registry_api": {
+						"source_url": "https://source-sr.example.com:8081",
+						"paused": true,
+						"auth_options": {
+							"basic": {
+								"username": "sr-user",
+								"password": "sr-pass"
+							}
+						},
+						"tail_interval": 10000000000,
+						"full_sync_interval": 300000000000,
+						"max_source_requests_per_second": 30,
+						"source_filter": {
+							"contexts": ["."],
+							"subjects": ["orders-value"]
+						},
+						"destination": {
+							"identity": {}
+						},
+						"unsupported_schema_feature_policy": "FAIL"
+					}
+				}
+			}`,
+			want: ShadowLinkConfig{
+				Name: "sr-api-test",
+				ClientOptions: &ShadowLinkClientOptions{
+					BootstrapServers: []string{"broker1:9092"},
+				},
+				SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+					ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+						SourceURL: "https://source-sr.example.com:8081",
+						Paused:    true,
+						AuthOptions: &SchemaRegistryAuthOptions{
+							Basic: &HTTPBasicAuthOptions{
+								Username: "sr-user",
+								Password: "sr-pass",
+							},
+						},
+						TailInterval:               10 * time.Second,
+						FullSyncInterval:           5 * time.Minute,
+						MaxSourceRequestsPerSecond: 30,
+						SourceFilter: &SchemaRegistrySourceFilter{
+							Contexts: []string{"."},
+							Subjects: []string{"orders-value"},
+						},
+						Destination: &SchemaRegistryContextDestination{
+							Identity: &SchemaRegistryIdentityContextMapping{},
+						},
+						UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyFail,
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -388,10 +562,12 @@ func TestShadowLinkConfigDrift(t *testing.T) {
 		// durationpb.Duration which has an underlying struct with exported
 		// fields.
 		regexp.MustCompile(`^.*\.interval$`),
+		regexp.MustCompile(`^.*\.(tail_interval|full_sync_interval)$`),
 		// Enums in protobuf but string in our config.
 		regexp.MustCompile(`_filters\..*_type$`),
 		regexp.MustCompile(`^.*\.scram_configuration.scram_mechanism$`),
 		regexp.MustCompile(`^security_sync_options\.acl_filters\.access_filter\.operation$`),
+		regexp.MustCompile(`^.*\.unsupported_schema_feature_policy$`),
 		// one of: start_at_timestamp is a oneof field in protobuf but is a
 		// duration. In proto, it is parsed as a struct containing a timestamp
 		// field, but in the resulting JSON it is represented as a timestamp,

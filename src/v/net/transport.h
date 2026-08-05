@@ -80,6 +80,11 @@ public:
             /// to the origin TLS handshake inside the CONNECT tunnel.
             /// SNI for the TLS handshake is derived from address.host().
             ss::shared_ptr<ss::tls::certificate_credentials> credentials;
+            /// Opaque Proxy-Authorization header value (e.g.
+            /// "Basic <base64>") sent on the CONNECT request. The
+            /// transport emits it verbatim and does not interpret it.
+            /// std::nullopt means no Proxy-Authorization header is sent.
+            std::optional<ss::sstring> authorization;
         };
 
         unresolved_address server_addr;
@@ -118,6 +123,8 @@ public:
 
     void set_keepalive_parameters(const ss::net::keepalive_params& params);
     void set_keepalive(bool);
+    // Set TCP_NODELAY on the socket
+    void set_nodelay(bool);
 
     [[gnu::always_inline]] bool is_valid() const {
         return _fd && !_shutdown && (_in && !in().eof());
@@ -135,6 +142,15 @@ public:
 
 protected:
     virtual void fail_outstanding_futures() {}
+
+    /// Establishes the TCP connection to \p target, which is either the
+    /// configured server address or the forward proxy. The default
+    /// implementation resolves the host name and dials the first
+    /// resolved address, giving it all the time until \p deadline.
+    /// Subclasses may override to customize dialing, e.g. to try
+    /// multiple resolved addresses.
+    virtual ss::future<ss::connected_socket>
+    dial(const unresolved_address& target, clock_type::time_point deadline);
 
     // Return the input stream associated with the transport.
     // The transport must not be in initial/stopped state.
@@ -190,6 +206,12 @@ namespace detail {
 /// §3.2.2. Hosts already bracketed (e.g. `[::1]`) are left alone; a
 /// colon in an unbracketed host is treated as an IPv6 literal marker.
 std::string format_connect_authority(std::string_view host, uint16_t port);
+
+/// Builds the CONNECT request line + headers for `authority`
+/// (host:port). When `authorization` is set, includes a
+/// Proxy-Authorization header. Terminated with the blank line.
+std::string format_connect_request(
+  std::string_view authority, const std::optional<ss::sstring>& authorization);
 
 /// Consumes an HTTP CONNECT response in a single pass, capturing the
 /// status line and discarding header values. Bounds per-line length

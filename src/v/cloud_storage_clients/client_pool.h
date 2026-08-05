@@ -10,7 +10,7 @@
 
 #pragma once
 
-#include "cloud_io/scheduler.h"
+#include "cloud_io/admission_control.h"
 #include "cloud_storage_clients/bucket_name_parts.h"
 #include "cloud_storage_clients/client.h"
 #include "cloud_storage_clients/client_probe.h"
@@ -20,6 +20,7 @@
 #include "utils/stop_signal.h"
 
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/shared_ptr.hh>
 
@@ -115,7 +116,7 @@ public:
       upstream_registry& registry,
       size_t size,
       client_configuration conf,
-      cloud_io::scheduler_config scheduler_cfg = {},
+      cloud_io::admission_control_config admission_control_cfg = {},
       client_pool_overdraft_policy policy
       = client_pool_overdraft_policy::wait_if_empty);
 
@@ -136,7 +137,7 @@ public:
     ///       before it gets released (release happens implicitly, when
     ///       the lifetime of the pointer ends).
     /// \param g - cloud_io::group_id used to gate the lease through the
-    ///            per-shard scheduler.
+    ///            per-shard admission_control.
     /// \param as
     /// \param deadline - Optional timeout. If deadline is reached before a
     ///                   client becomes available, throw ss::timed_out_error
@@ -165,7 +166,7 @@ public:
     ///     deadline before a client becomes available.
     ///
     /// \param g - cloud_io::group_id used to gate the lease through the
-    ///            per-shard scheduler.
+    ///            per-shard admission_control.
     /// \param as
     /// \param deadline - Lease expiration time, after which the client is
     ///                   forcibly shut down.
@@ -200,7 +201,7 @@ public:
 
     bool has_waiters() const noexcept {
         return _cvar.has_waiters() || _pool_ready_barrier.waiters() > 0
-               || (_sched && _sched->has_waiters());
+               || (_admission_control && _admission_control->has_waiters());
     }
 
 private:
@@ -255,15 +256,13 @@ private:
     [[nodiscard]] client_ptr
     replace_least_recently_used(client_ptr leased) noexcept;
 
-    void update_usage_stats();
-
     upstream_registry& _upstreams;
     std::optional<upstream_registry::handle> _default_upstream;
 
     /// Configured capacity per shard
     const size_t _capacity;
 
-    cloud_io::scheduler_config _scheduler_cfg;
+    cloud_io::admission_control_config _admission_control_cfg;
 
     client_configuration _config;
 
@@ -281,7 +280,7 @@ private:
     // connections.
     intrusive_list<client_lease, &client_lease::_hook> _leased;
 
-    std::unique_ptr<cloud_io::scheduler> _sched;
+    std::unique_ptr<cloud_io::admission_control> _admission_control;
     ss::condition_variable _cvar;
     ss::abort_source _as;
     ss::gate _gate;
@@ -291,6 +290,57 @@ private:
     ss::gate _bg_gate;
 
     ssx::semaphore _pool_ready_barrier{0, "pool_barrier"};
+};
+
+/// Supplies a leased client for a single cloud-storage request, hiding the
+/// client_pool (and its admission group) from the caller. Lets an operation
+/// that issues many requests — e.g. a multipart upload — lease a client per
+/// request and release it immediately, rather than pinning one for its whole
+/// lifetime.
+class client_provider {
+public:
+    client_provider() = default;
+    client_provider(const client_provider&) = delete;
+    client_provider& operator=(const client_provider&) = delete;
+    client_provider(client_provider&&) = delete;
+    client_provider& operator=(client_provider&&) = delete;
+    virtual ~client_provider() = default;
+
+    /// Acquire a client and its admission slot for one request. The slot is
+    /// released when the returned lease is dropped.
+    virtual ss::future<client_pool::client_lease> acquire() = 0;
+};
+
+/// A client_provider that leases from a client_pool for a fixed bucket and
+/// admission group.
+class pooled_client_provider final : public client_provider {
+public:
+    pooled_client_provider(
+      client_pool& pool,
+      bucket_name_parts bucket,
+      cloud_io::group_id gid,
+      ss::lowres_clock::duration lease_timeout,
+      ss::abort_source& as,
+      ss::gate::holder owner_gate_holder)
+      : _pool(pool)
+      , _bucket(std::move(bucket))
+      , _gid(gid)
+      , _lease_timeout(lease_timeout)
+      , _as(as)
+      , _owner_gate_holder(std::move(owner_gate_holder)) {}
+
+    ss::future<client_pool::client_lease> acquire() override {
+        return _pool.acquire_with_timeout(
+          _bucket, _gid, _as, _lease_timeout, "multipart_upload");
+    }
+
+private:
+    client_pool& _pool;
+    bucket_name_parts _bucket;
+    cloud_io::group_id _gid;
+    ss::lowres_clock::duration _lease_timeout;
+    ss::abort_source& _as;
+    ss::gate::holder _owner_gate_holder;
 };
 
 } // namespace cloud_storage_clients

@@ -399,6 +399,54 @@ func TestMapConsumerOffsetSyncOptions(t *testing.T) {
 	}
 }
 
+func TestMapRoleSyncOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *RoleSyncOptions
+		want *adminv2.RoleSyncOptions
+	}{
+		{
+			name: "nil options returns nil",
+			opts: nil,
+			want: nil,
+		},
+		{
+			name: "paused with zero interval",
+			opts: &RoleSyncOptions{
+				Paused:   true,
+				Interval: 0,
+			},
+			want: &adminv2.RoleSyncOptions{
+				Paused: true,
+			},
+		},
+		{
+			name: "not paused with filters",
+			opts: &RoleSyncOptions{
+				Paused:   false,
+				Interval: 45 * time.Second,
+				RoleNameFilters: []*NameFilter{
+					{PatternType: PatternTypePrefix, FilterType: FilterTypeInclude, Name: "team-"},
+				},
+			},
+			want: &adminv2.RoleSyncOptions{
+				Paused:   false,
+				Interval: durationpb.New(45 * time.Second),
+				RoleNameFilters: []*adminv2.NameFilter{
+					{PatternType: adminv2.PatternType_PATTERN_TYPE_PREFIX, FilterType: adminv2.FilterType_FILTER_TYPE_INCLUDE, Name: "team-"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mapRoleSyncOptions(tt.opts)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestMapSecuritySyncOptions(t *testing.T) {
 	tests := []struct {
 		name string
@@ -466,6 +514,160 @@ func TestMapSecuritySyncOptions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := mapSecuritySyncOptions(tt.opts)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestMapSchemaRegistrySyncOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *SchemaRegistrySyncOptions
+		want *adminv2.SchemaRegistrySyncOptions
+	}{
+		{
+			name: "nil options returns nil",
+			opts: nil,
+			want: nil,
+		},
+		{
+			name: "no shadowing mode set",
+			opts: &SchemaRegistrySyncOptions{},
+			want: &adminv2.SchemaRegistrySyncOptions{},
+		},
+		{
+			name: "topic mode",
+			opts: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryTopic: &ShadowSchemaRegistryTopic{},
+			},
+			want: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryTopic_{
+					ShadowSchemaRegistryTopic: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryTopic{},
+				},
+			},
+		},
+		{
+			name: "API mode minimal",
+			opts: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+					SourceURL: "https://source-sr.example.com:8081",
+				},
+			},
+			want: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi_{
+					ShadowSchemaRegistryApi: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi{
+						SourceUrl: "https://source-sr.example.com:8081",
+					},
+				},
+			},
+		},
+		{
+			name: "API mode full with exact destination",
+			opts: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+					SourceURL: "https://source-sr.example.com:8081",
+					AuthOptions: &SchemaRegistryAuthOptions{
+						Basic: &HTTPBasicAuthOptions{
+							Username: "sr-user",
+							Password: "sr-pass",
+						},
+					},
+					TLSSettings: &TLSSettings{
+						Enabled: true,
+						TLSFileSettings: &TLSFileSettings{
+							CAPath: "/path/to/ca.crt",
+						},
+					},
+					TailInterval:               10 * time.Second,
+					FullSyncInterval:           5 * time.Minute,
+					MaxSourceRequestsPerSecond: 30,
+					SourceFilter: &SchemaRegistrySourceFilter{
+						Contexts: []string{".", ".prod"},
+						Subjects: []string{"orders-value"},
+					},
+					Destination: &SchemaRegistryContextDestination{
+						Exact: &SchemaRegistryExactContextMappings{
+							Mappings: []*SchemaRegistryContextMap{
+								{Source: ".", Destination: ".shadow"},
+							},
+						},
+					},
+					UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyRemove,
+					Paused:                         true,
+				},
+			},
+			want: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi_{
+					ShadowSchemaRegistryApi: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi{
+						SourceUrl: "https://source-sr.example.com:8081",
+						AuthOptions: &adminv2.SchemaRegistryAuthOptions{
+							AuthOptions: &adminv2.SchemaRegistryAuthOptions_Basic{
+								Basic: &adminv2.HTTPBasicAuthOptions{
+									Username: "sr-user",
+									Password: "sr-pass",
+								},
+							},
+						},
+						TlsSettings: &corecommonv1.TLSSettings{
+							Enabled: true,
+							TlsSettings: &corecommonv1.TLSSettings_TlsFileSettings{
+								TlsFileSettings: &corecommonv1.TLSFileSettings{
+									CaPath: "/path/to/ca.crt",
+								},
+							},
+						},
+						TailInterval:               durationpb.New(10 * time.Second),
+						FullSyncInterval:           durationpb.New(5 * time.Minute),
+						MaxSourceRequestsPerSecond: 30,
+						SourceFilter: &adminv2.SchemaRegistrySourceFilter{
+							Contexts: []string{".", ".prod"},
+							Subjects: []string{"orders-value"},
+						},
+						Destination: &adminv2.SchemaRegistryContextDestination{
+							Mapping: &adminv2.SchemaRegistryContextDestination_Exact{
+								Exact: &adminv2.SchemaRegistryExactContextMappings{
+									Mappings: []*adminv2.SchemaRegistryContextMap{
+										{Source: ".", Destination: ".shadow"},
+									},
+								},
+							},
+						},
+						UnsupportedSchemaFeaturePolicy: adminv2.UnsupportedSchemaFeaturePolicy_UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE,
+						Paused:                         true,
+					},
+				},
+			},
+		},
+		{
+			name: "API mode with identity destination",
+			opts: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+					SourceURL: "https://source-sr.example.com:8081",
+					Destination: &SchemaRegistryContextDestination{
+						Identity: &SchemaRegistryIdentityContextMapping{},
+					},
+					UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyFail,
+				},
+			},
+			want: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi_{
+					ShadowSchemaRegistryApi: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi{
+						SourceUrl: "https://source-sr.example.com:8081",
+						Destination: &adminv2.SchemaRegistryContextDestination{
+							Mapping: &adminv2.SchemaRegistryContextDestination_Identity{
+								Identity: &adminv2.SchemaRegistryIdentityContextMapping{},
+							},
+						},
+						UnsupportedSchemaFeaturePolicy: adminv2.UnsupportedSchemaFeaturePolicy_UNSUPPORTED_SCHEMA_FEATURE_POLICY_FAIL,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mapSchemaRegistrySyncOptions(tt.opts)
 			require.Equal(t, tt.want, got)
 		})
 	}
@@ -957,6 +1159,55 @@ func TestAdminConsumerOffsetSyncToCfg(t *testing.T) {
 	}
 }
 
+func TestAdminRoleSyncToCfg(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *adminv2.RoleSyncOptions
+		want *RoleSyncOptions
+	}{
+		{
+			name: "nil options returns nil",
+			opts: nil,
+			want: nil,
+		},
+		{
+			name: "paused with nil interval",
+			opts: &adminv2.RoleSyncOptions{
+				Paused:   true,
+				Interval: nil,
+			},
+			want: &RoleSyncOptions{
+				Paused:   true,
+				Interval: 0,
+			},
+		},
+		{
+			name: "not paused with filters",
+			opts: &adminv2.RoleSyncOptions{
+				Paused:   false,
+				Interval: durationpb.New(45 * time.Second),
+				RoleNameFilters: []*adminv2.NameFilter{
+					{PatternType: adminv2.PatternType_PATTERN_TYPE_PREFIX, FilterType: adminv2.FilterType_FILTER_TYPE_INCLUDE, Name: "team-"},
+				},
+			},
+			want: &RoleSyncOptions{
+				Paused:   false,
+				Interval: 45 * time.Second,
+				RoleNameFilters: []*NameFilter{
+					{PatternType: PatternTypePrefix, FilterType: FilterTypeInclude, Name: "team-"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := adminRoleSyncToCfg(tt.opts)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestAdminSecuritySyncToCfg(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1025,6 +1276,145 @@ func TestAdminSecuritySyncToCfg(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := adminSecuritySyncToCfg(tt.opts)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestAdminSchemaRegistrySyncToCfg(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *adminv2.SchemaRegistrySyncOptions
+		want *SchemaRegistrySyncOptions
+	}{
+		{
+			name: "nil options returns nil",
+			opts: nil,
+			want: nil,
+		},
+		{
+			name: "no shadowing mode set",
+			opts: &adminv2.SchemaRegistrySyncOptions{},
+			want: &SchemaRegistrySyncOptions{},
+		},
+		{
+			name: "topic mode",
+			opts: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryTopic_{
+					ShadowSchemaRegistryTopic: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryTopic{},
+				},
+			},
+			want: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryTopic: &ShadowSchemaRegistryTopic{},
+			},
+		},
+		{
+			name: "API mode full with exact destination",
+			opts: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi_{
+					ShadowSchemaRegistryApi: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi{
+						SourceUrl: "https://source-sr.example.com:8081",
+						AuthOptions: &adminv2.SchemaRegistryAuthOptions{
+							AuthOptions: &adminv2.SchemaRegistryAuthOptions_Basic{
+								Basic: &adminv2.HTTPBasicAuthOptions{
+									Username: "sr-user",
+									Password: "sr-pass",
+								},
+							},
+						},
+						TlsSettings: &corecommonv1.TLSSettings{
+							Enabled: true,
+							TlsSettings: &corecommonv1.TLSSettings_TlsFileSettings{
+								TlsFileSettings: &corecommonv1.TLSFileSettings{
+									CaPath: "/path/to/ca.crt",
+								},
+							},
+						},
+						TailInterval:               durationpb.New(10 * time.Second),
+						FullSyncInterval:           durationpb.New(5 * time.Minute),
+						MaxSourceRequestsPerSecond: 30,
+						SourceFilter: &adminv2.SchemaRegistrySourceFilter{
+							Contexts: []string{".", ".prod"},
+							Subjects: []string{"orders-value"},
+						},
+						Destination: &adminv2.SchemaRegistryContextDestination{
+							Mapping: &adminv2.SchemaRegistryContextDestination_Exact{
+								Exact: &adminv2.SchemaRegistryExactContextMappings{
+									Mappings: []*adminv2.SchemaRegistryContextMap{
+										{Source: ".", Destination: ".shadow"},
+									},
+								},
+							},
+						},
+						UnsupportedSchemaFeaturePolicy: adminv2.UnsupportedSchemaFeaturePolicy_UNSUPPORTED_SCHEMA_FEATURE_POLICY_REMOVE,
+						Paused:                         true,
+					},
+				},
+			},
+			want: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+					SourceURL: "https://source-sr.example.com:8081",
+					AuthOptions: &SchemaRegistryAuthOptions{
+						Basic: &HTTPBasicAuthOptions{
+							Username: "sr-user",
+							Password: "sr-pass",
+						},
+					},
+					TLSSettings: &TLSSettings{
+						Enabled: true,
+						TLSFileSettings: &TLSFileSettings{
+							CAPath: "/path/to/ca.crt",
+						},
+					},
+					TailInterval:               10 * time.Second,
+					FullSyncInterval:           5 * time.Minute,
+					MaxSourceRequestsPerSecond: 30,
+					SourceFilter: &SchemaRegistrySourceFilter{
+						Contexts: []string{".", ".prod"},
+						Subjects: []string{"orders-value"},
+					},
+					Destination: &SchemaRegistryContextDestination{
+						Exact: &SchemaRegistryExactContextMappings{
+							Mappings: []*SchemaRegistryContextMap{
+								{Source: ".", Destination: ".shadow"},
+							},
+						},
+					},
+					UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyRemove,
+					Paused:                         true,
+				},
+			},
+		},
+		{
+			name: "API mode with identity destination",
+			opts: &adminv2.SchemaRegistrySyncOptions{
+				SchemaRegistryShadowingMode: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi_{
+					ShadowSchemaRegistryApi: &adminv2.SchemaRegistrySyncOptions_ShadowSchemaRegistryApi{
+						SourceUrl: "https://source-sr.example.com:8081",
+						Destination: &adminv2.SchemaRegistryContextDestination{
+							Mapping: &adminv2.SchemaRegistryContextDestination_Identity{
+								Identity: &adminv2.SchemaRegistryIdentityContextMapping{},
+							},
+						},
+						UnsupportedSchemaFeaturePolicy: adminv2.UnsupportedSchemaFeaturePolicy_UNSUPPORTED_SCHEMA_FEATURE_POLICY_FAIL,
+					},
+				},
+			},
+			want: &SchemaRegistrySyncOptions{
+				ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+					SourceURL: "https://source-sr.example.com:8081",
+					Destination: &SchemaRegistryContextDestination{
+						Identity: &SchemaRegistryIdentityContextMapping{},
+					},
+					UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyFail,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := adminSchemaRegistrySyncToCfg(tt.opts)
 			require.Equal(t, tt.want, got)
 		})
 	}
@@ -1256,6 +1646,22 @@ func TestRoundTrip(t *testing.T) {
 						PermissionType: ACLPermissionTypeAllow,
 						Host:           "*",
 					},
+				},
+			},
+		},
+		RoleSyncOptions: &RoleSyncOptions{
+			Paused:   true,
+			Interval: 75 * time.Second,
+			RoleNameFilters: []*NameFilter{
+				{
+					PatternType: PatternTypePrefix,
+					FilterType:  FilterTypeInclude,
+					Name:        "team-",
+				},
+				{
+					PatternType: PatternTypeLiteral,
+					FilterType:  FilterTypeExclude,
+					Name:        "admin",
 				},
 			},
 		},
@@ -1615,4 +2021,68 @@ func TestAdminACLOperationToCfg_UnknownValue(t *testing.T) {
 func TestAdminPermissionTypeToCfg_UnknownValue(t *testing.T) {
 	result := adminPermissionTypeToCfg(corecommonv1.ACLPermissionType_ACL_PERMISSION_TYPE_UNSPECIFIED)
 	require.Equal(t, ACLPermissionType(""), result, "unspecified permission type should return empty string")
+}
+
+func TestAdminUnsupportedSchemaFeaturePolicyToCfg_UnknownValue(t *testing.T) {
+	result := adminUnsupportedSchemaFeaturePolicyToCfg(adminv2.UnsupportedSchemaFeaturePolicy_UNSUPPORTED_SCHEMA_FEATURE_POLICY_UNSPECIFIED)
+	require.Equal(t, UnsupportedSchemaFeaturePolicy(""), result, "unspecified policy should return empty string")
+}
+
+// TestSchemaRegistryAPIRoundTrip verifies that a config using the schema
+// registry API shadowing mode survives a config -> proto -> config round-trip.
+// The API mode is a separate oneof branch from the topic mode covered by
+// TestRoundTrip, so it cannot coexist with that test's config.
+func TestSchemaRegistryAPIRoundTrip(t *testing.T) {
+	originalConfig := &ShadowLinkConfig{
+		Name: "sr-api-shadow-link",
+		ClientOptions: &ShadowLinkClientOptions{
+			BootstrapServers: []string{"broker1:9092", "broker2:9092"},
+		},
+		SchemaRegistrySyncOptions: &SchemaRegistrySyncOptions{
+			ShadowSchemaRegistryAPI: &ShadowSchemaRegistryAPI{
+				SourceURL: "https://source-sr.example.com:8081",
+				AuthOptions: &SchemaRegistryAuthOptions{
+					Basic: &HTTPBasicAuthOptions{
+						Username: "sr-user",
+						Password: "sr-pass",
+					},
+				},
+				TLSSettings: &TLSSettings{
+					Enabled: true,
+					TLSFileSettings: &TLSFileSettings{
+						CAPath:   "/etc/ssl/certs/ca.crt",
+						KeyPath:  "/etc/ssl/private/client.key",
+						CertPath: "/etc/ssl/certs/client.crt",
+					},
+				},
+				TailInterval:               15 * time.Second,
+				FullSyncInterval:           10 * time.Minute,
+				MaxSourceRequestsPerSecond: 50,
+				SourceFilter: &SchemaRegistrySourceFilter{
+					Contexts: []string{".", ".prod", ".staging"},
+					Subjects: []string{"orders-value", ":.prod:payments-value"},
+				},
+				Destination: &SchemaRegistryContextDestination{
+					Exact: &SchemaRegistryExactContextMappings{
+						Mappings: []*SchemaRegistryContextMap{
+							{Source: ".", Destination: ".shadow"},
+							{Source: ".prod", Destination: ".prod-shadow"},
+						},
+					},
+				},
+				UnsupportedSchemaFeaturePolicy: UnsupportedSchemaFeaturePolicyRemove,
+			},
+		},
+	}
+
+	// Step 1: Convert config to proto (config -> proto)
+	adminShadowLink := shadowLinkConfigToProto(originalConfig)
+	require.NotNil(t, adminShadowLink, "shadow link should not be nil")
+
+	// Step 2: Convert proto back to config (proto -> config)
+	roundTripConfig := shadowLinkToConfig(adminShadowLink)
+	require.NotNil(t, roundTripConfig, "round-trip config should not be nil")
+
+	// Step 3: Verify the round-trip config matches the original
+	require.Equal(t, originalConfig, roundTripConfig, "round-trip config should exactly match original config")
 }

@@ -317,9 +317,12 @@ class OMBValidationTest(RedpandaCloudTest):
             (tier_limits.max_connections_count - omb_connections) * 1.1
         )
 
-        # we expect each swarm producer to create 1 connection per broker, plus 1 additional connection
-        # for metadata
-        conn_per_swarm_producer = self.num_brokers + 1
+        # We expect each swarm producer to hold one connection per broker. Older librdkafka also kept a
+        # separate persistent connection to the bootstrap broker (the historical "+ 1"), but librdkafka
+        # removed it in v2.10.0 (confluentinc/librdkafka#4557): brokers are now keyed by id rather than
+        # host:port, so the bootstrap entry is merged into the learned broker list. client-swarm bundles
+        # librdkafka >= 2.10.0, so a producer holds exactly num_brokers connections.
+        conn_per_swarm_producer = self.num_brokers
 
         producer_per_swarm_node: int = (
             swarm_target_connections // conn_per_swarm_producer // SWARM_WORKERS
@@ -329,7 +332,7 @@ class OMBValidationTest(RedpandaCloudTest):
         msg_rate_per_node = messages_per_sec_per_producer * producer_per_swarm_node
 
         # single producer runtime
-        # Each swarm will throttle the client creation rate to about 30 connections/second
+        # Each swarm will throttle the client creation rate to about 30 producers/second
         warm_up_time_s = (
             producer_per_swarm_node * ProducerSwarm.CLIENT_SPAWN_WAIT_MS // 1000
         ) + 60
@@ -427,7 +430,8 @@ class OMBValidationTest(RedpandaCloudTest):
 
         for s in swarm:
             # wait for the swarm to report that all producers have started (sent at least 1 message)
-            s.wait_for_all_started()
+            broker_scale_factor = max(1, self.num_brokers / 6)
+            s.wait_for_all_started(timeout_scale=broker_scale_factor)
 
         # Now wait for up to five minutes to hit our target connection count: even though all producers
         # have started, it's possible that the connections haven't hit their target yet because some

@@ -12,7 +12,6 @@
 
 #include "cloud_topics/level_one/common/abstract_io.h"
 #include "cloud_topics/level_one/maintenance/meta.h"
-#include "cloud_topics/level_one/maintenance/worker_probe.h"
 #include "cloud_topics/level_one/metastore/leveling_range_builder.h"
 #include "cloud_topics/level_one/metastore/metastore.h"
 #include "compaction/reducer.h"
@@ -36,7 +35,6 @@ public:
       io*,
       ss::abort_source&,
       compaction_job_state&,
-      compaction_worker_probe&,
       prefix_logger&);
 
     ss::future<> initialize() final;
@@ -61,7 +59,9 @@ private:
     // undersized/fragmented L1 objects).
     chunked_vector<levelable_range> _leveling_ranges;
 
-    // Iterator over _leveling_ranges for the current range being processed.
+    // Cursor into `_leveling_ranges`. deduplication_iteration() processes the
+    // range it points at — iterating that range's extents one at a time — then
+    // advances it, one range per call, until the ranges are exhausted.
     chunked_vector<levelable_range>::iterator _range_it;
 
     metastore* _metastore;
@@ -69,7 +69,6 @@ private:
 
     ss::abort_source& _as;
     compaction_job_state& _state;
-    compaction_worker_probe& _probe;
     prefix_logger& _ctxlog;
 };
 

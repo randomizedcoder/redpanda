@@ -24,6 +24,7 @@
 #include <seastar/util/bool_class.hh>
 
 #include <iosfwd>
+#include <optional>
 #include <type_traits>
 
 namespace avro {
@@ -39,9 +40,32 @@ using is_deleted = ss::bool_class<struct is_deleted_tag>;
 using default_to_global = ss::bool_class<struct default_to_global_tag>;
 using force = ss::bool_class<struct force_tag>;
 using normalize = ss::bool_class<struct normalize_tag>;
+/// Defer canonicalisation of an upserted schema: mark it for a later
+/// process_marked_schemas() pass instead of canonicalising inline.
+using defer_processing = ss::bool_class<struct defer_processing_tag>;
 using verbose = ss::bool_class<struct verbose_tag>;
 using is_qualified = ss::bool_class<struct is_qualified_tag>;
+using qualified_subjects_enabled
+  = ss::bool_class<struct qualified_subjects_enabled_tag>;
 using is_config_or_mode = ss::bool_class<struct is_config_or_mode_tag>;
+
+/// Identifies the write path for shadowing write policy. The
+/// schema_registry_sync source also bypasses destination write policy
+/// (read-only mode and the mode_mutability lockout); \ref force stays
+/// independent, carrying only Confluent `?force=` semantics.
+enum class write_source {
+    /// Public write paths: HTTP handlers and other client-facing callers.
+    client,
+    /// The internal Schema Registry sync importer (shadow link API sync).
+    schema_registry_sync,
+};
+
+/// Internal Schema Registry sync replicates a source cluster's
+/// already-accepted writes, so it bypasses destination write policy
+/// (read-only mode and the mode_mutability lockout). Client writes do not.
+inline bool bypasses_write_policy(write_source src) {
+    return src == write_source::schema_registry_sync;
+}
 
 template<typename E>
 std::enable_if_t<std::is_enum_v<E>, std::optional<E>>
@@ -189,8 +213,17 @@ struct context_subject {
     }
 
     /// Parse from qualified subject ":.context:subject" or unqualified
-    /// "subject" (which uses the default context)
+    /// "subject" (which uses the default context). Whether the qualified form
+    /// is honored is read from this node's cluster config
+    /// (schema_registry_enable_qualified_subjects).
     static context_subject from_string(std::string_view input);
+
+    /// As above, but the caller supplies whether qualified parsing is enabled
+    /// instead of reading cluster config. Use from code that must not depend on
+    /// this node's cluster config, e.g. a client parsing the responses of a
+    /// remote schema registry.
+    static context_subject
+    from_string(std::string_view input, qualified_subjects_enabled enabled);
 
     /// Helper for testing to create a simple unqualified subject in the default
     /// context
@@ -257,8 +290,17 @@ void validate_context(const context& ctx);
 /// A reference subject that may be qualified or unqualified.
 /// Unqualified references are resolved relative to a parent schema's context.
 struct context_subject_reference {
-    /// Parse from a string while detecting qualification status
+    /// Parse from a string while detecting qualification status. Whether the
+    /// qualified form is honored is read from this node's cluster config
+    /// (schema_registry_enable_qualified_subjects).
     static context_subject_reference from_string(std::string_view input);
+
+    /// As above, but the caller supplies whether qualified parsing is enabled
+    /// instead of reading cluster config. Use from code that must not depend on
+    /// this node's cluster config, e.g. a client parsing the responses of a
+    /// remote schema registry.
+    static context_subject_reference
+    from_string(std::string_view input, qualified_subjects_enabled enabled);
 
     /// Helper for testing to create a simple unqualified reference
     static context_subject_reference unqualified(std::string_view input) {
@@ -602,6 +644,25 @@ struct subject_version {
       , version{v} {}
     context_subject sub;
     schema_version version;
+
+    friend bool
+    operator==(const subject_version&, const subject_version&) = default;
+
+    template<typename H>
+    friend H AbslHashValue(H h, const subject_version& sv) {
+        return H::combine(std::move(h), sv.sub, sv.version);
+    }
+};
+
+/// A (subject, version) pair carrying that version's soft-delete state, so a
+/// single include_deleted scan can report both the live and deleted nodes.
+struct subject_version_deleted {
+    context_subject sub;
+    schema_version version;
+    is_deleted deleted{is_deleted::no};
+
+    friend bool operator==(
+      const subject_version_deleted&, const subject_version_deleted&) = default;
 };
 
 // Very similar to topic_key_type, separate to avoid intermingling storage code
@@ -690,6 +751,49 @@ struct stored_schema {
         return {schema.share(), version, id, deleted};
     }
     context_schema_id context_id() const { return {schema.sub().ctx, id}; }
+};
+
+/// \brief A field in a source Schema Registry response that Redpanda does not
+/// model and therefore cannot store (e.g. a rule set or metadata tags).
+///
+/// Surfaced as a sidecar diagnostic alongside the parsed schema so a migration
+/// task can apply its configured unsupported-feature policy and log what was
+/// dropped. Identified by a JSON pointer into the response (e.g. "/ruleSet" or
+/// "/metadata/tags").
+struct unsupported_feature {
+    ss::sstring json_pointer;
+    ss::sstring json_type;
+
+    friend bool operator==(
+      const unsupported_feature&, const unsupported_feature&) = default;
+
+    fmt::iterator format_to(fmt::iterator out) const {
+        return fmt::format_to(out, "{} ({})", json_pointer, json_type);
+    }
+};
+
+/// \brief The outcome of reading one schema from a source Schema Registry: the
+/// schema projected into Redpanda's supported model, plus any unsupported
+/// fields that were seen but not stored.
+struct source_schema_read {
+    subject_schema schema;
+    schema_version version{invalid_schema_version};
+    schema_id id{invalid_schema_id};
+    /// The soft-delete state the source explicitly reported for this version,
+    /// or nullopt when the source omitted `deleted` from the body.
+    std::optional<is_deleted> deleted;
+    chunked_vector<unsupported_feature> unsupported;
+
+    /// Materializes the read into a stored_schema, resolving \ref deleted to
+    /// the source-reported flag when present, or \p fallback when the source
+    /// omitted it (\ref deleted is nullopt). Consumes the read.
+    stored_schema into_stored(is_deleted fallback = is_deleted::no) && {
+        return {
+          .schema = std::move(schema),
+          .version = version,
+          .id = id,
+          .deleted = deleted.value_or(fallback)};
+    }
 };
 
 ///\brief A mapping of version and schema id for a subject.

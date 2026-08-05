@@ -58,7 +58,76 @@ void compaction_worker_probe::setup_metrics() {
           sm::description(
             "The duration of a compaction run for cloud topic partitions on "
             "this shard")),
-      });
+        sm::make_histogram(
+          "leveling_duration_microseconds",
+          [this] { return _leveling_runs.internal_histogram_logform(); },
+          sm::description(
+            "The duration of a leveling-range rewrite for cloud topic "
+            "partitions on this shard")),
+        sm::make_counter(
+          "leveling_extents_reclaimed_total",
+          [this] { return _leveling_extents_reclaimed; },
+          sm::description(
+            "Net reduction in object/extent count from committed leveling "
+            "ranges (input extents minus output objects) across all cloud "
+            "topic partitions on this shard")),
+        sm::make_counter(
+          "compaction_objects_committed_total",
+          [this] { return _compaction_objects_committed; },
+          sm::description(
+            "Number of new L1 objects uploaded by committed compaction jobs "
+            "across all cloud topic partitions on this shard")),
+        sm::make_counter(
+          "compaction_bytes_committed_total",
+          [this] { return _compaction_bytes_committed; },
+          sm::description(
+            "Total size in bytes of new L1 objects uploaded by committed "
+            "compaction jobs across all cloud topic partitions on this "
+            "shard")),
+        sm::make_counter(
+          "leveling_objects_committed_total",
+          [this] { return _leveling_objects_committed; },
+          sm::description(
+            "Number of new L1 objects uploaded by committed leveling jobs "
+            "across all cloud topic partitions on this shard")),
+        sm::make_counter(
+          "leveling_bytes_committed_total",
+          [this] { return _leveling_bytes_committed; },
+          sm::description(
+            "Total size in bytes of new L1 objects uploaded by committed "
+            "leveling jobs across all cloud topic partitions on this "
+            "shard")),
+        sm::make_counter(
+          "compaction_objects_rejected_total",
+          [this] { return _compaction_objects_rejected; },
+          sm::description(
+            "Number of new L1 objects uploaded by compaction jobs whose "
+            "commit did not succeed (uploaded but not committed) "
+            "across all cloud topic partitions on this shard")),
+        sm::make_counter(
+          "compaction_bytes_rejected_total",
+          [this] { return _compaction_bytes_rejected; },
+          sm::description(
+            "Total size in bytes of new L1 objects uploaded by compaction "
+            "jobs whose commit did not succeed (uploaded but not "
+            "committed) across all cloud topic partitions on this shard")),
+        sm::make_counter(
+          "leveling_objects_rejected_total",
+          [this] { return _leveling_objects_rejected; },
+          sm::description(
+            "Number of new L1 objects uploaded by leveling jobs whose "
+            "commit did not succeed (uploaded but not committed) "
+            "across all cloud topic partitions on this shard")),
+        sm::make_counter(
+          "leveling_bytes_rejected_total",
+          [this] { return _leveling_bytes_rejected; },
+          sm::description(
+            "Total size in bytes of new L1 objects uploaded by leveling jobs "
+            "whose commit did not succeed (uploaded but not "
+            "committed) across all cloud topic partitions on this shard")),
+      },
+      {},
+      {sm::shard_label});
 }
 
 } // namespace cloud_topics::l1

@@ -74,7 +74,7 @@ redpanda_cc_library(
     ],
     deps = [
         "//src/v/base",
-        "//src/v/cloud_io:scheduler_types",
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/cloud_topics/level_zero/common:extent_meta",
         "//src/v/container:chunked_vector",
         "//src/v/model",
@@ -96,11 +96,12 @@ redpanda_cc_library(
         ":data_plane_impl",
         ":logger",
         ":topic_manifest_upload_manager",
-        "//src/v/cloud_io:scheduler_types",
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/cloud_topics/housekeeper:manager",
         "//src/v/cloud_topics/level_one/metastore:flush_loop",
         "//src/v/cloud_topics/level_one/metastore:topic_purger",
         "//src/v/cloud_topics/level_zero/gc:level_zero_gc",
+        "//src/v/cloud_topics/level_zero/notifier:level_zero_notifier",
         "//src/v/cloud_topics/manager",
         "//src/v/cloud_topics/read_replica:metadata_manager",
         "//src/v/cloud_topics/read_replica:snapshot_manager",
@@ -168,9 +169,9 @@ redpanda_cc_library(
     ],
     implementation_deps = [
         "//src/v/base",
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/cloud_io:cache",
         "//src/v/cloud_io:remote",
-        "//src/v/cloud_io:scheduler_types",
         "//src/v/cloud_topics:cluster_services_interface",
         "//src/v/cloud_topics:data_plane_api",
         "//src/v/cloud_topics/batch_cache",
@@ -278,9 +279,10 @@ redpanda_cc_library(
     deps = [
         ":types",
         "//src/v/base",
-        "//src/v/cloud_io:scheduler_types",
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/model",
         "//src/v/utils:to_string",
+        "@seastar",
     ],
 )
 

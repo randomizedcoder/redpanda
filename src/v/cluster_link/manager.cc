@@ -92,6 +92,8 @@ manager::manager(
   std::unique_ptr<partition_metadata_provider> partition_metadata_provider,
   std::unique_ptr<kafka_rpc_client_service> kafka_rpc_client_service,
   std::unique_ptr<members_table_provider> members_table_provider,
+  std::unique_ptr<sr_preflight_checker> sr_preflight,
+  ss::sharded<features::feature_table>* feature_table,
   ss::lowres_clock::duration task_reconciler_interval,
   config::binding<int16_t> default_topic_replication,
   ss::scheduling_group scheduling_group)
@@ -102,12 +104,14 @@ manager::manager(
   , _topic_creator(std::move(topic_creator))
   , _security_service(std::move(security_service))
   , _registry(std::move(registry))
+  , _feature_table(feature_table)
   , _link_factory(std::move(link_factory))
   , _cluster_factory(std::move(cluster_factory))
   , _group_router(std::move(group_router))
   , _partition_metadata_provider(std::move(partition_metadata_provider))
   , _kafka_rpc_client_service(std::move(kafka_rpc_client_service))
   , _members_table_provider(std::move(members_table_provider))
+  , _sr_preflight(std::move(sr_preflight))
   , _queue(
       scheduling_group,
       [](const std::exception_ptr& ex) {
@@ -146,15 +150,45 @@ ss::future<> manager::stop() {
     vlog(cllog.info, "Stopping cluster link manager");
 
     co_await on_controller_stepdown();
+    vlog(cllog.debug, "manager stop: controller stepdown complete");
 
-    co_await _queue.shutdown();
     _link_task_reconciler_timer.cancel();
     _as.request_abort();
     _link_created_cv.broken();
-    co_await _g.close();
-    for (auto& [_, link] : _links) {
+
+    // Stop the links (which aborts their tasks) BEFORE draining the work
+    // queue and the gate: a queued link-change handler or an in-flight
+    // reconcile tick can be blocked on task machinery that only unblocks once
+    // the tasks' run fibers are aborted. Draining first sequences that abort
+    // behind the very drain that waits on it, deadlocking shutdown until the
+    // node-stop timeout kills the process.
+    //
+    // The queue is still live here and its one executing item may mutate
+    // _links, so stop by id snapshot and re-lookup; a link created after the
+    // snapshot is caught by the sweep below.
+    chunked_vector<id_t> ids;
+    ids.reserve(_links.size());
+    for (const auto& [id, _] : _links) {
+        ids.push_back(id);
+    }
+    for (const auto& id : ids) {
+        if (auto it = _links.find(id); it != _links.end()) {
+            co_await it->second->stop();
+        }
+    }
+    vlog(cllog.debug, "manager stop: links stopped");
+
+    co_await _queue.shutdown();
+    vlog(cllog.debug, "manager stop: work queue drained");
+
+    // The queue is drained and the reconcile timer canceled, so _links is
+    // stable now; sweep up any link a mid-flight handler created after the
+    // snapshot (stop() is idempotent, so re-stopping the rest is a no-op).
+    for (const auto& [_, link] : _links) {
         co_await link->stop();
     }
+
+    co_await _g.close();
 
     vlog(cllog.info, "Cluster link manager stopped");
 }
@@ -351,7 +385,18 @@ ss::future<err_info> manager::link_preflight_checks(const model::metadata& md) {
             e.what())};
     }
     co_await stop_and_ignore();
-    co_return return_error;
+    if (return_error.code() != errc::success) {
+        co_return return_error;
+    }
+    co_return co_await _sr_preflight->check(md, _as);
+}
+
+ss::future<cl_result<void>> manager::test_connection(model::metadata md) {
+    auto err = co_await link_preflight_checks(md);
+    if (err.code() != errc::success) {
+        co_return err;
+    }
+    co_return outcome::success();
 }
 
 ss::future<cl_result<model::metadata_ptr>>
@@ -865,6 +910,11 @@ ss::future<> manager::link_task_reconciler() {
     auto units = std::move(fut).get();
 
     for (const auto& [_, link] : _links) {
+        // Shutdown aborts before stopping links; registering a task on a
+        // link that is about to stop would leak a never-stopped runner.
+        if (_as.abort_requested()) {
+            co_return;
+        }
         vlog(
           cllog.trace,
           "Reconciling tasks for cluster link {} ({})",
@@ -987,6 +1037,7 @@ ss::future<> manager::on_controller_leadership(::model::term_id term) {
           _topic_creator.get(),
           _topic_metadata_cache.get(),
           _registry.get(),
+          _feature_table,
           topic_reconciler_interval,
           _default_topic_replication,
           _scheduling_group);

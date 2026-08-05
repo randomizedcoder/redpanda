@@ -17,10 +17,12 @@
 #include "cluster_link/link_status_reconciler.h"
 #include "cluster_link/logger.h"
 #include "cluster_link/model/types.h"
+#include "cluster_link/sr_preflight_checker.h"
 #include "cluster_link/task.h"
 #include "cluster_link/topic_reconciler.h"
 #include "cluster_link/types.h"
 #include "container/chunked_vector.h"
+#include "features/fwd.h"
 #include "kafka/data/rpc/deps.h"
 #include "kafka/data/rpc/fwd.h"
 #include "model/fundamental.h"
@@ -56,6 +58,8 @@ public:
       std::unique_ptr<partition_metadata_provider> partition_metadata_provider,
       std::unique_ptr<kafka_rpc_client_service> kafka_rpc_client_service,
       std::unique_ptr<members_table_provider> members_table_provider,
+      std::unique_ptr<sr_preflight_checker> sr_preflight,
+      ss::sharded<features::feature_table>* feature_table,
       ss::lowres_clock::duration task_reconciler_interval,
       config::binding<int16_t> default_topic_replication,
       ss::scheduling_group scheduling_group);
@@ -150,6 +154,7 @@ public:
     /// are created
     template<typename T, typename... Args>
     ss::future<> register_task_factory(Args&&... args) {
+        auto factory = std::make_unique<T>(std::forward<Args>(args)...);
         auto fut = co_await ss::coroutine::as_future(
           _link_task_reconciler_mutex.get_units(_as));
         if (fut.failed()) {
@@ -163,8 +168,7 @@ public:
             }
             co_return;
         }
-        _task_factories.emplace_back(
-          std::make_unique<T>(std::forward<Args>(args)...));
+        _task_factories.emplace_back(std::move(factory));
     }
 
     model::cluster_link_task_status_report get_task_status_report() const;
@@ -214,6 +218,8 @@ public:
 
     members_table_provider& get_members_table_provider() noexcept;
 
+    ss::future<cl_result<void>> test_connection(model::metadata md);
+
 private:
     /// Called periodically to reconcile registered tasks on created links
     ss::future<> link_task_reconciler();
@@ -233,6 +239,7 @@ private:
     std::unique_ptr<kafka::data::rpc::topic_creator> _topic_creator;
     std::unique_ptr<security_service> _security_service;
     std::unique_ptr<link_registry> _registry;
+    ss::sharded<features::feature_table>* _feature_table;
     std::unique_ptr<link_factory> _link_factory;
     std::unique_ptr<cluster_factory> _cluster_factory;
     std::unique_ptr<topic_reconciler> _topic_reconciler;
@@ -241,6 +248,7 @@ private:
     std::unique_ptr<partition_metadata_provider> _partition_metadata_provider;
     std::unique_ptr<kafka_rpc_client_service> _kafka_rpc_client_service;
     std::unique_ptr<members_table_provider> _members_table_provider;
+    std::unique_ptr<sr_preflight_checker> _sr_preflight;
     ssx::work_queue _queue;
 
     chunked_vector<std::unique_ptr<task_factory>> _task_factories;

@@ -236,6 +236,30 @@ SEASTAR_THREAD_TEST_CASE(test_http_POST_roundtrip) {
       });
 }
 
+SEASTAR_THREAD_TEST_CASE(test_collect_response_carries_headers) {
+    auto config = transport_configuration();
+    auto [server, client] = started_client_and_server(config);
+
+    http::client::request_header header;
+    header.method(boost::beast::http::verb::get);
+    header.target("/get");
+    header_set_host(header, config.server_addr);
+
+    auto resp = client->request_and_collect_response(std::move(header)).get();
+    server->stop().get();
+
+    BOOST_REQUIRE_EQUAL(resp.status, boost::beast::http::status::ok);
+    BOOST_REQUIRE(!resp.body.empty());
+    // The collected headers mirror the wire: the server's content-length
+    // matches the body actually received.
+    auto content_length = resp.headers.find(
+      boost::beast::http::field::content_length);
+    BOOST_REQUIRE(content_length != resp.headers.end());
+    BOOST_REQUIRE_EQUAL(
+      std::string(content_length->value()),
+      std::to_string(resp.body.size_bytes()));
+}
+
 /// Test http streaming requests e2e in ss::async
 template<class Func>
 void test_http_streaming_request(
@@ -862,27 +886,51 @@ SEASTAR_THREAD_TEST_CASE(test_http_cancel_reconnect) {
     auto config = transport_configuration();
     ss::abort_source as;
     http::client client(config, as);
+    // get_connected makes a single connection attempt; an abort
+    // requested before (or during) the attempt surfaces as
+    // abort_requested_exception rather than a connect failure.
+    as.request_abort();
     auto fut = client.get_connected(
       10s, prefix_logger(http::http_log, "test-url"));
-    ss::sleep(10ms).get();
-    BOOST_REQUIRE(fut.failed() == false);
-    BOOST_REQUIRE(fut.available() == false);
-    as.request_abort();
     BOOST_REQUIRE_THROW(fut.get(), ss::abort_requested_exception);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_http_reconnect_graceful_shutdown) {
-    auto config = transport_configuration();
-    ss::abort_source as;
-    http::client client(config, as);
-    auto fut = client.get_connected(
+SEASTAR_THREAD_TEST_CASE(test_http_shutdown_now_during_connect) {
+    auto [server, client] = started_client_and_server(
+      transport_configuration());
+    // A shutdown requested while a connection attempt is in flight takes
+    // priority: the attempt is dropped, even if it succeeded, and is
+    // reported as a graceful timed_out.
+    auto fut = client->get_connected(
       10s, prefix_logger(http::http_log, "test-url"));
-    ss::sleep(10ms).get();
-    BOOST_REQUIRE(fut.failed() == false);
-    BOOST_REQUIRE(fut.available() == false);
-    client.stop().get();
-    ss::sleep(10ms).get();
+    client->shutdown_now();
     BOOST_REQUIRE(fut.get() == http::reconnect_result_t::timed_out);
+    BOOST_REQUIRE(!client->is_valid());
+    client->stop().get();
+    server->stop().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_http_shutdown_now_does_not_poison_reuse) {
+    auto [server, client] = started_client_and_server(
+      transport_configuration());
+    // Pooled clients are reused after shutdown_now; the shutdown applies
+    // only to the connection attempt it interrupted, not to later ones.
+    auto fut = client->get_connected(
+      10s, prefix_logger(http::http_log, "test-url"));
+    client->shutdown_now();
+    BOOST_REQUIRE(fut.get() == http::reconnect_result_t::timed_out);
+    auto fut2 = client->get_connected(
+      10s, prefix_logger(http::http_log, "test-url"));
+    BOOST_REQUIRE(fut2.get() == http::reconnect_result_t::connected);
+    BOOST_REQUIRE(client->is_valid());
+    // Same when the shutdown is requested while the client is idle.
+    client->shutdown_now();
+    BOOST_REQUIRE(!client->is_valid());
+    auto fut3 = client->get_connected(
+      10s, prefix_logger(http::http_log, "test-url"));
+    BOOST_REQUIRE(fut3.get() == http::reconnect_result_t::connected);
+    client->stop().get();
+    server->stop().get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_header_redacted) {

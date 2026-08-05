@@ -459,14 +459,6 @@ SEASTAR_THREAD_TEST_CASE(test_segment_contains) {
       == std::next(m.begin(), m.size() - 1));
 }
 
-// Test for the partition manifest tracked memory.
-SEASTAR_THREAD_TEST_CASE(test_manifest_mem_tracking) {
-    partition_manifest empty_manifest;
-    empty_manifest
-      .update(manifest_format::json, make_manifest_stream(empty_manifest_json))
-      .get();
-}
-
 SEASTAR_THREAD_TEST_CASE(test_manifest_type) {
     partition_manifest m;
     BOOST_REQUIRE(m.get_manifest_type() == manifest_type::partition);
@@ -1120,7 +1112,7 @@ SEASTAR_THREAD_TEST_CASE(test_complete_manifest_serialization_roundtrip) {
            .delta_offset_end = model::offset_delta(9),
            .sname_format = segment_name_format::v3,
          }},
-      };
+    };
     std::multimap<ss::sstring, partition_manifest::segment_meta>
       expected_replaced_segments = {
         // v0 segments
@@ -1193,7 +1185,7 @@ SEASTAR_THREAD_TEST_CASE(test_complete_manifest_serialization_roundtrip) {
            .delta_offset_end = model::offset_delta(9),
            .sname_format = segment_name_format::v2,
          }},
-      };
+    };
 
     partition_manifest m(manifest_ntp, model::initial_revision_id(0));
     for (const auto& segment : expected_segments) {
@@ -1498,7 +1490,7 @@ SEASTAR_THREAD_TEST_CASE(
            .ntp_revision = model::initial_revision_id(1),
            .segment_term = model::term_id(2),
          }},
-      };
+    };
 
     partition_manifest m(manifest_ntp, model::initial_revision_id(0));
     for (const auto& segment : expected_segments) {
@@ -2044,8 +2036,7 @@ SEASTAR_THREAD_TEST_CASE(test_reset_manifest) {
       path, "60000000/meta/test-ns/test-topic/42_1/manifest.bin");
     BOOST_REQUIRE_EQUAL(m.size(), 5);
 
-    partition_manifest expected{
-      m.get_ntp(), m.get_revision_id(), m.mem_tracker()};
+    partition_manifest expected{m.get_ntp(), m.get_revision_id()};
 
     m.unsafe_reset();
     BOOST_REQUIRE(m == expected);
@@ -2817,7 +2808,7 @@ SEASTAR_THREAD_TEST_CASE(
            .ntp_revision = model::initial_revision_id(1),
            .segment_term = model::term_id(2),
          }},
-      };
+    };
 
     partition_manifest m(manifest_ntp, model::initial_revision_id(0));
     for (const auto& segment : expected_segments) {

@@ -353,9 +353,25 @@ cluster::topic_configuration to_topic_config(
         topic_property_message_timestamp_after_max_ms,
         /*clamp_to_duration_max=*/true);
 
+    // The exact implementation (redpanda.storage.mode.impl) wins over the
+    // alias-resolved mode. Malformed combinations are rejected by
+    // storage_mode_config_validator before conversion.
     cfg.properties.storage_mode
-      = get_enum_value<model::redpanda_storage_mode>(
-          config_entries, topic_property_redpanda_storage_mode)
+      = get_string_value(
+          config_entries, topic_property_redpanda_storage_mode_impl)
+          .and_then([](const ss::sstring& raw) {
+              return model::redpanda_storage_mode_from_impl_string(raw);
+          })
+          .or_else([&config_entries]() {
+              return get_string_value(
+                       config_entries, topic_property_redpanda_storage_mode)
+                .and_then([](const ss::sstring& raw) {
+                    return model::redpanda_storage_mode_from_user_string(
+                      raw,
+                      config::shard_local_cfg()
+                        .default_redpanda_storage_mode_tiered_impl());
+                });
+          })
           .value_or(config::shard_local_cfg().default_redpanda_storage_mode());
 
     schema_id_validation_config_parser schema_id_validation_config_parser{
@@ -366,6 +382,33 @@ cluster::topic_configuration to_topic_config(
           name, value, kafka::config_resource_operation::set);
     }
 
+    return cfg;
+}
+
+cluster::topic_configuration
+schema_registry_topic_configuration(int16_t replication_factor) {
+    // Create the base topic configuration to get the cluster defaults
+    auto cfg = to_topic_config(
+      model::kafka_namespace,
+      model::schema_registry_internal_tp.topic,
+      /*partition_count=*/1,
+      replication_factor,
+      {});
+    // Now update the properties
+    cfg.properties.cleanup_policy_bitflags
+      = model::cleanup_policy_bitflags::compaction;
+    cfg.properties.compression = model::compression::none;
+    cfg.properties.retention_bytes = tristate<size_t>{disable_tristate};
+    cfg.properties.retention_duration = tristate<std::chrono::milliseconds>{
+      disable_tristate};
+    cfg.properties.retention_local_target_bytes = tristate<size_t>{
+      disable_tristate};
+    cfg.properties.retention_local_target_ms
+      = tristate<std::chrono::milliseconds>{disable_tristate};
+    cfg.properties.initial_retention_local_target_bytes = tristate<size_t>{
+      disable_tristate};
+    cfg.properties.initial_retention_local_target_ms
+      = tristate<std::chrono::milliseconds>{disable_tristate};
     return cfg;
 }
 

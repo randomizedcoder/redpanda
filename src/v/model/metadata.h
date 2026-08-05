@@ -33,6 +33,7 @@
 
 #include <compare>
 #include <cstddef>
+#include <expected>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -645,6 +646,74 @@ std::optional<redpanda_storage_mode>
 fmt::iterator format_to(redpanda_storage_mode m, fmt::iterator out);
 std::istream& operator>>(std::istream&, redpanda_storage_mode&);
 
+// Selects which storage mode the plain 'tiered' user-facing alias refers to:
+// 'tiered_v1' is redpanda_storage_mode::tiered, 'tiered_v2' is
+// redpanda_storage_mode::tiered_cloud. Value of the
+// redpanda_storage_mode_tiered_impl cluster config.
+enum class redpanda_storage_mode_tiered_impl : uint8_t {
+    tiered_v1 = 0,
+    tiered_v2 = 1,
+};
+
+constexpr const char* redpanda_storage_mode_tiered_impl_to_string(
+  redpanda_storage_mode_tiered_impl m) {
+    switch (m) {
+    case redpanda_storage_mode_tiered_impl::tiered_v1:
+        return "tiered_v1";
+    case redpanda_storage_mode_tiered_impl::tiered_v2:
+        return "tiered_v2";
+    }
+    throw std::invalid_argument("unknown redpanda_storage_mode_tiered_impl");
+}
+
+std::optional<redpanda_storage_mode_tiered_impl>
+  redpanda_storage_mode_tiered_impl_from_string(std::string_view);
+
+fmt::iterator format_to(redpanda_storage_mode_tiered_impl m, fmt::iterator out);
+std::istream& operator>>(std::istream&, redpanda_storage_mode_tiered_impl&);
+
+/// Parse a user-supplied storage mode string (the redpanda.storage.mode topic
+/// property). The user vocabulary is local/tiered/cloud/unset: 'tiered'
+/// resolves against the redpanda_storage_mode_tiered_impl cluster config, and
+/// the variant names (tiered_v1/tiered_v2) as well as the internal
+/// 'tiered_cloud' spelling are rejected -- a specific variant is selected with
+/// the separate redpanda.storage.mode.impl property instead.
+std::optional<redpanda_storage_mode> redpanda_storage_mode_from_user_string(
+  std::string_view, redpanda_storage_mode_tiered_impl);
+
+/// The user-facing name of a storage mode: both tiered variants display as
+/// 'tiered' (the variant is exposed via redpanda.storage.mode.impl);
+/// other modes display as their enum name.
+const char* redpanda_storage_mode_user_name(redpanda_storage_mode);
+
+/// The tiered variant of a storage mode: tiered -> tiered_v1,
+/// tiered_cloud -> tiered_v2, nullopt for the other modes.
+std::optional<redpanda_storage_mode_tiered_impl>
+  storage_mode_tiered_impl(redpanda_storage_mode);
+
+/// The unambiguous implementation name of a storage mode, the value of the
+/// read-only redpanda.storage.mode.impl topic property:
+/// unset/local/cloud display as their enum name, the tiered variants as
+/// tiered_v1/tiered_v2.
+const char* redpanda_storage_mode_impl_name(redpanda_storage_mode);
+
+/// Parse the redpanda.storage.mode.impl vocabulary
+/// (unset|local|tiered_v1|tiered_v2|cloud): the exact inverse of
+/// redpanda_storage_mode_impl_name. The ambiguous 'tiered' alias and the
+/// internal 'tiered_cloud' spelling are rejected.
+std::optional<redpanda_storage_mode>
+  redpanda_storage_mode_from_impl_string(std::string_view);
+
+/// Combine the redpanda.storage.mode value with an explicit
+/// redpanda.storage.mode.impl into the storage mode enum: the version
+/// picks the tiered variant.
+constexpr redpanda_storage_mode
+storage_mode_with_tiered_impl(redpanda_storage_mode_tiered_impl version) {
+    return version == redpanda_storage_mode_tiered_impl::tiered_v2
+             ? redpanda_storage_mode::tiered_cloud
+             : redpanda_storage_mode::tiered;
+}
+
 enum class recovery_validation_mode : std::uint16_t {
     // ensure that either the manifest is in TS or that no manifest is present.
     // download issues will fail the validation
@@ -659,71 +728,121 @@ enum class recovery_validation_mode : std::uint16_t {
 fmt::iterator format_to(recovery_validation_mode vm, fmt::iterator out);
 std::istream& operator>>(std::istream&, recovery_validation_mode&);
 
-// Iceberg enablement options for a topic
+/// Iceberg enablement options for a topic.
+///
+/// A topic's iceberg_mode controls how Kafka records are translated into
+/// Iceberg rows. The mode is composed of three independent section configs
+/// (key, value, headers) and a disabled state. Use iceberg_mode::disabled for
+/// the disabled state and the section-based constructors for all enabled modes.
+///
+/// Backward-compatible static instances (disabled, key_value,
+/// value_schema_id_prefix) and the value_schema_latest() factory are preserved
+/// for call sites that have not yet been migrated to the new API.
 class iceberg_mode {
 public:
-    iceberg_mode() = default;
-
-    enum class variant : uint8_t {
-        // Iceberg is disabled
-        disabled = 0,
-        // Iceberg translation interprets record key and value as binary
-        // types and uses default Iceberg table schema.
-        key_value = 1,
-        // Iceberg translation interprets the record value using the schema
-        // id embedded in value. Kafka serializers embed a magic byte as the
-        // first byte of the value to indicate the presence of a schema id
-        // which is then resolved with the schema registry. The value bytes
-        // are then interepted using the schema and the resulting columns are
-        // mapped to appropriate iceberg types and corresponding table columns.
-        value_schema_id_prefix = 2,
-        // Iceberg translation always uses the latest schema found in
-        // the topic's subject in schema registry. By default we assume the
-        // TopicNamingStrategy (<topic>-value) and if protobuf the 0th message
-        // in the file descriptor. However these can both be overridden by the
-        // user.
-        value_schema_latest = 3,
+    /// How to decode a record key or value field.
+    enum class schema_mode : uint8_t {
+        binary,           ///< Store as raw bytes, no schema decoding.
+        schema_id_prefix, ///< Decode using schema ID embedded in the record.
+        schema_latest, ///< Decode using latest schema for a registry subject.
+        string, ///< Store as UTF-8 string, replacing invalid bytes with U+FFFD.
     };
+
+    /// Whether header values are stored as binary or decoded as UTF-8 strings.
+    enum class header_schema_mode : uint8_t { binary, string };
+
+    /// How translated value fields are placed in the Iceberg row.
+    enum class value_layout : uint8_t {
+        flat,   ///< User fields placed at top level of the row (default).
+        nested, ///< User fields wrapped inside a "value" struct.
+    };
+
+    /// Schema decoding config for the key section.
+    struct key_config {
+        schema_mode mode{schema_mode::binary};
+        ss::sstring subject; ///< Empty = <topic>-key (topic name strategy).
+        ss::sstring
+          protobuf_name; ///< Empty = first proto message definition in schema.
+        bool operator==(const key_config&) const = default;
+    };
+
+    /// Schema decoding config for the value section.
+    struct value_config {
+        schema_mode mode{schema_mode::binary};
+        ss::sstring subject; ///< Empty = <topic>-value (topic name strategy).
+        ss::sstring
+          protobuf_name; ///< Empty = first proto message definition in schema.
+        value_layout layout{value_layout::flat};
+        bool operator==(const value_config&) const = default;
+
+        /// Returns true if this config can be fully represented by the legacy
+        /// wire discriminants (0–3).
+        bool is_legacy_compatible() const noexcept {
+            return layout == value_layout::flat && mode != schema_mode::string;
+        }
+    };
+
+    /// Config for the headers section.
+    struct headers_config {
+        header_schema_mode value_type{header_schema_mode::binary};
+        bool operator==(const headers_config&) const = default;
+    };
+
+    /// Holds the per-section configs for an enabled iceberg_mode.
+    struct enabled_impl {
+        key_config key;
+        value_config value;
+        headers_config headers;
+        bool operator==(const enabled_impl&) const = default;
+    };
+
+    iceberg_mode() = default; ///< Default-constructs to the disabled state.
+
+    /// Constructs an enabled iceberg_mode from explicit section configs.
+    explicit iceberg_mode(enabled_impl impl)
+      : _impl(std::move(impl)) {}
+
+    // --- Backward-compatible static instances and factories ---
+
     static iceberg_mode disabled;
-
     static iceberg_mode key_value;
-
     static iceberg_mode value_schema_id_prefix;
 
-    // Creates a new iceberg mode with the latest protobuf value kind and the
-    // protobuf full name.
+    /// Creates a mode equivalent to the legacy value_schema_latest config.
     static iceberg_mode value_schema_latest(
       std::string_view protobuf_full_name, std::string_view subject_name) {
-        return {value_schema_latest_t{}, protobuf_full_name, subject_name};
+        enabled_impl e{};
+        e.value.mode = schema_mode::schema_latest;
+        e.value.protobuf_name = ss::sstring(protobuf_full_name);
+        e.value.subject = ss::sstring(subject_name);
+        return iceberg_mode{std::move(e)};
     }
 
-    // Returns the kind of iceberg mode is being used.
-    variant kind() const noexcept {
-        return static_cast<variant>(_impl.index());
+    bool is_disabled() const noexcept {
+        return std::holds_alternative<disabled_impl>(_impl);
     }
 
-    // Returns the protobuf message's full name if specified.
-    //
-    // Throws is variant() != variant::value_schema_latest
-    std::optional<ss::sstring> protobuf_full_name() const {
-        const auto& name
-          = std::get<value_schema_latest_impl>(_impl).message_full_name;
-        if (name.empty()) {
-            return std::nullopt;
+    /// Returns true if this mode would be encoded using the new wire
+    /// discriminant (4), which requires all cluster nodes to be upgraded.
+    bool needs_extended_cluster_feature() const noexcept {
+        if (is_disabled()) {
+            return false;
         }
-        return name;
+        const auto& e = std::get<enabled_impl>(_impl);
+        return e.key.mode != schema_mode::binary
+               || e.headers.value_type != header_schema_mode::binary
+               || !e.value.is_legacy_compatible();
     }
 
-    // Returns the subject name if specified.
-    //
-    // Throws is variant() != variant::value_schema_latest
-    std::optional<ss::sstring> subject_name() const {
-        const auto& subject
-          = std::get<value_schema_latest_impl>(_impl).subject_name;
-        if (subject.empty()) {
-            return std::nullopt;
-        }
-        return subject;
+    /// \pre !is_disabled()
+    const key_config& key() const { return std::get<enabled_impl>(_impl).key; }
+    /// \pre !is_disabled()
+    const value_config& value() const {
+        return std::get<enabled_impl>(_impl).value;
+    }
+    /// \pre !is_disabled()
+    const headers_config& headers() const {
+        return std::get<enabled_impl>(_impl).headers;
     }
 
     bool operator==(const iceberg_mode&) const = default;
@@ -732,49 +851,20 @@ public:
     friend void write_nested(iobuf& out, const iceberg_mode& m);
 
     friend void read_nested(
-      iobuf_parser& in, iceberg_mode& m, const std::size_t bytes_left_limit);
+      iobuf_parser& in, iceberg_mode& m, std::size_t bytes_left_limit);
 
 private:
-    template<variant v>
-    static iceberg_mode make() noexcept {
-        iceberg_mode m;
-        m._impl = decltype(m._impl){
-          std::in_place_index<static_cast<size_t>(v)>};
-        return m;
-    }
-
-    struct value_schema_latest_t {};
-    iceberg_mode(
-      value_schema_latest_t,
-      std::string_view protobuf_full_name,
-      std::string_view subject_name)
-      : _impl(
-          std::in_place_type<value_schema_latest_impl>,
-          ss::sstring(protobuf_full_name),
-          ss::sstring(subject_name)) {}
-
     struct disabled_impl {
         bool operator==(const disabled_impl&) const = default;
     };
-    struct key_value_impl {
-        bool operator==(const key_value_impl&) const = default;
-    };
-    struct value_schema_id_prefix_impl {
-        bool operator==(const value_schema_id_prefix_impl&) const = default;
-    };
-    struct value_schema_latest_impl {
-        ss::sstring message_full_name;
-        ss::sstring subject_name;
-        bool operator==(const value_schema_latest_impl&) const = default;
-    };
 
-    std::variant<
-      disabled_impl,
-      key_value_impl,
-      value_schema_id_prefix_impl,
-      value_schema_latest_impl>
-      _impl;
+    std::variant<disabled_impl, enabled_impl> _impl;
 };
+
+/// Parse an iceberg_mode from its string representation.
+/// Returns the parsed mode on success, or a human-readable error string on
+/// failure. Prefer this over operator>> when error messages matter.
+std::expected<iceberg_mode, ss::sstring> parse_iceberg_mode(std::string_view s);
 
 std::istream& operator>>(std::istream&, iceberg_mode&);
 

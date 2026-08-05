@@ -36,34 +36,38 @@ namespace datalake {
 
 namespace {
 
-static std::unique_ptr<type_resolver> make_type_resolver(
-  const model::iceberg_mode& mode,
+static std::unique_ptr<type_resolver> make_field_type_resolver(
+  model::iceberg_mode::schema_mode field_mode,
+  const ss::sstring& subject_override,
+  const ss::sstring& protobuf_name,
   model::topic_view topic_name,
+  std::string_view default_subject_suffix,
   pandaproxy::schema_registry::context sr_context,
   schema::registry& sr,
   schema_cache& cache,
   resolved_type_cache& type_cache) {
-    switch (mode.kind()) {
-    case model::iceberg_mode::variant::disabled:
-        vassert(
-          false,
-          "Cannot make record translator when iceberg is disabled, logic bug.");
-    case model::iceberg_mode::variant::key_value:
+    switch (field_mode) {
+    case model::iceberg_mode::schema_mode::binary:
+    case model::iceberg_mode::schema_mode::string:
         return std::make_unique<binary_type_resolver>();
-    case model::iceberg_mode::variant::value_schema_id_prefix:
+    case model::iceberg_mode::schema_mode::schema_id_prefix:
         return std::make_unique<record_schema_resolver>(
           sr, cache, type_cache, std::move(sr_context));
-    case model::iceberg_mode::variant::value_schema_latest:
+    case model::iceberg_mode::schema_mode::schema_latest:
         auto subject = pandaproxy::schema_registry::subject(
-          fmt::format("{}-value", topic_name));
-        if (auto explicit_subject = mode.subject_name()) {
-            subject = pandaproxy::schema_registry::subject(*explicit_subject);
+          subject_override.empty()
+            ? ss::sstring(
+                fmt::format("{}{}", topic_name, default_subject_suffix))
+            : subject_override);
+        std::optional<ss::sstring> proto_name;
+        if (!protobuf_name.empty()) {
+            proto_name = protobuf_name;
         }
         return std::make_unique<latest_subject_schema_resolver>(
           sr,
           std::move(sr_context),
-          subject,
-          mode.protobuf_full_name(),
+          std::move(subject),
+          std::move(proto_name),
           config::shard_local_cfg().iceberg_latest_schema_cache_ttl_ms.bind(),
           cache,
           type_cache);
@@ -72,17 +76,11 @@ static std::unique_ptr<type_resolver> make_type_resolver(
 
 static std::unique_ptr<record_translator>
 make_record_translator(const model::iceberg_mode& mode) {
-    switch (mode.kind()) {
-    case model::iceberg_mode::variant::disabled:
-        vassert(
-          false,
-          "Cannot make record translator when iceberg is disabled, logic bug.");
-    case model::iceberg_mode::variant::key_value:
-        return std::make_unique<key_value_translator>();
-    case model::iceberg_mode::variant::value_schema_id_prefix:
-    case model::iceberg_mode::variant::value_schema_latest:
-        return std::make_unique<structured_data_translator>();
-    }
+    vassert(
+      !mode.is_disabled(),
+      "Cannot make record translator when iceberg is disabled, logic bug.");
+    return std::make_unique<record_translator>(
+      mode.key(), mode.value(), mode.headers());
 }
 } // namespace
 
@@ -635,11 +633,25 @@ ss::future<> datalake_manager::handle_translator_state_change(
     // otherwise we need to set up a translator
 
     auto mode = partition->topic_cfg->properties.iceberg_mode;
-    auto type_resolver = make_type_resolver(
-      mode,
+    auto sr_context = partition->topic_cfg->properties.schema_registry_context
+                        .value_or(pandaproxy::schema_registry::default_context);
+    auto val_type_resolver = make_field_type_resolver(
+      mode.value().mode,
+      mode.value().subject,
+      mode.value().protobuf_name,
       ntp.tp.topic,
-      partition->topic_cfg->properties.schema_registry_context.value_or(
-        pandaproxy::schema_registry::default_context),
+      "-value",
+      sr_context,
+      *_schema_registry,
+      *_schema_cache,
+      *_resolved_type_cache);
+    auto key_type_resolver = make_field_type_resolver(
+      mode.key().mode,
+      mode.key().subject,
+      mode.key().protobuf_name,
+      ntp.tp.topic,
+      "-key",
+      sr_context,
       *_schema_registry,
       *_schema_cache,
       *_resolved_type_cache);
@@ -666,7 +678,8 @@ ss::future<> datalake_manager::handle_translator_state_change(
         data_src->topic_revision(),
         *_cloud_data_io,
         *_schema_mgr,
-        std::move(type_resolver),
+        std::move(val_type_resolver),
+        std::move(key_type_resolver),
         std::move(record_translator),
         std::move(table_creator),
         _location_provider,

@@ -183,6 +183,11 @@ void rjson_serialize(
 }
 
 void rjson_serialize(
+  json::Writer<json::StringBuffer>& w, const cloud_io::policy_type& v) {
+    stringize(w, v);
+}
+
+void rjson_serialize(
   json::Writer<json::StringBuffer>& w,
   const model::cloud_credentials_source& v) {
     stringize(w, v);
@@ -334,6 +339,12 @@ void rjson_serialize(
 
 void rjson_serialize(
   json::Writer<json::StringBuffer>& w, const model::redpanda_storage_mode& m) {
+    stringize(w, m);
+}
+
+void rjson_serialize(
+  json::Writer<json::StringBuffer>& w,
+  const model::redpanda_storage_mode_tiered_impl& m) {
     stringize(w, m);
 }
 

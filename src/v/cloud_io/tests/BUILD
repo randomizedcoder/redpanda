@@ -163,13 +163,42 @@ redpanda_cc_gtest(
 )
 
 redpanda_cc_gtest(
-    name = "scheduler_test",
+    name = "admission_control_test",
     timeout = "short",
     srcs = [
-        "scheduler_test.cc",
+        "admission_control_test.cc",
     ],
     deps = [
-        "//src/v/cloud_io:scheduler",
+        "//src/v/cloud_io:admission_control",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "reservation_policy_test",
+    timeout = "short",
+    srcs = [
+        "reservation_policy_test.cc",
+    ],
+    deps = [
+        "//src/v/cloud_io:admission_control_types",
+        "//src/v/cloud_io:reservation_policy",
+        "//src/v/test_utils:gtest",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "admission_control_types_test",
+    timeout = "short",
+    srcs = [
+        "admission_control_types_test.cc",
+    ],
+    deps = [
+        "//src/v/cloud_io:admission_control_types",
         "//src/v/test_utils:gtest",
         "@googletest//:gtest",
         "@seastar",

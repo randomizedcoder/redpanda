@@ -79,7 +79,35 @@ bool ctp_stm_state::epoch_in_window(
       _max_applied_epoch.value_or(cluster_epoch::min()));
     auto begin = _previous_seen_epoch.value_or(
       _previous_applied_epoch.value_or(end));
-    return epoch >= begin && epoch <= end;
+    if (epoch < begin || epoch > end) {
+        return false;
+    }
+    if (epoch == end) {
+        return true;
+    }
+    // A below-max epoch is only admissible if some epoch batch is known to
+    // precede the max-seen epoch's first batch in the log. The seen window
+    // alone can't prove this: a fence-time bump whose batch never lands (a
+    // failed replicate) leaves a lower bound with no counterpart in the log.
+    // If nothing precedes the max epoch's first batch, the log epoch window
+    // collapses to [max, max] when that batch applies, and a below-max batch
+    // landing after it violates the log invariant enforced by
+    // epoch_window_checker and may reference L0 objects the GC already
+    // considers inactive.
+    //
+    // Applied state gives positional evidence, since apply follows log order:
+    // - _max_applied_epoch < end: an applied batch sits at a lower log
+    //   position than any batch at the max-seen epoch (applied or not).
+    // - _max_applied_epoch == end: the max epoch applied; a batch preceded it
+    //   iff the applied window did not collapse to [end, end].
+    if (!_max_applied_epoch.has_value()) {
+        return false;
+    }
+    if (*_max_applied_epoch < end) {
+        return true;
+    }
+    return *_max_applied_epoch == end
+           && _previous_applied_epoch.value_or(end) < end;
 }
 
 bool ctp_stm_state::epoch_above_window(
@@ -180,14 +208,17 @@ kafka::offset ctp_stm_state::start_offset() const noexcept {
     return _start_offset;
 }
 
-void ctp_stm_state::set_allowed_local_start_offset(
-  std::optional<kafka::offset> offset) noexcept {
-    _allowed_local_start_offset = offset;
+void ctp_stm_state::set_min_allowed_local_threshold(
+  kafka::offset offset) noexcept {
+    // The min allowed local threshold is a kafka-offset floor below which L1
+    // has compacted; it is monotonic non-decreasing, so values that do not
+    // advance it are ignored. The unset floor is kafka::offset::min().
+    _min_allowed_local_threshold = std::max(
+      _min_allowed_local_threshold, offset);
 }
 
-std::optional<kafka::offset>
-ctp_stm_state::get_allowed_local_start_offset() const noexcept {
-    return _allowed_local_start_offset;
+kafka::offset ctp_stm_state::get_min_allowed_local_threshold() const noexcept {
+    return _min_allowed_local_threshold;
 }
 
 fmt::iterator ctp_stm_state::format_to(fmt::iterator it) const {

@@ -62,7 +62,7 @@ struct base_fixture : public ::testing::Test {
             [this]() { return make_log_cfg(); },
             std::ref(_feature_table))
           .get();
-        _api.invoke_on_all(&storage::api::start).get();
+        _api.invoke_on_all([](storage::api& a) { return a.start(); }).get();
     }
 
     storage::kvstore_config make_kv_cfg() const {
@@ -346,8 +346,7 @@ struct fuzz_checker {
               : _self(self)
               , _appender(self._log->make_appender(
                   storage::log_append_config{
-                    .should_fsync = storage::log_append_config::fsync::no,
-                    .timeout = model::no_timeout})) {}
+                    .should_fsync = storage::log_append_config::fsync::no})) {}
 
             ss::future<ss::stop_iteration>
             operator()(model::record_batch& batch) {

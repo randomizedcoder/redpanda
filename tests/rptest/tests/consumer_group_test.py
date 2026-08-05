@@ -10,6 +10,7 @@
 
 import asyncio
 from contextlib import closing
+import json
 import random
 import threading
 import time
@@ -23,7 +24,7 @@ from confluent_kafka import (
     TopicPartition,
 )
 from confluent_kafka.admin import AdminClient
-from ducktape.mark import ignore, parametrize
+from ducktape.mark import ignore, matrix, parametrize
 from ducktape.utils.util import wait_until
 from kafka import KafkaConsumer
 from kafka.admin import KafkaAdminClient
@@ -41,9 +42,15 @@ from rptest.services.redpanda import (
     RESTART_LOG_ALLOW_LIST,
     LoggingConfig,
     MetricsEndpoint,
+    get_cloud_storage_type,
 )
 from rptest.services.rpk_producer import RpkProducer
 from rptest.services.verifiable_consumer import VerifiableConsumer
+from rptest.tests.read_replica_e2e_test import (
+    READ_REPLICA_LOG_ALLOW_LIST,
+    ReadReplicaE2EBase,
+    get_hwm_per_partition,
+)
 from rptest.tests.redpanda_test import RedpandaTest
 from rptest.util import wait_until_result
 from rptest.utils.mode_checks import skip_debug_mode
@@ -120,7 +127,7 @@ class ConsumerGroupTest(RedpandaTest):
 
         for c in consumers:
             c.start()
-        wait_until(self.co_topic_is_ready, 10, 1)
+        self.wait_for_co_topic()
 
         rpk = RpkTool(self.redpanda)
 
@@ -133,6 +140,18 @@ class ConsumerGroupTest(RedpandaTest):
 
     def co_topic_is_ready(self):
         return len(self.client().describe_topic("__consumer_offsets").partitions) > 0
+
+    def wait_for_co_topic(self):
+        # __consumer_offsets is created lazily, as a side effect of the first
+        # FindCoordinator request, which is only sent once a consumer has
+        # finished starting up. The budget therefore has to cover JVM startup
+        # of the CLI consumers on a busy machine, not just topic creation.
+        wait_until(
+            self.co_topic_is_ready,
+            timeout_sec=60,
+            backoff_sec=1,
+            err_msg="__consumer_offsets topic was not created",
+        )
 
     def consumed_at_least(consumers, count):
         return all([c._message_cnt > count for c in consumers])
@@ -293,7 +312,7 @@ class ConsumerGroupTest(RedpandaTest):
     def wait_for_members(self, group, members_count):
         rpk = RpkTool(self.redpanda)
 
-        wait_until(self.co_topic_is_ready, 10, 1)
+        self.wait_for_co_topic()
 
         def group_stable():
             rpk_group = rpk.group_describe(group)
@@ -583,10 +602,16 @@ class ConsumerGroupTest(RedpandaTest):
                     )
                     try:
                         consumer.subscribe([self.topic_spec.name])
-                        # poll() must run long enough for JoinGroup to
-                        # complete so the group is registered; kafka-python
-                        # 2.3.1's coordinator poll honors this timeout.
-                        consumer.poll(timeout_ms=5000)
+                        # Poll until the consumer is actually assigned
+                        # partitions, which proves JoinGroup/SyncGroup
+                        # completed and the group is registered on the
+                        # coordinator.
+                        deadline = time.monotonic() + 30
+                        while not consumer.assignment() and time.monotonic() < deadline:
+                            consumer.poll(timeout_ms=500)
+                        assert consumer.assignment(), (
+                            f"consumer g-{i} failed to join group in time"
+                        )
                     finally:
                         consumer.close(autocommit=True)
                 except Exception as e:
@@ -594,11 +619,15 @@ class ConsumerGroupTest(RedpandaTest):
                     raise
 
             async def create_groups(r):
+                # Limit to 10 concurrent connections to avoid overwhelming the broker
+                sem = asyncio.Semaphore(10)
+
+                async def throttled(i):
+                    async with sem:
+                        await asyncio.to_thread(poll_once, i + r * groups_in_round)
+
                 results = await asyncio.gather(
-                    *[
-                        asyncio.to_thread(poll_once, i + r * groups_in_round)
-                        for i in range(groups_in_round)
-                    ],
+                    *[throttled(i) for i in range(groups_in_round)],
                     return_exceptions=True,
                 )
                 for res in results:
@@ -641,7 +670,7 @@ class ConsumerGroupTest(RedpandaTest):
         )
 
         consumer1.start()
-        wait_until(self.co_topic_is_ready, 10, 1)
+        self.wait_for_co_topic()
 
         self.wait_for_members(group, 1)
 
@@ -912,14 +941,15 @@ class ConsumerGroupTest(RedpandaTest):
         )
         topic_count = 1
         partition_count = 20
-        consumer_count = 4
+        # One consumer per partition: each consumer then owns exactly one
+        # partition, so its consume() queue holds only that partition and any
+        # non-empty poll covers it -- avoiding the cross-partition delivery-order
+        # starvation that made this test flaky (CORE-13976). See the consume loop.
+        consumer_count = partition_count
         group = "test-lag-metrics-group"
         # Use a small batch size to ensure that fetches are distributed across all partitions
         batch_size = 1
         produce_msg_cnt_min = 1000
-        consume_count = (topic_count * partition_count * produce_msg_cnt_min) // (
-            2 * consumer_count
-        )
 
         self.redpanda.set_cluster_config(
             {
@@ -942,6 +972,12 @@ class ConsumerGroupTest(RedpandaTest):
             ]
         )
 
+        # Per-consumer librdkafka statistics, refreshed via stats_cb. Cheap to
+        # collect; only dumped on failure (see not_ready_diagnostic) to show the
+        # per-broker connection state and per-partition fetch state when a
+        # consumer stalls reading from a broker. See CORE-13976.
+        consumer_stats: dict[int, dict] = {}
+
         def create_consumer(instance_id: int) -> Consumer:
             return Consumer(
                 {
@@ -953,6 +989,10 @@ class ConsumerGroupTest(RedpandaTest):
                     "enable.auto.offset.store": True,
                     "enable.auto.commit": False,
                     "max.partition.fetch.bytes": batch_size,
+                    "statistics.interval.ms": 2000,
+                    "stats_cb": lambda s, i=instance_id: consumer_stats.__setitem__(
+                        i, json.loads(s)
+                    ),
                     "log_level": 7,
                     "debug": "cgrp",
                 },
@@ -1004,12 +1044,110 @@ class ConsumerGroupTest(RedpandaTest):
             self.logger.debug(f"  Produced {tp} - flushed {offset} msgs")
 
         self.logger.info("Consuming")
-        for consumer in consumers:
-            consumer.consume(num_messages=consume_count, timeout=10)
-            assert len(consumer.assignment()) != 0, (
-                "Consumer was not assigned any partitions"
-            )
-            self.logger.debug("  Consumed")
+
+        # Consume until every consumer has read at least one record from each of
+        # its assigned partitions, so that every partition ends up with a
+        # committed offset (and therefore a committed-offset/lag metric).
+
+        # assigned
+        # consumer -> set{(topic, partition)}
+        # For each consumer, set of partitions assigned as of most recent request
+        assigned: list[set[tuple[str, int]]] = [set() for _ in consumers]
+
+        # consumed_from
+        # consumer -> set{(topic, partition)}
+        # For each consumer, set of all partitions ever consumed from
+        consumed_from: list[set[tuple[str, int]]] = [set() for _ in consumers]
+
+        def is_consumer_ready(i):
+            """
+            For consumer i, returns True if the consumer has read from
+            all assigned partitions, False otherwise.
+            """
+            if not assigned[i]:
+                self.logger.debug(f"Consumer {i} was not assigned any partitions.")
+                return False
+            elif not assigned[i] <= consumed_from[i]:
+                not_yet_assigned = {
+                    str(p) for p in assigned[i] if p not in consumed_from[i]
+                }
+                self.logger.debug(
+                    f"Consumer {i} has not yet consumed from assigned "
+                    f"partitions: {', '.join(not_yet_assigned)}."
+                )
+                return False
+            else:
+                return True
+
+        def all_consumers_ready():
+            return all(map(is_consumer_ready, range(len(consumers))))
+
+        def consume_and_check_ready():
+            """
+            For each consumer:
+            - consume partition_count messages.
+            - set assigned with the resulting set of partitions assigned to the
+              consumer.
+            - update consumed_from with each partition consumed from
+
+            Return true once all partitions have read at least one message from
+            each partition to which they were most recently assigned.
+            """
+            for i, consumer in enumerate(consumers):
+                msgs = consumer.consume(num_messages=partition_count, timeout=1)
+                assigned[i] = {(tp.topic, tp.partition) for tp in consumer.assignment()}
+                for msg in msgs:
+                    if msg is None or msg.error() is not None:
+                        continue
+                    consumed_from[i].add((msg.topic(), msg.partition()))
+            return all_consumers_ready()
+
+        def not_ready_diagnostic() -> str:
+            """On timeout, dump each stalled consumer's assigned-but-unconsumed
+            partitions together with the librdkafka broker/partition state, so a
+            failure is self-diagnosing (which broker's fetch path stalled, and
+            whether it looks like a dead connection vs a stuck fetch)."""
+            lines = ["Timed out waiting for all partitions to be consumed"]
+            for i in range(len(consumers)):
+                missing = assigned[i] - consumed_from[i]
+                if assigned[i] and not missing:
+                    continue
+                stats = consumer_stats.get(i, {})
+                brokers = {
+                    b.get("nodeid"): {
+                        "state": b.get("state"),
+                        "rxidle_us": b.get("rxidle"),
+                    }
+                    for b in stats.get("brokers", {}).values()
+                    if b.get("nodeid", -1) >= 0
+                }
+                lines.append(
+                    f"consumer {i}: missing {sorted(missing)} of assigned "
+                    f"{sorted(assigned[i])}; brokers={brokers}"
+                )
+                for topic in stats.get("topics", {}).values():
+                    tname = topic.get("topic")
+                    for pid, p in topic.get("partitions", {}).items():
+                        try:
+                            key = (tname, int(pid))
+                        except ValueError:
+                            continue
+                        if key not in missing:
+                            continue
+                        lines.append(
+                            f"  {tname}/{pid}: leader={p.get('leader')} "
+                            f"fetch_state={p.get('fetch_state')} "
+                            f"next_offset={p.get('next_offset')} "
+                            f"rxbytes={p.get('rxbytes')} lag={p.get('consumer_lag')}"
+                        )
+            return "\n".join(lines)
+
+        wait_until(
+            consume_and_check_ready,
+            30,
+            1,
+            err_msg=not_ready_diagnostic,
+        )
 
         self.logger.info("Waiting for lag_metrics")
         time.sleep(wait_for_lag_secs)
@@ -1037,7 +1175,18 @@ class ConsumerGroupTest(RedpandaTest):
             hwm_by_tp = {}
             for s in metrics["redpanda_kafka_max_offset"].samples:
                 if s.labels["redpanda_topic"] in topics:
-                    key = tuple((k, v) for k, v in s.labels.items() if k != "node")
+                    # Group by partition identity only. Exclude "node" and
+                    # "shard": redpanda_kafka_max_offset is emitted per replica
+                    # and carries a per-shard "shard" label, and each broker
+                    # assigns a partition to a shard independently, so a single
+                    # partition's replicas otherwise spread across distinct
+                    # (node, shard) pairs and inflate the count past
+                    # partition_count.
+                    key = tuple(
+                        (k, v)
+                        for k, v in s.labels.items()
+                        if k not in ("node", "shard")
+                    )
                     hwm_by_tp.setdefault(key, []).append(s.value)
             return [max(hwm) for hwm in hwm_by_tp.values()]
 
@@ -1195,6 +1344,194 @@ class ConsumerGroupTest(RedpandaTest):
 
         for consumer in consumers:
             consumer.close()
+
+    @cluster(num_nodes=3)
+    def test_group_lag_metrics_with_retention(self):
+        """
+        Verify that consumer group lag metrics are not inflated when the
+        committed offset falls below the partition's log start offset due to
+        retention.  After trim-prefix advances log_start_offset past the
+        committed offset the lag gauges should report zero, not
+        hwm - committed_offset.
+        """
+        lag_collection_interval = 5
+        topic = "test-lag-retention"
+        group = "test-lag-retention-group"
+        partition = 0
+        msg_count = 1000
+        consume_count = 500
+
+        self.redpanda.set_cluster_config(
+            {
+                "enable_consumer_group_metrics": ["consumer_lag"],
+                "consumer_group_lag_collection_interval_sec": lag_collection_interval,
+            }
+        )
+
+        rpk = RpkTool(self.redpanda)
+
+        rpk.create_topic(topic, partitions=1, replicas=3)
+
+        producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+        for i in range(msg_count):
+            producer.produce(topic, value=f"msg-{i}")
+        producer.flush()
+
+        consumer = Consumer(
+            {
+                "bootstrap.servers": self.redpanda.brokers(),
+                "group.id": group,
+                "auto.offset.reset": "earliest",
+                "enable.auto.commit": False,
+            }
+        )
+        consumer.subscribe([topic])
+        consumed = consumer.consume(num_messages=consume_count, timeout=30)
+        assert len(consumed) == consume_count, (
+            f"Expected {consume_count} messages, got {len(consumed)}"
+        )
+        consumer.commit(asynchronous=False)
+        consumer.close()
+
+        def get_group_lag(metric_name) -> float | None:
+            samples = self.redpanda.metrics_samples(
+                [metric_name],
+                self.redpanda.started_nodes(),
+                MetricsEndpoint.PUBLIC_METRICS,
+            )
+            if samples is None:
+                return None
+            group_samples = (
+                samples[metric_name].label_filter({"redpanda_group": group}).samples
+            )
+            if not group_samples:
+                return None
+            return max(s.value for s in group_samples)
+
+        # Before trim-prefix: committed=500, hwm=1000, lag should be ~500.
+        # This confirms metrics are being collected before we apply the fix
+        # scenario, so the post-trim assertion is meaningful.
+        wait_until(
+            lambda: get_group_lag("redpanda_kafka_consumer_group_lag_max") is not None
+            and get_group_lag("redpanda_kafka_consumer_group_lag_max") > 0,
+            timeout_sec=30,
+            backoff_sec=1,
+            err_msg="Expected lag_max > 0 after commit but before trim-prefix",
+        )
+
+        # Advance log_start_offset past all produced messages so the committed
+        # offset becomes stale: lag = max(hwm - max(committed, lso), 0) = 0.
+        rpk.trim_prefix(topic, msg_count, partitions=[partition])
+
+        # Wait for the metric to reflect the trim — up to two extra intervals.
+        wait_until(
+            lambda: get_group_lag("redpanda_kafka_consumer_group_lag_max") == 0
+            and get_group_lag("redpanda_kafka_consumer_group_lag_sum") == 0,
+            timeout_sec=lag_collection_interval * 2 + 30,
+            backoff_sec=lag_collection_interval,
+            err_msg=(
+                f"Expected lag_max=0 and lag_sum=0 after trim-prefix past "
+                f"committed offset, got lag_max="
+                f"{get_group_lag('redpanda_kafka_consumer_group_lag_max')}, "
+                f"lag_sum="
+                f"{get_group_lag('redpanda_kafka_consumer_group_lag_sum')}"
+            ),
+        )
+
+    @cluster(num_nodes=3)
+    def test_group_lag_metrics_partial_retention(self):
+        """
+        Verify that when retention advances log_start_offset past the committed
+        offset but readable data still remains (log_start_offset < hwm), the lag
+        reflects the readable backlog (hwm - log_start_offset) rather than the
+        stale hwm - committed_offset or a fully-clamped zero.
+
+        This is the case that distinguishes the fix from a clamp-everything-to-
+        zero bug: trim-prefix lands between the committed offset and the hwm.
+        """
+        lag_collection_interval = 5
+        topic = "test-lag-partial-retention"
+        group = "test-lag-partial-retention-group"
+        partition = 0
+        msg_count = 1000
+        consume_count = 500
+        trim_offset = 700
+
+        self.redpanda.set_cluster_config(
+            {
+                "enable_consumer_group_metrics": ["consumer_lag"],
+                "consumer_group_lag_collection_interval_sec": lag_collection_interval,
+            }
+        )
+
+        rpk = RpkTool(self.redpanda)
+
+        rpk.create_topic(topic, partitions=1, replicas=3)
+
+        producer = Producer({"bootstrap.servers": self.redpanda.brokers()})
+        for i in range(msg_count):
+            producer.produce(topic, value=f"msg-{i}")
+        producer.flush()
+
+        consumer = Consumer(
+            {
+                "bootstrap.servers": self.redpanda.brokers(),
+                "group.id": group,
+                "auto.offset.reset": "earliest",
+                "enable.auto.commit": False,
+            }
+        )
+        consumer.subscribe([topic])
+        consumed = consumer.consume(num_messages=consume_count, timeout=30)
+        assert len(consumed) == consume_count, (
+            f"Expected {consume_count} messages, got {len(consumed)}"
+        )
+        consumer.commit(asynchronous=False)
+        consumer.close()
+
+        def get_group_lag(metric_name) -> float | None:
+            samples = self.redpanda.metrics_samples(
+                [metric_name],
+                self.redpanda.started_nodes(),
+                MetricsEndpoint.PUBLIC_METRICS,
+            )
+            if samples is None:
+                return None
+            group_samples = (
+                samples[metric_name].label_filter({"redpanda_group": group}).samples
+            )
+            if not group_samples:
+                return None
+            return max(s.value for s in group_samples)
+
+        # Trim-prefix to an offset between the committed offset (500) and the
+        # hwm (1000). The committed offset is now stale, but data in
+        # [trim_offset, hwm) is still consumable.
+        responses = rpk.trim_prefix(topic, trim_offset, partitions=[partition])
+        assert len(responses) == 1, f"Expected 1 trim response, got {responses}"
+        new_start_offset = responses[0].new_start_offset
+        assert new_start_offset == trim_offset, (
+            f"Expected new start offset {trim_offset}, got {new_start_offset}"
+        )
+
+        # lag = max(hwm - max(committed, log_start_offset), 0)
+        #     = max(1000 - max(500, 700), 0) = 300
+        expected_lag = msg_count - new_start_offset
+
+        wait_until(
+            lambda: get_group_lag("redpanda_kafka_consumer_group_lag_max")
+            == expected_lag
+            and get_group_lag("redpanda_kafka_consumer_group_lag_sum") == expected_lag,
+            timeout_sec=lag_collection_interval * 2 + 30,
+            backoff_sec=lag_collection_interval,
+            err_msg=(
+                f"Expected lag_max={expected_lag} and lag_sum={expected_lag} "
+                f"after partial trim-prefix, got lag_max="
+                f"{get_group_lag('redpanda_kafka_consumer_group_lag_max')}, "
+                f"lag_sum="
+                f"{get_group_lag('redpanda_kafka_consumer_group_lag_sum')}"
+            ),
+        )
 
 
 class TestConsumer:
@@ -1732,4 +2069,171 @@ class ConsumerGroupOffsetResetTest(RedpandaTest):
         tp = self.list_consumer_group_offsets(topic.name).topic_partitions[0]
         assert tp.offset == INVALID_OFFSET, (
             f"Expected offset '{INVALID_OFFSET}' but got '{tp.offset}', instead"
+        )
+
+
+class ReadReplicaConsumerLagTest(ReadReplicaE2EBase):
+    """
+    Regression test: consumer-group lag metrics must reflect the real,
+    cloud-aware high watermark for read-replica topics.
+
+    Bug: build_partition_status() reports a partition's high watermark as
+    from_log_offset(p.high_watermark()). For a read replica the local raft
+    log holds only the synced manifest (no data batches), so that value
+    translates to ~0 in the Kafka offset space — instead of the real cloud
+    high watermark (next_cloud_offset). The health-report HWM consumed by
+    group_manager's lag metric is therefore 0, and the reported lag collapses
+    to 0 regardless of the committed offset.
+
+    The Kafka-visible HWM (rpk / list_offsets) is NOT affected, because it
+    goes through replicated_partition::high_watermark() -> kafka_high_watermark(),
+    which has a read-replica branch returning next_cloud_offset().
+
+    This test pins the committed offset to 0 so the reported lag reduces to
+    exactly the health-report HWM:
+
+        lag = max(hwm_report - max(committed=0, log_start_offset~0), 0)
+            = hwm_report
+
+    With the fix (build_partition_status using kafka_high_watermark()),
+    hwm_report == kafka_hwm and the asserted lag == kafka_hwm. On the unfixed
+    code hwm_report == 0, so this assertion FAILS — which is the proof that
+    the bug is real.
+
+    Lives alongside the single-cluster test_group_lag_metrics_* tests above,
+    but in its own class because it needs the read-replica (tiered storage +
+    second cluster) setup from ReadReplicaE2EBase.
+    """
+
+    LAG_COLLECTION_INTERVAL = 5
+    GROUP = "rr-consumer-lag-group"
+
+    # 3 nodes: source broker (1) + producer (1) + read-replica broker (1).
+    # The consumer is an in-process confluent_kafka client, not a ducktape
+    # service, so it needs no node of its own.
+    @cluster(num_nodes=3, log_allow_list=READ_REPLICA_LOG_ALLOW_LIST)
+    @matrix(cloud_storage_type=get_cloud_storage_type(docker_use_arbitrary=True))
+    def test_group_lag_metrics_read_replica(self, cloud_storage_type):
+        num_messages = 1000
+        partition = 0
+
+        # Source: tiered-storage topic with data; then a synced read replica.
+        # Single partition keeps the offset arithmetic unambiguous.
+        self._setup_read_replica(
+            num_messages=num_messages,
+            partition_count=1,
+            num_source_brokers=1,
+            num_rrr_brokers=1,
+            replication_factor=1,
+        )
+
+        rr = self.second_cluster
+        assert rr is not None
+
+        # The consumer group lives on the read-replica cluster, so the lag
+        # metric is collected there — enable it there.
+        rr.set_cluster_config(
+            {
+                "enable_consumer_group_metrics": ["consumer_lag"],
+                "consumer_group_lag_collection_interval_sec": self.LAG_COLLECTION_INTERVAL,
+            }
+        )
+
+        # Kafka-visible HWM on the read replica (via list_offsets). This is the
+        # CORRECT, cloud-aware HWM and proves the data is really readable.
+        id_to_hwm = wait_until_result(
+            lambda: get_hwm_per_partition(rr, self.topic_name, 1),
+            timeout_sec=60,
+            backoff_sec=2,
+        )
+        kafka_hwm = id_to_hwm[partition]
+        # Guard against a false pass: the final assertion is lag == kafka_hwm,
+        # and the bug makes the reported lag 0. If kafka_hwm were also 0 (data
+        # not yet synced to the replica) that assertion would trivially hold
+        # (0 == 0) even on buggy code. Requiring kafka_hwm > 0 ensures the
+        # comparison actually distinguishes the bug (0) from the fix
+        # (kafka_hwm). We don't assert an exact count: the producer overshoots
+        # num_messages and only uploaded/synced offsets reach the replica.
+        assert kafka_hwm > 0, (
+            f"expected a non-zero Kafka HWM on the read replica, got {kafka_hwm}"
+        )
+
+        # Create the group on the read replica and force its committed offset
+        # to 0. With committed == 0 the reported lag reduces to exactly the
+        # health-report HWM, so the metric value below directly reveals it.
+        consumer = Consumer(
+            {
+                "bootstrap.servers": rr.brokers(),
+                "group.id": self.GROUP,
+                "auto.offset.reset": "earliest",
+                "enable.auto.commit": False,
+            }
+        )
+        try:
+            consumer.subscribe([self.topic_name])
+            # Poll once to join the group and get the partition assigned.
+            consumer.poll(timeout=30)
+            consumer.commit(
+                offsets=[TopicPartition(self.topic_name, partition, 0)],
+                asynchronous=False,
+            )
+            committed = consumer.committed(
+                [TopicPartition(self.topic_name, partition)]
+            )[0].offset
+        finally:
+            consumer.close()
+
+        assert committed == 0, f"expected committed offset 0, got {committed}"
+        self.logger.info(
+            f"read replica: Kafka HWM={kafka_hwm}, committed={committed}, "
+            f"expected (Kafka-visible) lag={kafka_hwm}"
+        )
+
+        def get_group_lag(metric_name: str) -> float | None:
+            samples = rr.metrics_samples(
+                [metric_name],
+                rr.started_nodes(),
+                MetricsEndpoint.PUBLIC_METRICS,
+            )
+            if metric_name not in samples:
+                return None
+            group_samples = (
+                samples[metric_name]
+                .label_filter({"redpanda_group": self.GROUP})
+                .samples
+            )
+            if not group_samples:
+                return None
+            return max(s.value for s in group_samples)
+
+        # Wait until the metric is being collected for this group at all
+        # (gives at least one collection cycle after the commit).
+        wait_until(
+            lambda: get_group_lag("redpanda_kafka_consumer_group_lag_max") is not None,
+            timeout_sec=self.LAG_COLLECTION_INTERVAL * 2 + 30,
+            backoff_sec=self.LAG_COLLECTION_INTERVAL,
+            err_msg="consumer_group_lag_max metric never appeared for the group",
+        )
+
+        # With committed == 0 the reported lag equals the health-report HWM.
+        # It must equal the real, Kafka-visible HWM. On the unfixed code the
+        # health-report HWM for a read replica is 0 (the local manifest-log
+        # position), so this fails with lag_max == 0 — the proof of the bug.
+        def lag_matches_cloud_hwm() -> bool:
+            lag_max = get_group_lag("redpanda_kafka_consumer_group_lag_max")
+            lag_sum = get_group_lag("redpanda_kafka_consumer_group_lag_sum")
+            self.logger.info(
+                f"observed lag_max={lag_max}, lag_sum={lag_sum}, expected={kafka_hwm}"
+            )
+            return lag_max == kafka_hwm and lag_sum == kafka_hwm
+
+        wait_until(
+            lag_matches_cloud_hwm,
+            timeout_sec=self.LAG_COLLECTION_INTERVAL * 2 + 30,
+            backoff_sec=self.LAG_COLLECTION_INTERVAL,
+            err_msg=(
+                f"consumer-group lag did not reflect the cloud HWM "
+                f"({kafka_hwm}) for the read replica. A reported lag of 0 "
+                f"means the health-report HWM is 0 (read-replica HWM bug)."
+            ),
         )

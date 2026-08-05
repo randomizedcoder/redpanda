@@ -10,6 +10,7 @@
  */
 #include "container/chunked_vector.h"
 #include "kafka/protocol/schemata/produce_request.h"
+#include "kafka/protocol/wire.h"
 #include "kafka/server/handlers/produce.h"
 #include "model/fundamental.h"
 #include "random/generators.h"
@@ -39,6 +40,7 @@ struct produce_partition_fixture : redpanda_thread_fixture {
     static constexpr size_t total_partition_count = 1;
 
     model::topic t;
+    int32_t idempotent_seq{0};
 
     produce_partition_fixture() {
         BOOST_TEST_CHECKPOINT("before leadership");
@@ -72,18 +74,39 @@ produce_partition_fixture::run_test(size_t data_size, measured_region region) {
     storage::record_batch_builder builder(
       model::record_batch_type::raft_data, model::offset{0});
 
-    constexpr size_t num_records = 100;
+    constexpr size_t num_records = 1;
     for (size_t i = 0; i < num_records; ++i) {
         builder.add_raw_kv(iobuf{}, rand_iobuf(data_size));
     }
 
     auto batch = std::move(builder).build();
 
+    // Make it idempotent
+    batch.header().producer_id = 1;
+    batch.header().producer_epoch = 0;
+    batch.header().base_sequence = idempotent_seq;
+    idempotent_seq += num_records;
+    batch.header().reset_size_checksum_metadata(batch.data());
+
+    // Reproduce the iobuf fragment layout of a real produce request: serialize
+    // the batch to the kafka wire format and decode it through the batch
+    // adapter, exactly as the produce request decode path does. The records
+    // then live in a contiguous slice of the request buffer (as they do in
+    // production) rather than in the per-record fragments that
+    // record_batch_builder produces.
+    iobuf wire;
+    kafka::protocol::encoder writer(wire);
+    kafka::protocol::writer_serialize_batch(writer, std::move(batch));
+    auto records = kafka::produce_request_record_data(
+      std::make_optional(wire.copy()), kafka::produce_handler::max_supported);
+    vassert(
+      records.adapter.valid_crc, "batch must round-trip with a valid crc");
+
     chunked_vector<kafka::produce_request::partition> partitions;
     partitions.push_back(
       kafka::produce_request::partition{
         .partition_index{model::partition_id(0)},
-        .records = kafka::produce_request_record_data(std::move(batch))});
+        .records = std::move(records)});
 
     chunked_vector<kafka::produce_request::topic> topics;
     topics.push_back(

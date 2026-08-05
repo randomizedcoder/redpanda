@@ -53,11 +53,10 @@ ss::future<ss::stop_iteration> put_entry(
 ss::future<bool> is_latest_record_for_enhanced_key(
   const compaction::key_offset_map& map,
   const model::record_batch& b,
-  const model::record& r) {
-    const auto o = b.base_offset() + model::offset_delta(r.offset_delta());
-    auto key_view = compaction::compaction_key{iobuf_to_bytes(r.key())};
+  const model::record_key_metadata& r) {
+    const auto o = b.base_offset() + model::offset_delta(r.offset_delta);
     auto key = enhance_key(
-      b.header().type, b.header().attrs.is_control(), key_view);
+      b.header().type, b.header().attrs.is_control(), r.key);
 
     auto latest_offset_indexed = co_await map.get(key);
     // If the map hasn't indexed the given key, we should keep the
@@ -147,7 +146,7 @@ ss::future<model::offset> build_offset_map(
         vlog(gclog.trace, "Adding segment to offset map: {}", seg->filename());
 
         try {
-            auto read_lock = co_await seg->read_lock();
+            auto read_lock = co_await seg->read_lock(*cfg.asrc);
             co_await internal::maybe_rebuild_compaction_index(
               seg,
               stm_hookset,
@@ -198,7 +197,7 @@ ss::future<index_state> deduplicate_segment(
   offset_delta_time should_offset_delta_times,
   ss::sharded<features::feature_table>& feature_table,
   bool inject_reader_failure) {
-    auto read_holder = co_await seg->read_lock();
+    auto read_holder = co_await seg->read_lock(*cfg.asrc);
     if (seg->is_closed()) {
         throw segment_closed_exception();
     }
@@ -219,9 +218,10 @@ ss::future<index_state> deduplicate_segment(
     bool may_have_transaction_control_batches = false;
     bool may_have_transaction_data_or_fence_batches = false;
 
-    auto is_latest_record = [&map](
-                              const model::record_batch& b,
-                              const model::record& r) -> ss::future<bool> {
+    auto is_latest_record =
+      [&map](
+        const model::record_batch& b,
+        const model::record_key_metadata& r) -> ss::future<bool> {
         return is_latest_record_for_enhanced_key(map, b, r);
     };
 
@@ -238,7 +238,7 @@ ss::future<index_state> deduplicate_segment(
                           &may_have_transaction_data_or_fence_batches,
                           tx_batch_compaction_enabled](
                            const model::record_batch& b,
-                           const model::record& r,
+                           const model::record_key_metadata& r,
                            bool is_last_record_in_batch) {
         return internal::should_keep(
           b,
@@ -326,7 +326,7 @@ ss::future<bool> index_chunk_of_segment_for_map(
         throw segment_closed_exception();
     }
     co_await map.reset();
-    auto read_holder = co_await seg->read_lock();
+    auto read_holder = co_await seg->read_lock(*compact_cfg.asrc);
     auto start_offset_inclusive = model::next_offset(last_indexed_offset);
     auto rdr = internal::create_segment_full_reader(
       seg, compact_cfg, pb, std::move(read_holder), start_offset_inclusive);

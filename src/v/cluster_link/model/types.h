@@ -15,6 +15,7 @@
 #include "base/format_to.h"
 #include "cluster_link/errc.h"
 #include "container/chunked_hash_map.h"
+#include "container/chunked_vector.h"
 #include "kafka/protocol/topic_properties.h"
 #include "model/fundamental.h"
 #include "model/metadata.h"
@@ -27,6 +28,7 @@
 #include "serde/rw/map.h"
 #include "serde/rw/named_type.h"
 #include "serde/rw/optional.h"
+#include "serde/rw/set.h"
 #include "serde/rw/variant.h"
 #include "serde/rw/vector.h"
 #include "utils/absl_sstring_hash.h"
@@ -68,6 +70,7 @@ inline auto default_synced_topic_properties = std::to_array<std::string_view>({
   kafka::topic_property_min_compaction_lag_ms,
   kafka::topic_property_max_compaction_lag_ms,
   kafka::topic_property_redpanda_storage_mode,
+  kafka::topic_property_redpanda_storage_mode_impl,
 });
 
 /// List of topic properties that are not permitted to be synced
@@ -519,7 +522,7 @@ struct topic_metadata_mirroring_config
 struct schema_registry_sync_config
   : serde::envelope<
       schema_registry_sync_config,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     struct shadow_entire_schema_registry
       : serde::envelope<
@@ -535,17 +538,202 @@ struct schema_registry_sync_config
         fmt::iterator format_to(fmt::iterator) const;
     };
 
-    using shadow_schema_registry_mode_t
-      = serde::variant<shadow_entire_schema_registry>;
+    struct basic_auth
+      : serde::
+          envelope<basic_auth, serde::version<0>, serde::compat_version<0>> {
+        ss::sstring username;
+        ss::sstring password;
+        ::model::timestamp password_last_updated;
 
-    std::optional<shadow_schema_registry_mode_t>
-      sync_schema_registry_topic_mode;
+        friend bool operator==(const basic_auth&, const basic_auth&) = default;
 
-    auto serde_fields() { return std::tie(sync_schema_registry_topic_mode); }
+        auto serde_fields() {
+            return std::tie(username, password, password_last_updated);
+        }
+
+        fmt::iterator format_to(fmt::iterator) const;
+    };
+
+    using auth_config_t = serde::variant<basic_auth>;
+
+    struct source_filter
+      : serde::
+          envelope<source_filter, serde::version<0>, serde::compat_version<0>> {
+        chunked_vector<ss::sstring> contexts;
+        chunked_vector<ss::sstring> subjects;
+
+        friend bool
+        operator==(const source_filter&, const source_filter&) = default;
+
+        auto serde_fields() { return std::tie(contexts, subjects); }
+
+        source_filter copy() const;
+
+        fmt::iterator format_to(fmt::iterator) const;
+    };
+
+    struct identity_context_mapping
+      : serde::envelope<
+          identity_context_mapping,
+          serde::version<0>,
+          serde::compat_version<0>> {
+        friend bool operator==(
+          const identity_context_mapping&,
+          const identity_context_mapping&) = default;
+
+        auto serde_fields() { return std::tie(); }
+
+        fmt::iterator format_to(fmt::iterator) const;
+    };
+
+    struct exact_context_mapping
+      : serde::envelope<
+          exact_context_mapping,
+          serde::version<0>,
+          serde::compat_version<0>> {
+        // Source context name -> destination context name. The shadowing API
+        // requires every source context in scope to have exactly one mapping,
+        // so a map keyed by source encodes that uniqueness invariant and gives
+        // O(1) destination lookup during sync.
+        chunked_hash_map<ss::sstring, ss::sstring> mappings;
+
+        friend bool operator==(
+          const exact_context_mapping&, const exact_context_mapping&) = default;
+
+        auto serde_fields() { return std::tie(mappings); }
+
+        exact_context_mapping copy() const;
+
+        fmt::iterator format_to(fmt::iterator) const;
+    };
+
+    using destination_mapping_t
+      = serde::variant<identity_context_mapping, exact_context_mapping>;
+
+    enum class unsupported_feature_policy : uint8_t {
+        fail,
+        remove,
+    };
+
+    struct shadow_schema_registry_api
+      : serde::envelope<
+          shadow_schema_registry_api,
+          serde::version<1>,
+          serde::compat_version<0>> {
+        ss::sstring source_url;
+        std::optional<auth_config_t> auth_config;
+
+        connection_config::tls_enabled_t tls_enabled{
+          connection_config::tls_enabled_t::no};
+        std::optional<tls_file_or_value> cert;
+        std::optional<tls_file_or_value> key;
+        std::optional<tls_file_or_value> ca;
+        connection_config::tls_provide_sni_t tls_provide_sni{
+          connection_config::tls_provide_sni_t::yes};
+
+        std::optional<ss::lowres_clock::duration> tail_interval;
+        static constexpr auto default_tail_interval = std::chrono::seconds(10);
+        std::optional<ss::lowres_clock::duration> full_sync_interval;
+        static constexpr auto default_full_sync_interval = std::chrono::minutes(
+          5);
+        std::optional<int32_t> max_source_requests_per_second;
+        static constexpr auto default_max_source_requests_per_second = 30;
+
+        source_filter filter;
+        std::optional<destination_mapping_t> destination;
+        unsupported_feature_policy feature_policy{
+          unsupported_feature_policy::fail};
+
+        /// Whether the Schema Registry sync task is enabled. When disabled
+        /// (the user paused the task) it enters the 'paused' state, stops
+        /// replicating schemas, and the per-context client write protection on
+        /// the contexts this link owns is lifted.
+        enabled_t is_enabled{enabled_t::yes};
+
+        ss::lowres_clock::duration get_tail_interval() const {
+            return tail_interval.value_or(default_tail_interval);
+        }
+
+        ss::lowres_clock::duration get_full_sync_interval() const {
+            return full_sync_interval.value_or(default_full_sync_interval);
+        }
+
+        int32_t get_max_source_requests_per_second() const {
+            return max_source_requests_per_second.value_or(
+              default_max_source_requests_per_second);
+        }
+
+        friend bool operator==(
+          const shadow_schema_registry_api&,
+          const shadow_schema_registry_api&) = default;
+
+        auto serde_fields() {
+            return std::tie(
+              source_url,
+              auth_config,
+              tls_enabled,
+              cert,
+              key,
+              ca,
+              tls_provide_sni,
+              tail_interval,
+              full_sync_interval,
+              max_source_requests_per_second,
+              filter,
+              destination,
+              feature_policy,
+              is_enabled);
+        }
+
+        shadow_schema_registry_api copy() const;
+
+        fmt::iterator format_to(fmt::iterator) const;
+    };
+
+    // At most one shadowing mode may be engaged. Modelling the two modes as a
+    // single variant makes the "both modes set" state unrepresentable. The
+    // on-wire layout still serializes as two separate optional fields (see
+    // serde_write/serde_read) to stay backwards compatible with v0 topic-mode
+    // records.
+    using shadow_schema_registry_mode_t = serde::
+      variant<shadow_entire_schema_registry, shadow_schema_registry_api>;
+
+    std::optional<shadow_schema_registry_mode_t> sync_mode;
+
+    /// Returns the API-based shadowing config when API mode is engaged, else
+    /// nullptr.
+    const shadow_schema_registry_api* api_mode() const {
+        if (
+          sync_mode.has_value()
+          && std::holds_alternative<shadow_schema_registry_api>(*sync_mode)) {
+            return &std::get<shadow_schema_registry_api>(*sync_mode);
+        }
+        return nullptr;
+    }
+    shadow_schema_registry_api* api_mode() {
+        if (
+          sync_mode.has_value()
+          && std::holds_alternative<shadow_schema_registry_api>(*sync_mode)) {
+            return &std::get<shadow_schema_registry_api>(*sync_mode);
+        }
+        return nullptr;
+    }
+
+    /// True when shadowing the entire Schema Registry via topic replication.
+    bool is_topic_mode() const {
+        return sync_mode.has_value()
+               && std::holds_alternative<shadow_entire_schema_registry>(
+                 *sync_mode);
+    }
+
+    void serde_write(iobuf&) const;
+    void serde_read(iobuf_parser&, const serde::header&);
 
     friend bool operator==(
       const schema_registry_sync_config&,
       const schema_registry_sync_config&) = default;
+
+    schema_registry_sync_config copy() const;
 
     fmt::iterator format_to(fmt::iterator) const;
 };
@@ -780,13 +968,44 @@ struct security_settings_sync_config
 };
 
 /**
+ * Configuration for syncing RBAC roles
+ */
+struct role_sync_config
+  : serde::
+      envelope<role_sync_config, serde::version<0>, serde::compat_version<0>> {
+    /// Flag to indicate if the task is enabled or not
+    enabled_t is_enabled{enabled_t::yes};
+    /// Interval for the role sync task
+    std::optional<ss::lowres_clock::duration> task_interval;
+    /// Default interval
+    static constexpr auto task_interval_default = std::chrono::seconds{30};
+
+    ss::lowres_clock::duration get_task_interval() const {
+        return task_interval.value_or(task_interval_default);
+    }
+
+    /// Filters selecting which roles to shadow, by role name. Defaults to
+    /// empty: no roles are synced until at least one include filter is added.
+    chunked_vector<resource_name_filter_pattern> role_name_filters;
+
+    friend bool
+    operator==(const role_sync_config&, const role_sync_config&) = default;
+
+    auto serde_fields() {
+        return std::tie(is_enabled, task_interval, role_name_filters);
+    }
+
+    role_sync_config copy() const;
+};
+
+/**
  * Configuration of a cluster link. Configuration changes are driven by the
  * API and are a result of user actions.
  */
 struct link_configuration
   : serde::envelope<
       link_configuration,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     /// Configuration for the auto mirror topic creation task
     topic_metadata_mirroring_config topic_metadata_mirroring_cfg;
@@ -796,6 +1015,8 @@ struct link_configuration
     security_settings_sync_config security_settings_sync_cfg;
     /// Configuration for syncing schema registry
     schema_registry_sync_config schema_registry_sync_cfg;
+    /// Configuration for syncing RBAC roles
+    role_sync_config role_sync_cfg;
 
     friend bool
     operator==(const link_configuration&, const link_configuration&) = default;
@@ -805,7 +1026,8 @@ struct link_configuration
           topic_metadata_mirroring_cfg,
           consumer_groups_mirroring_cfg,
           security_settings_sync_cfg,
-          schema_registry_sync_cfg);
+          schema_registry_sync_cfg,
+          role_sync_cfg);
     }
 
     link_configuration copy() const;
@@ -1024,11 +1246,128 @@ struct update_cluster_link_configuration_cmd
     update_cluster_link_configuration_cmd copy() const;
 };
 
+/// Type of Schema Registry sync currently running. Mirrors the admin proto
+/// SchemaRegistrySyncType.
+enum class schema_registry_sync_type : uint8_t {
+    full,
+    tail,
+};
+
+/// Last observed source and destination Schema Registry inventory.
+struct schema_registry_inventory
+  : serde::envelope<
+      schema_registry_inventory,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // Counts are non-negative; the admin proto uses int64 for
+    // connectrpc/json, the converter narrows at the boundary.
+    uint64_t selected_source_subjects{0};
+    uint64_t selected_source_subject_versions{0};
+    uint64_t destination_subjects{0};
+    uint64_t destination_subject_versions{0};
+
+    friend bool operator==(
+      const schema_registry_inventory&,
+      const schema_registry_inventory&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          selected_source_subjects,
+          selected_source_subject_versions,
+          destination_subjects,
+          destination_subject_versions);
+    }
+};
+
+/// Summary counters for one Schema Registry sync or a cumulative interval.
+struct schema_registry_sync_summary
+  : serde::envelope<
+      schema_registry_sync_summary,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    std::optional<::model::timestamp> start_time;
+    std::optional<::model::timestamp> finish_time;
+    uint64_t subject_versions_changed{0};
+    uint64_t compatibility_configs_changed{0};
+    uint64_t modes_changed{0};
+    uint64_t unsupported_features_removed{0};
+    uint64_t errors{0};
+
+    friend bool operator==(
+      const schema_registry_sync_summary&,
+      const schema_registry_sync_summary&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          start_time,
+          finish_time,
+          subject_versions_changed,
+          compatibility_configs_changed,
+          modes_changed,
+          unsupported_features_removed,
+          errors);
+    }
+};
+
+/// A Schema Registry sync that is currently running.
+struct schema_registry_current_sync
+  : serde::envelope<
+      schema_registry_current_sync,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    schema_registry_sync_type sync_type{schema_registry_sync_type::full};
+    schema_registry_sync_summary summary;
+
+    friend bool operator==(
+      const schema_registry_current_sync&,
+      const schema_registry_current_sync&) = default;
+
+    auto serde_fields() { return std::tie(sync_type, summary); }
+};
+
+/// Status of Schema Registry syncing for a link. Mirrors the admin proto
+/// SchemaRegistrySyncStatus.
+struct schema_registry_sync_status
+  : serde::envelope<
+      schema_registry_sync_status,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    schema_registry_inventory inventory;
+    std::optional<schema_registry_current_sync> current_sync;
+    std::optional<schema_registry_sync_summary> last_full_sync;
+    schema_registry_sync_summary totals_since_task_start;
+    ss::sstring last_error_message;
+
+    friend bool operator==(
+      const schema_registry_sync_status&,
+      const schema_registry_sync_status&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          inventory,
+          current_sync,
+          last_full_sync,
+          totals_since_task_start,
+          last_error_message);
+    }
+};
+
+/// Task-specific status detail. Each task type that reports extra status adds
+/// its own optional member here (append-only, for serde compatibility).
+struct task_detail
+  : serde::envelope<task_detail, serde::version<0>, serde::compat_version<0>> {
+    std::optional<schema_registry_sync_status> schema_registry_sync_status;
+
+    friend bool operator==(const task_detail&, const task_detail&) = default;
+
+    auto serde_fields() { return std::tie(schema_registry_sync_status); }
+};
+
 /// Status report for a task
 struct task_status_report
   : serde::envelope<
       task_status_report,
-      serde::version<0>,
+      serde::version<1>,
       serde::compat_version<0>> {
     ss::sstring task_name;
     task_state task_state;
@@ -1039,6 +1378,8 @@ struct task_status_report
       is_controller_locked_task_t::no};
     ::model::node_id node_id;
     ss::shard_id shard;
+    /// Task-specific status, set only by tasks that report extra detail.
+    std::optional<task_detail> detail;
     friend bool
     operator==(const task_status_report&, const task_status_report&) = default;
 
@@ -1049,7 +1390,8 @@ struct task_status_report
           task_state_reason,
           is_controller_locked_task,
           node_id,
-          shard);
+          shard,
+          detail);
     }
 };
 
@@ -1557,6 +1899,14 @@ struct fmt::formatter<cluster_link::model::security_settings_sync_config>
     auto format(
       const cluster_link::model::security_settings_sync_config& m,
       format_context& ctx) const -> decltype(ctx.out());
+};
+
+template<>
+struct fmt::formatter<cluster_link::model::role_sync_config>
+  : fmt::formatter<string_view> {
+    auto format(
+      const cluster_link::model::role_sync_config& m, format_context& ctx) const
+      -> decltype(ctx.out());
 };
 
 template<>

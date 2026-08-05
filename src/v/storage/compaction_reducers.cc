@@ -118,11 +118,11 @@ compacted_offset_list_reducer::operator()(compacted_index::entry&& e) {
 
 ss::future<> copy_data_segment_reducer::maybe_keep_offset(
   const model::record_batch& batch,
-  const model::record& r,
+  model::record_key_metadata r,
   bool is_last_record_in_batch,
   chunked_vector<int32_t>& offset_deltas) {
     if (co_await _should_keep_fn(batch, r, is_last_record_in_batch)) {
-        offset_deltas.push_back(r.offset_delta());
+        offset_deltas.push_back(r.offset_delta);
         co_return;
     }
 }
@@ -171,11 +171,15 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
     offset_deltas.reserve(batch.record_count());
 
     int32_t records_seen = 0;
-    co_await batch.for_each_record_async(
-      [this, &batch, &offset_deltas, &records_seen](const model::record& r) {
+    co_await batch.for_each_record_key_async(
+      [this, &batch, &offset_deltas, &records_seen](
+        model::record_key_metadata r) {
           ++records_seen;
           return maybe_keep_offset(
-            batch, r, batch.record_count() == records_seen, offset_deltas);
+            batch,
+            std::move(r),
+            batch.record_count() == records_seen,
+            offset_deltas);
       });
 
     if (offset_deltas.empty() && _compaction_placeholder_enabled) {
@@ -230,19 +234,29 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
     // 4. filter
     iobuf ret;
     int32_t rec_count = 0;
+    // Re-base surviving records onto the first surviving record's timestamp, as
+    // Kafka does on compaction (MemoryRecordsBuilder.appendWithOffset). Records
+    // are dropped in offset order, so the first kept record sets the new batch
+    // first_timestamp; every kept delta is re-based relative to it, and we
+    // track the greatest re-based delta for MaxTimestamp.
     std::optional<int64_t> first_timestamp_delta;
-    int64_t last_timestamp_delta;
+    int64_t max_timestamp_delta = 0;
+    // We expect and enforce that offset_deltas is sorted.
+    dassert(
+      std::ranges::is_sorted(offset_deltas),
+      "offset_deltas must be ascending in record-iteration order");
+    size_t keep_idx = 0;
     batch.for_each_record([&rec_count,
                            &first_timestamp_delta,
-                           &last_timestamp_delta,
+                           &max_timestamp_delta,
                            &ret,
+                           &keep_idx,
                            &offset_deltas](model::record record) {
         // contains the key
         if (
-          std::count(
-            offset_deltas.begin(),
-            offset_deltas.end(),
-            record.offset_delta())) {
+          keep_idx < offset_deltas.size()
+          && offset_deltas[keep_idx] == record.offset_delta()) {
+            ++keep_idx;
             /*
              * TODO when we further optimize lazy record materialization ot
              * make use of views we can avoid this re-encoding by copying or
@@ -253,7 +267,12 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
             if (!first_timestamp_delta) {
                 first_timestamp_delta = record.timestamp_delta();
             }
-            last_timestamp_delta = record.timestamp_delta();
+            const auto rebased = record.timestamp_delta()
+                                 - *first_timestamp_delta;
+            if (rebased > max_timestamp_delta) {
+                max_timestamp_delta = rebased;
+            }
+            record.set_timestamp_delta(rebased);
             model::append_record_to_buffer(ret, record);
             ++rec_count;
         }
@@ -285,24 +304,16 @@ copy_data_segment_reducer::filter(model::record_batch batch) {
         co_return std::nullopt;
     }
 
-    // There is no similar need to preserve the timestamp from the original
-    // batch after compaction. The FirstTimestamp field therefore always
-    // reflects the timestamp of the first record in the batch. If the batch is
-    // empty, the FirstTimestamp will be set to -1 (NO_TIMESTAMP).
-    //
-    // Similarly, the MaxTimestamp field reflects the maximum timestamp of the
-    // current records if the timestamp type is CREATE_TIME. For
-    // LOG_APPEND_TIME, on the other hand, the MaxTimestamp field reflects the
-    // timestamp set by the broker and is preserved after compaction.
-    // Additionally, the MaxTimestamp of an empty batch always retains the
-    // previous value prior to becoming empty.
-    //
+    // Header timestamps for the re-encoded batch: first_timestamp = first
+    // surviving record (deltas were re-based onto it above); max_timestamp =
+    // greatest surviving timestamp for CREATE_TIME, or the preserved broker
+    // value for LOG_APPEND_TIME.
     auto& hdr = batch.header();
     const auto first_time = model::timestamp(
       hdr.first_timestamp() + first_timestamp_delta.value());
     auto last_time = hdr.max_timestamp;
     if (hdr.attrs.timestamp_type() == model::timestamp_type::create_time) {
-        last_time = model::timestamp(first_time() + last_timestamp_delta);
+        last_time = model::timestamp(first_time() + max_timestamp_delta);
     }
     auto new_hdr = hdr;
 
@@ -358,15 +369,15 @@ ss::future<ss::stop_iteration> copy_data_segment_reducer::filter_and_append(
         ++_stats.non_compactible_batches;
     }
     if (_compacted_idx && compactible_batch) {
-        co_await model::for_each_record(
-          batch, [&batch, this](const model::record& r) {
+        co_await batch.for_each_record_key_async(
+          [&batch, this](model::record_key_metadata r) {
               auto& hdr = batch.header();
               return _compacted_idx->index(
                 hdr.type,
                 hdr.attrs.is_control(),
-                r.key(),
+                std::move(r.key),
                 batch.base_offset(),
-                r.offset_delta());
+                r.offset_delta);
           });
     }
     using result = filtered_batch::result;
@@ -464,17 +475,14 @@ index_rebuilder_reducer::operator()(model::record_batch b) {
     co_return stop_t::no;
 }
 
-ss::future<> index_rebuilder_reducer::do_index(model::record_batch&& b) {
-    return ss::do_with(std::move(b), [this](model::record_batch& b) {
-        return model::for_each_record(
-          b,
-          [this,
-           bt = b.header().type,
-           ctrl = b.header().attrs.is_control(),
-           o = b.base_offset()](model::record& r) {
-              return _w->index(bt, ctrl, r.key(), o, r.offset_delta());
-          });
-    });
+ss::future<> index_rebuilder_reducer::do_index(model::record_batch b) {
+    co_await b.for_each_record_key_async(
+      [this,
+       bt = b.header().type,
+       ctrl = b.header().attrs.is_control(),
+       o = b.base_offset()](model::record_key_metadata r) {
+          return _w->index(bt, ctrl, std::move(r.key), o, r.offset_delta);
+      });
 }
 
 void tx_reducer::refresh_ongoing_aborted_txs(const model::record_batch& b) {
@@ -542,18 +550,17 @@ ss::future<ss::stop_iteration> tx_reducer::operator()(model::record_batch&& b) {
 }
 
 ss::future<ss::stop_iteration> map_building_reducer::maybe_index_record_in_map(
-  const model::record& r,
+  model::record_key_metadata record,
   model::offset base_offset,
   model::record_batch_type type,
   bool is_control,
   bool& fully_indexed_batch) {
-    auto offset = base_offset + model::offset_delta(r.offset_delta());
+    auto offset = base_offset + model::offset_delta(record.offset_delta);
     if (offset < _start_offset) {
         co_return ss::stop_iteration::no;
     }
 
-    auto key_view = iobuf_to_bytes(r.key());
-    auto key = enhance_key(type, is_control, key_view);
+    auto key = enhance_key(type, is_control, record.key);
     bool success = co_await _map->put(key, offset);
 
     if (success) {
@@ -578,15 +585,15 @@ map_building_reducer::operator()(model::record_batch batch) {
         batch = co_await model::decompress_batch(batch);
     }
     // is_control must be false below due to above `is_compactible()` check.
-    co_await batch.for_each_record_async(
+    co_await batch.for_each_record_key_async(
       [this,
        &fully_indexed_batch,
        base_offset = batch.base_offset(),
        type = header.type,
        is_control = false](
-        const model::record& r) -> ss::future<ss::stop_iteration> {
+        model::record_key_metadata r) -> ss::future<ss::stop_iteration> {
           return maybe_index_record_in_map(
-            r, base_offset, type, is_control, fully_indexed_batch);
+            std::move(r), base_offset, type, is_control, fully_indexed_batch);
       });
 
     if (fully_indexed_batch) {

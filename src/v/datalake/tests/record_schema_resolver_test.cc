@@ -583,6 +583,8 @@ class counting_registry : public schema::registry {
 public:
     bool is_enabled() const override { return true; };
 
+    ss::future<> ensure_internal_topic() override { return ss::now(); }
+
     ss::future<pandaproxy::schema_registry::schema_getter*>
     getter() const override {
         co_return &_store;
@@ -608,9 +610,81 @@ public:
         return _registry.get_subject_schema(sub, version);
     }
 
+    ss::future<
+      chunked_vector<pandaproxy::schema_registry::subject_version_deleted>>
+    list_subject_versions(
+      ss::noncopyable_function<
+        bool(const pandaproxy::schema_registry::context_subject&)> filter,
+      pandaproxy::schema_registry::include_deleted inc_del) const override {
+        return _registry.list_subject_versions(std::move(filter), inc_del);
+    }
+
+    ss::future<bool> has_subjects(
+      pandaproxy::schema_registry::context ctx,
+      pandaproxy::schema_registry::include_deleted inc_del) const override {
+        return _registry.has_subjects(std::move(ctx), inc_del);
+    }
+
+    ss::future<chunked_vector<pandaproxy::schema_registry::context_subject>>
+    get_subjects(
+      pandaproxy::schema_registry::include_deleted inc_del) const override {
+        return _registry.get_subjects(inc_del);
+    }
+
+    ss::future<chunked_vector<pandaproxy::schema_registry::context>>
+    list_contexts() const override {
+        return _registry.list_contexts();
+    }
+
     ss::future<pandaproxy::schema_registry::context_schema_id> create_schema(
       pandaproxy::schema_registry::subject_schema unparsed) override {
         return _registry.create_schema(std::move(unparsed));
+    }
+
+    ss::future<pandaproxy::schema_registry::context_schema_id> import_schema(
+      pandaproxy::schema_registry::stored_schema imported) override {
+        return _registry.import_schema(std::move(imported));
+    }
+
+    ss::future<bool> soft_delete_schema(
+      pandaproxy::schema_registry::context_subject sub,
+      pandaproxy::schema_registry::schema_version version) override {
+        return _registry.soft_delete_schema(std::move(sub), version);
+    }
+
+    ss::future<chunked_vector<pandaproxy::schema_registry::schema_version>>
+    permanent_delete_schema(
+      pandaproxy::schema_registry::context_subject sub,
+      std::optional<pandaproxy::schema_registry::schema_version> version)
+      override {
+        return _registry.permanent_delete_schema(std::move(sub), version);
+    }
+
+    ss::future<bool> write_mode(
+      pandaproxy::schema_registry::context_subject sub,
+      pandaproxy::schema_registry::mode mode) override {
+        return _registry.write_mode(std::move(sub), mode);
+    }
+
+    ss::future<bool>
+    delete_mode(pandaproxy::schema_registry::context_subject sub) override {
+        return _registry.delete_mode(std::move(sub));
+    }
+
+    ss::future<bool> write_config(
+      pandaproxy::schema_registry::context_subject sub,
+      pandaproxy::schema_registry::compatibility_level compat) override {
+        return _registry.write_config(std::move(sub), compat);
+    }
+
+    ss::future<bool>
+    delete_config(pandaproxy::schema_registry::context_subject sub) override {
+        return _registry.delete_config(std::move(sub));
+    }
+
+    ss::future<>
+    delete_context(pandaproxy::schema_registry::context ctx) override {
+        return _registry.delete_context(std::move(ctx));
     }
 
     const std::vector<pandaproxy::schema_registry::stored_schema>& get_all() {

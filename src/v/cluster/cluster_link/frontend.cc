@@ -18,14 +18,17 @@
 #include "cluster/partition_leaders_table.h"
 #include "cluster/types.h"
 #include "cluster_link/model/filter_utils.h"
+#include "cluster_link/model/sr_context_mapping.h"
 #include "cluster_link/model/types.h"
 #include "config/configuration.h"
 #include "model/namespace.h"
 #include "model/validation.h"
+#include "pandaproxy/schema_registry/types.h"
 #include "rpc/connection_cache.h"
 #include "ssx/when_all.h"
 
 #include <algorithm>
+#include <variant>
 
 namespace cluster::cluster_link {
 
@@ -39,6 +42,7 @@ using ::cluster_link::model::name_t;
 using ::cluster_link::model::update_cluster_link_configuration_cmd;
 using ::cluster_link::model::update_mirror_topic_properties_cmd;
 using ::cluster_link::model::update_mirror_topic_status_cmd;
+namespace ppsr = pandaproxy::schema_registry;
 
 namespace {
 errc map_errc(std::error_code ec) {
@@ -169,6 +173,24 @@ ss::future<errc> frontend::batch_update_mirror_topic_status(
   batch_update_mirror_topic_status_cmd cmd,
   model::timeout_clock::time_point timeout) {
     if (!cluster_linking_enabled()) {
+        co_return errc::feature_disabled;
+    }
+    // Defense in depth at the replicate boundary. failover_link_topics only
+    // produces this batched command once batch_mirror_topic_status is active
+    // cluster-wide, and the controller leader observes activation no later than
+    // any follower, so a node reaching this path (locally or via a forwarded
+    // RPC) with the feature inactive is version skew or a bug -- never a normal
+    // state. Refuse rather than replicate: the batched command's record type is
+    // unknown to pre-feature binaries and would poison a downgrade's
+    // controller-log replay.
+    if (!_features->is_active(features::feature::batch_mirror_topic_status)) {
+        vlog(
+          cluster::clusterlog.error,
+          "Refusing to replicate a batched mirror-topic-status update for link "
+          "{} while the batch_mirror_topic_status feature is inactive; the "
+          "feature gates the only producer of this command, so this indicates "
+          "version skew or a logic error",
+          id);
         co_return errc::feature_disabled;
     }
     cluster_link_cmd c{
@@ -317,39 +339,122 @@ ss::future<chunked_vector<topic_result>> frontend::delete_mirror_topics(
       std::move(futures));
 }
 
+namespace {
+
+bool link_shadows_schema_registry_topic(
+  const ::cluster_link::model::metadata& md) {
+    const auto& mirror_topics = md.state.mirror_topics;
+    auto topic_it = mirror_topics.find(
+      ::model::schema_registry_internal_tp.topic);
+    if (topic_it != mirror_topics.end()) {
+        return !is_topic_mutable(topic_it->second.status);
+    }
+    // Topic mode owns _schemas even before the mirror topic appears.
+    return md.configuration.schema_registry_sync_cfg.is_topic_mode();
+}
+
+bool link_shadows_schema_registry(const ::cluster_link::model::metadata& md) {
+    return link_shadows_schema_registry_topic(md)
+           || md.configuration.schema_registry_sync_cfg.api_mode() != nullptr;
+}
+
+bool api_mode_shadows_context(
+  const ::cluster_link::model::schema_registry_sync_config::
+    shadow_schema_registry_api& api,
+  const ppsr::context& dest_context) {
+    // Identity mapping: the destination context name equals the source name.
+    if (!api.destination) {
+        return ::cluster_link::model::filter_selects_source_context(
+          api.filter, dest_context);
+    }
+
+    return ss::visit(
+      *api.destination,
+      [&api, &dest_context](
+        const ::cluster_link::model::schema_registry_sync_config::
+          identity_context_mapping&) {
+          // Identity mapping: the destination context name equals the source
+          // name.
+          return ::cluster_link::model::filter_selects_source_context(
+            api.filter, dest_context);
+      },
+      [&api, &dest_context](
+        const ::cluster_link::model::schema_registry_sync_config::
+          exact_context_mapping& destination) {
+          // Exact mapping: a destination context is owned only when some
+          // filter-selected source maps to it. Both conditions matter -- a
+          // mapping whose source is not selected by the filter is inert
+          // (nothing is mirrored into its destination), so matching the
+          // destination name alone would over-block.
+          for (const auto& [src_ctx, dst_ctx] : destination.mappings) {
+              if (
+                dest_context == dst_ctx
+                && ::cluster_link::model::filter_selects_source_context(
+                  api.filter, ppsr::context{src_ctx})) {
+                  return true;
+              }
+          }
+          return false;
+      });
+}
+
+bool link_disables_client_writes(
+  const ::cluster_link::model::metadata& md, const ppsr::context& context) {
+    // Topic-mode shadowing owns the whole _schemas topic, so it blocks every
+    // context.
+    if (link_shadows_schema_registry_topic(md)) {
+        return true;
+    }
+    // API-mode shadowing only blocks the contexts it mirrors, identified by
+    // source_filter/destination.
+    if (auto* api = md.configuration.schema_registry_sync_cfg.api_mode()) {
+        // A paused link relinquishes ownership of its contexts: replication
+        // has stopped, so client writes to them are allowed again.
+        if (!bool(api->is_enabled)) {
+            return false;
+        }
+        return api_mode_shadows_context(*api, context);
+    }
+    return false;
+}
+
+} // namespace
+
 bool frontend::schema_registry_shadowing_active() const {
     if (!cluster_link_active()) {
-        // If not shadow links are active then quick exit
+        return false;
+    }
+    auto link_ids = get_all_link_ids();
+    return std::ranges::any_of(link_ids, [this](id_t link_id) -> bool {
+        const auto md = find_link_by_id(link_id);
+        return md && link_shadows_schema_registry(*md);
+    });
+}
+
+bool frontend::schema_registry_client_writes_disabled(
+  std::string_view context) const {
+    if (!cluster_link_active()) {
+        return false;
+    }
+
+    ppsr::context local_context{ss::sstring{context}};
+    auto link_ids = get_all_link_ids();
+    return std::ranges::any_of(
+      link_ids, [this, &local_context](id_t link_id) -> bool {
+          const auto md = find_link_by_id(link_id);
+          return md && link_disables_client_writes(*md, local_context);
+      });
+}
+
+bool frontend::schema_registry_local_topic_writes_disabled() const {
+    if (!cluster_link_active()) {
         return false;
     }
 
     auto link_ids = get_all_link_ids();
     return std::ranges::any_of(link_ids, [this](id_t link_id) -> bool {
         const auto md = find_link_by_id(link_id);
-        if (!md) {
-            return false;
-        }
-        // Check to see if the schema registry topic is in the mirror topic list
-        const auto& mirror_topics = md->state.mirror_topics;
-        auto topic_it = mirror_topics.find(
-          ::model::schema_registry_internal_tp.topic);
-        if (topic_it != mirror_topics.end()) {
-            // If it is, return whether or not it is mutable based on its status
-            return !is_topic_mutable(topic_it->second.status);
-        }
-        // If mirror_schema_registry_topic option is set and the topic is not
-        // yet in the mirror topic list, then shadowing for SR is active
-        const auto& sr_cfg = md->configuration.schema_registry_sync_cfg;
-        if (
-          sr_cfg.sync_schema_registry_topic_mode.has_value()
-          && std::holds_alternative<
-            ::cluster_link::model::schema_registry_sync_config::
-              shadow_entire_schema_registry>(
-            sr_cfg.sync_schema_registry_topic_mode.value())) {
-            return true;
-        }
-
-        return false;
+        return md && link_shadows_schema_registry_topic(*md);
     });
 }
 

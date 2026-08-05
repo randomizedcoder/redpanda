@@ -404,8 +404,8 @@ ss::future<storage::index_state> do_copy_segment_data(
     auto offset_in_compacted_list =
       [compacted_offsets = std::move(compacted_offsets)](
         const model::record_batch& b,
-        const model::record& r) -> ss::future<bool> {
-        const auto o = b.base_offset() + model::offset_delta(r.offset_delta());
+        const model::record_key_metadata& r) -> ss::future<bool> {
+        const auto o = b.base_offset() + model::offset_delta(r.offset_delta);
         const auto keep = compacted_offsets.contains(o);
         return ss::make_ready_future<bool>(keep);
     };
@@ -423,7 +423,7 @@ ss::future<storage::index_state> do_copy_segment_data(
                           &may_have_transaction_data_or_fence_batches,
                           tx_batch_compaction_enabled](
                            const model::record_batch& b,
-                           const model::record& r,
+                           const model::record_key_metadata& r,
                            bool is_last_record_in_batch) {
         return internal::should_keep(
           b,
@@ -621,7 +621,7 @@ ss::future<compaction_result> do_self_compact_segment(
 
     auto rdr_holder = co_await readers_cache.evict_segment_readers(s);
 
-    auto write_lock_holder = co_await s->write_lock();
+    auto write_lock_holder = co_await s->write_lock(*cfg.asrc);
     if (segment_generation != s->get_generation_id()) {
         vlog(
           gclog.debug,
@@ -660,19 +660,31 @@ ss::future<> build_compaction_index(
   compaction::compaction_config cfg,
   storage_resources& resources,
   bool tx_batch_compaction_enabled) {
-    auto transactional_stm_type = stm_hookset->transactional_stm_type();
-    auto w = storage::make_file_backed_compacted_index(
-      p, false, resources, cfg.sanitizer_config);
-    auto reducer = tx_reducer(
-      p.get_ntp(),
-      stm_hookset,
-      transactional_stm_type,
-      std::move(aborted_txs),
-      w.get(),
-      tx_batch_compaction_enabled);
+    std::unique_ptr<compacted_index_writer> w;
+    std::optional<tx_reducer> reducer;
+    std::exception_ptr setup_error;
+    try {
+        auto transactional_stm_type = stm_hookset->transactional_stm_type();
+        w = storage::make_file_backed_compacted_index(
+          p, false, resources, cfg.sanitizer_config);
+        reducer.emplace(
+          p.get_ntp(),
+          stm_hookset,
+          transactional_stm_type,
+          std::move(aborted_txs),
+          w.get(),
+          tx_batch_compaction_enabled);
+    } catch (...) {
+        setup_error = std::current_exception();
+    }
+    auto rdr_impl = std::move(rdr).release();
+    if (setup_error) {
+        co_await rdr_impl->finally();
+        co_await ss::coroutine::return_exception_ptr(std::move(setup_error));
+    }
     auto index_builder = co_await ss::coroutine::as_future<tx_reducer::stats>(
-      std::move(rdr)
-        .consume(std::move(reducer), model::no_timeout)
+      model::record_batch_reader(std::move(rdr_impl))
+        .consume(std::move(*reducer), model::no_timeout)
         .finally([&w] { return w->close(); }));
     if (index_builder.failed()) {
         auto exception = index_builder.get_exception();
@@ -714,7 +726,7 @@ ss::future<> rebuild_compaction_index(
     segment_full_path idx_path = s->path().to_compacted_index();
     vlog(gclog.info, "Rebuilding index file... ({})", idx_path);
     pb.corrupted_compaction_index();
-    auto h = co_await s->read_lock();
+    auto h = co_await s->read_lock(*cfg.asrc);
     if (s->is_closed()) {
         co_await ss::coroutine::return_exception(segment_closed_exception());
     }
@@ -778,7 +790,7 @@ ss::future<compacted_index::recovery_state> maybe_rebuild_compaction_index(
           s, stm_hookset, cfg, pb, resources, tx_batch_compaction_enabled);
 
         // Take the lock again before proceeding.
-        read_holder = co_await s->read_lock();
+        read_holder = co_await s->read_lock(*cfg.asrc);
     }
 
     // Compaction index was successfully built, remove it from files to clean.
@@ -821,7 +833,7 @@ ss::future<compaction_result> self_compact_segment(
         co_return compaction_result{s->size_bytes()};
     }
 
-    auto read_holder = co_await s->read_lock();
+    auto read_holder = co_await s->read_lock(*cfg.asrc);
     compacted_index::recovery_state state
       = co_await maybe_rebuild_compaction_index(
         s,
@@ -873,7 +885,7 @@ make_concatenated_segment(
     chunked_vector<segment::generation_id> generations;
     generations.reserve(segments.size());
     for (auto& segment : segments) {
-        locks.push_back(co_await segment->read_lock());
+        locks.push_back(co_await segment->read_lock(*cfg.asrc));
         generations.push_back(segment->get_generation_id());
     }
 

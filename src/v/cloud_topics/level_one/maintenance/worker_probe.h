@@ -38,6 +38,10 @@ public:
         return _compaction_runs.auto_measure();
     }
 
+    std::unique_ptr<hist_t::measurement> auto_leveling_measurement() {
+        return _leveling_runs.auto_measure();
+    }
+
     void add_stats(const compaction::stats& stats) {
         _batches_processed += stats.batches_processed;
         _batches_removed += stats.batches_discarded;
@@ -45,13 +49,59 @@ public:
         _tombstones_removed += stats.expired_tombstones_discarded;
     }
 
+    // Records the net reduction in object/extent count from a committed
+    // leveling range: `input_extents - output_objects`.
+    void add_leveling_extents_reclaimed(uint64_t reclaimed) {
+        _leveling_extents_reclaimed += reclaimed;
+    }
+
+    void add_compaction_objects_committed(uint64_t objects) {
+        _compaction_objects_committed += objects;
+    }
+    void add_compaction_bytes_committed(uint64_t bytes) {
+        _compaction_bytes_committed += bytes;
+    }
+
+    void add_leveling_objects_committed(uint64_t objects) {
+        _leveling_objects_committed += objects;
+    }
+    void add_leveling_bytes_committed(uint64_t bytes) {
+        _leveling_bytes_committed += bytes;
+    }
+
+    // Output objects/bytes that a maintenance job uploaded to object storage
+    // but whose metastore commit did not succeed.
+    void add_compaction_objects_rejected(uint64_t objects) {
+        _compaction_objects_rejected += objects;
+    }
+    void add_compaction_bytes_rejected(uint64_t bytes) {
+        _compaction_bytes_rejected += bytes;
+    }
+
+    void add_leveling_objects_rejected(uint64_t objects) {
+        _leveling_objects_rejected += objects;
+    }
+    void add_leveling_bytes_rejected(uint64_t bytes) {
+        _leveling_bytes_rejected += bytes;
+    }
+
 private:
     hist_t _compaction_runs;
+    hist_t _leveling_runs;
 
     uint64_t _batches_processed{0};
     uint64_t _batches_removed{0};
     uint64_t _records_removed{0};
     uint64_t _tombstones_removed{0};
+    uint64_t _leveling_extents_reclaimed{0};
+    uint64_t _compaction_objects_committed{0};
+    uint64_t _compaction_bytes_committed{0};
+    uint64_t _leveling_objects_committed{0};
+    uint64_t _leveling_bytes_committed{0};
+    uint64_t _compaction_objects_rejected{0};
+    uint64_t _compaction_bytes_rejected{0};
+    uint64_t _leveling_objects_rejected{0};
+    uint64_t _leveling_bytes_rejected{0};
 
     metrics::internal_metric_groups _metrics;
 };

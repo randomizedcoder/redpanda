@@ -86,6 +86,7 @@ DEFAULT_SYNCED_TOPIC_PROPERTIES = [
     "max.compaction.lag.ms",
     "min.compaction.lag.ms",
     "redpanda.storage.mode",
+    "redpanda.storage.mode.impl",
 ]
 
 DISALLOWED_SYNCED_TOPIC_PROPERTIES = [
@@ -99,13 +100,18 @@ DISALLOWED_SYNCED_TOPIC_PROPERTIES = [
 CONTROLLER_LOCKED_TASKS = [
     "Source Topic Sync",
     "Security Migrator Task",
+    "Roles Migrator Task",
 ]
+
+# Matches mirroring_task::task_name in
+# src/v/cluster_link/schema_registry_sync/mirroring_task.h
+SCHEMA_REGISTRY_SYNC_TASK_NAME = "Schema Registry Shadowing"
 
 ALL_STORAGE_MODES = [
     TopicSpec.STORAGE_MODE_LOCAL,
-    TopicSpec.STORAGE_MODE_TIERED,
+    TopicSpec.STORAGE_MODE_IMPL_TIERED_V1,
     TopicSpec.STORAGE_MODE_CLOUD,
-    TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+    TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
 ]
 
 # Log messages that are expected when running shadow link tests with
@@ -231,6 +237,13 @@ class ClusterLinkingProgressVerifier:
         self.consumer_properties: dict[str, Any] = (
             consumer_properties if consumer_properties else {}
         )
+        # When using compaction, the completion criteria examines per-partition
+        # offsets, which may be at odds with having a max_msgs set.
+        assert not (self.use_compaction and "max_msgs" in self.consumer_properties), (
+            "max_msgs is incompatible with use_compaction: completion requires "
+            "per-partition offset parity, which a bounded read may never reach. "
+            "Let the consumer tail (continuous) instead."
+        )
         self.timeout_sec = timeout_sec
         self.validate_number_of_messages_on_target = (
             validate_number_of_messages_on_target
@@ -274,12 +287,14 @@ class ClusterLinkingProgressVerifier:
         )
         self.source_consumer.start(clean=False)
 
+        # NOTE: when using compaction, the completion criteria examines
+        # per-partition offsets, which is at odds with having a max_msgs.
         self.target_consumer = KgoVerifierConsumerGroupConsumer(
             context=self.test_context,
             redpanda=self.target_cluster.service,
             topic=self.topic,
             msg_size=self.msg_size,
-            max_msgs=self.msg_count,
+            max_msgs=None if self.use_compaction else self.msg_count,
             readers=readers,
             use_transactions=self.use_transactions,
             group_name=f"target-cg-{self._instance_id}",
@@ -339,45 +354,120 @@ class ClusterLinkingProgressVerifier:
         )
 
     def check_topic_hwms(self, timeout: int = 120, debug_only: bool = False):
-        # describe target first to make sure the lag is always greater than or equal to 0
+        """Verify the target topic's high watermarks have caught up to the source.
+
+        Describes the topic on both clusters and compares the per-partition high
+        watermark; any partition whose watermarks differ is counted as lagging.
+        With debug_only=True discrepancies are only logged (used to dump
+        diagnostics when the workload stalls); otherwise a lagging or mismatched
+        partition fails verification.
+
+        describe_topics() retries until source and target agree on the partition
+        set and every partition has a readable high watermark on both sides, so
+        the comparison never races against transient leadership churn. See
+        CORE-16414 for the failure this guards against.
+        """
+
         def describe_topics():
+            last_log = None
+
+            def log_once(message):
+                # Throttle to distinct states: a persistent condition leaves one
+                # line per transition rather than spamming on every backoff.
+                nonlocal last_log
+                if message != last_log:
+                    last_log = message
+                    self.logger.warning(message)
+
             def describe_once():
-                target = list(self.target_rpk.describe_topic(self.topic))
-                source = list(self.source_rpk.describe_topic(self.topic))
-                if len(source) != len(target):
+                # tolerant=True keeps momentarily-leaderless partitions in the
+                # result (with high_watermark=None) instead of dropping them,
+                # which separates two concerns the default describe conflates:
+                #
+                #   1. Structural: the set of partition ids is fixed for a
+                #      provisioned topic and is reported in metadata regardless
+                #      of leadership. Source and target must agree on it; a
+                #      persistent mismatch is a real (shadow-link) bug, surfaced
+                #      via the timeout below.
+                #   2. Transient: an individual partition may briefly have no
+                #      leader (e.g. during failure injection) and thus no
+                #      readable high watermark. We wait for liveness rather than
+                #      silently skipping the partition.
+                #
+                # Logging both (throttled) keeps the signal alive even when a
+                # transient condition is waited out and the test passes.
+                #
+                # Target is described before source so that, for a partition
+                # still replicating, target_hw <= source_hw and the lag computed
+                # below stays non-negative.
+                target = {
+                    p.id: p
+                    for p in self.target_rpk.describe_topic(self.topic, tolerant=True)
+                }
+                source = {
+                    p.id: p
+                    for p in self.source_rpk.describe_topic(self.topic, tolerant=True)
+                }
+
+                if not source or source.keys() != target.keys():
+                    log_once(
+                        f"Partition set mismatch (structural) for {self.topic} "
+                        f"while computing lag: source={sorted(source.keys())} "
+                        f"target={sorted(target.keys())}; retrying"
+                    )
                     return False, None
+
+                not_ready = [
+                    pid
+                    for pid in sorted(source.keys())
+                    if source[pid].high_watermark is None
+                    or target[pid].high_watermark is None
+                ]
+                if not_ready:
+                    log_once(
+                        f"Partitions without a readable high watermark for "
+                        f"{self.topic}: {not_ready}; retrying"
+                    )
+                    return False, None
+
                 return True, (target, source)
 
             return wait_until_result(
                 describe_once,
                 timeout_sec=timeout,
                 backoff_sec=0.5,
-                err_msg=f"Failed to describe topics for lag calculation in {timeout} seconds",
+                err_msg=f"Source and target did not converge on a comparable set of partitions for lag calculation in {timeout} seconds",
             )
 
         try:
             (target, source) = describe_topics()
-            assert len(target) == len(source), (
-                "Verification failed, Topic partitions count mismatch between source and target"
+            # Postcondition of describe_topics(): the partition sets match and
+            # every high watermark is non-None on both sides, so partitions line
+            # up by id and the subtraction below cannot see None. The assert
+            # documents (and defensively re-checks) that invariant.
+            assert source.keys() == target.keys(), (
+                "Verification failed, Topic partitions mismatch between source and target"
             )
             partitions_with_lag = 0
-            for source_partition, target_partition in zip(source, target):
-                assert source_partition.id == target_partition.id, (
-                    f"Partition id mismatch {source_partition.id} != {target_partition.id}"
-                )
+            for pid in sorted(source.keys()):
+                source_partition = source[pid]
+                target_partition = target[pid]
                 if target_partition.high_watermark != source_partition.high_watermark:
                     lag = (
                         source_partition.high_watermark
                         - target_partition.high_watermark
                     )
                     self.logger.debug(
-                        f"Partition {self.topic}/{source_partition.id} - source: ({source_partition}), target: ({target_partition}) lag: {lag}"
+                        f"Partition {self.topic}/{pid} - source: ({source_partition}), target: ({target_partition}) lag: {lag}"
                     )
                     partitions_with_lag += 1
-                assert debug_only or partitions_with_lag == 0, (
-                    f"Verification failed, {partitions_with_lag} partitions do not have synced high watermarks"
-                )
+            assert debug_only or partitions_with_lag == 0, (
+                f"Verification failed, {partitions_with_lag} partitions do not have synced high watermarks"
+            )
         except Exception as e:
+            # debug_only callers (e.g. the workload-stall diagnostic dump) want a
+            # best-effort snapshot, so swallow failures; real verification
+            # propagates them.
             self.logger.warning(f"Verification failed: {e}")
             if not debug_only:
                 raise
@@ -386,6 +476,20 @@ class ClusterLinkingProgressVerifier:
         self.source_consumer.stop()
         self.target_consumer.stop()
         self.producer.stop()
+
+    def _raise_if_worker_crashed(self):
+        """Fail fast if any kgo-verifier worker's status thread has errored.
+
+        A worker whose process dies (e.g. a client-library crash such as the
+        franz-go produce-path panic) stops answering status polls and can never
+        recover. Its StatusThread records the failure -- naming the worker that
+        exited -- and raise_on_error() re-raises it here, so validate_progress
+        surfaces that descriptive error immediately instead of waiting out
+        progress_timeout and reporting an opaque "Workload stalled".
+        """
+        for svc in (self.producer, self.source_consumer, self.target_consumer):
+            if svc._status_thread is not None:
+                svc._status_thread.raise_on_error()
 
     def validate_progress(self, progress_timeout=60, backoff_delay=5):
         workload_last_progress = time.time()
@@ -398,6 +502,11 @@ class ClusterLinkingProgressVerifier:
             producer_acked = self.producer.produce_status.acked
             source_reads = self.source_consumer.consumer_status.validator.total_reads
             target_reads = self.target_consumer.consumer_status.validator.total_reads
+
+            # A crashed kgo-verifier worker can never make progress, so fail
+            # fast with the descriptive error its status thread recorded rather
+            # than blaming a "Workload stalled" after progress_timeout elapses.
+            self._raise_if_worker_crashed()
 
             # track workload progress
             if (
@@ -500,6 +609,16 @@ class ShadowLinkTestBase(PreallocNodesTest):
     the target cluster. Secondary service is used as the source cluster.
     """
 
+    # Pause Schema Registry API-mode sync and wait for the sync task to park
+    # before the target cluster is stopped, so shutdown never overlaps an
+    # in-flight sync (an overlap can stall shutdown long enough to time the
+    # test out). Set False (class- or instance-level) to opt out, e.g. for
+    # tests that deliberately exercise shutdown during a sync.
+    pause_sr_sync_before_shutdown: bool = True
+    # The drain must outlast a mid-flight sync's destination write retries
+    # (~70s worst case) on a loaded debug machine.
+    sr_sync_pause_timeout_sec: int = 120
+
     def __init__(
         self,
         test_context: TestContext,
@@ -516,12 +635,13 @@ class ShadowLinkTestBase(PreallocNodesTest):
         storage_mode = (test_context.injected_args or {}).get("storage_mode")
         needs_si = storage_mode in (
             TopicSpec.STORAGE_MODE_TIERED,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V1,
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         )
         needs_cloud_topics = storage_mode in (
             TopicSpec.STORAGE_MODE_CLOUD,
-            TopicSpec.STORAGE_MODE_TIERED_CLOUD,
+            TopicSpec.STORAGE_MODE_IMPL_TIERED_V2,
         )
 
         if needs_si and "si_settings" not in kwargs:
@@ -582,7 +702,9 @@ class ShadowLinkTestBase(PreallocNodesTest):
                 )
                 sec_kwargs["extra_rp_conf"] = sec_extra
             secondary_cluster_args = SecondaryClusterArgs(
-                *secondary_cluster_args.args, **sec_kwargs
+                secondary_cluster_args.num_brokers,
+                *secondary_cluster_args.args,
+                **sec_kwargs,
             )
 
         kwargs.setdefault(
@@ -656,13 +778,98 @@ class ShadowLinkTestBase(PreallocNodesTest):
             self.logger,
             self.redpanda,
             secondary_spec=self.source_cluster_spec,
-            num_brokers=3,
             secondary_args=self.secondary_cluster_args,
         )
         self.services.setUp()
         self.admin_v2 = AdminV2(self.target_cluster_service)
         self.service_client = self.admin_v2.shadow_link()
         self.internal_service_client = self.admin_v2.internal_shadow_link()
+        self._install_sr_sync_pause_hook()
+
+    def _install_sr_sync_pause_hook(self) -> None:
+        """Make the target service's stop() pause SR sync first. The @cluster
+        decorator stops the target cluster inside the test wrapper, before
+        tearDown runs, so a tearDown hook would fire only after the cluster is
+        already gone; wrapping stop() runs the pause right before any stop of
+        a live cluster, on both the passed and failed paths, while both
+        clusters are still up."""
+        target = self.target_cluster_service
+        original_stop = target.stop
+
+        def stop_with_sr_sync_pause(**kwargs: Any) -> None:
+            # Skip when nothing is running: ducktape's teardown stops services
+            # again after the decorator already stopped this one, and a pause
+            # attempt against a stopped cluster would only log a spurious
+            # warning. Any stop of a live cluster (including a mid-test one)
+            # pauses first.
+            if self.pause_sr_sync_before_shutdown and target.started_nodes():
+                try:
+                    self._pause_schema_registry_sync(self.sr_sync_pause_timeout_sec)
+                except Exception:
+                    # Best effort: a failed pause must not replace the test's
+                    # own result; shutdown just proceeds with the usual
+                    # overlap odds.
+                    self.logger.warn(
+                        "failed to pause Schema Registry sync before shutdown",
+                        exc_info=True,
+                    )
+            original_stop(**kwargs)
+
+        target.stop = stop_with_sr_sync_pause
+
+    def _pause_schema_registry_sync(self, timeout_sec: int) -> None:
+        """Pause Schema Registry API-mode sync on every link and wait until
+        the sync task is parked, so no sync is running when the clusters
+        shut down."""
+        for link in self.list_links():
+            sr = link.configurations.schema_registry_sync_options
+            if not sr.HasField("shadow_schema_registry_api"):
+                continue
+            link_name = link.name
+            if not sr.shadow_schema_registry_api.paused:
+                self.logger.info(
+                    f"Pausing Schema Registry sync on link {link_name} before shutdown"
+                )
+                sr.shadow_schema_registry_api.paused = True
+                self.update_link(
+                    shadow_link=link,
+                    update_mask=google.protobuf.field_mask_pb2.FieldMask(
+                        paths=[
+                            "configurations.schema_registry_sync_options"
+                            ".shadow_schema_registry_api.paused"
+                        ]
+                    ),
+                )
+
+            def sr_task_parked() -> bool:
+                status = self.get_link(link_name).status
+                for task in status.task_statuses:
+                    if task.name == SCHEMA_REGISTRY_SYNC_TASK_NAME:
+                        if task.state not in (
+                            shadow_link_pb2.TASK_STATE_PAUSED,
+                            shadow_link_pb2.TASK_STATE_NOT_RUNNING,
+                        ):
+                            return False
+                        # The task reports PAUSED before its in-flight run
+                        # has drained (task::pause flips the state, then
+                        # closes the runner gate), so PAUSED alone is not
+                        # proof the sync stopped. current_sync clears only
+                        # when the run actually exits; require that too.
+                        return not status.schema_registry_sync_status.HasField(
+                            "current_sync"
+                        )
+                # No task entry: nothing is running, so nothing to drain.
+                return True
+
+            wait_until(
+                sr_task_parked,
+                timeout_sec=timeout_sec,
+                backoff_sec=1,
+                err_msg=(
+                    f"Schema Registry sync task on link {link_name} "
+                    "did not pause before shutdown"
+                ),
+            )
 
     @property
     def source_cluster(self) -> Cluster:
@@ -942,7 +1149,7 @@ class ShadowLinkTestBase(PreallocNodesTest):
             self.source_default_client().create_topic(topic)
             return
 
-        if storage_mode == TopicSpec.STORAGE_MODE_TIERED_CLOUD:
+        if storage_mode == TopicSpec.STORAGE_MODE_IMPL_TIERED_V2:
             self.source_cluster_service.set_feature_active(
                 "tiered_cloud_topics", True, timeout_sec=30
             )
@@ -951,7 +1158,7 @@ class ShadowLinkTestBase(PreallocNodesTest):
             )
 
         config = self._topic_config_from_spec(topic)
-        config[TopicSpec.PROPERTY_STORAGE_MODE] = storage_mode
+        config.update(TopicSpec.storage_mode_config(storage_mode))
 
         source_rpk = RpkTool(self.source_cluster.service)
 

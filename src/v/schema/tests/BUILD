@@ -11,8 +11,10 @@ redpanda_test_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/v/base",
+        "//src/v/container:chunked_hash_map",
         "//src/v/pandaproxy/schema_registry:types",
         "//src/v/schema:registry",
+        "@fmt",
         "@seastar",
     ],
 )

@@ -47,6 +47,12 @@ std::string_view to_string_view(feature f) {
         return "shadow_linking";
     case feature::batch_mirror_topic_status:
         return "batch_mirror_topic_status";
+    case feature::shadow_link_sr_api_sync:
+        return "shadow_link_sr_api_sync";
+    case feature::shadow_link_role_sync:
+        return "shadow_link_role_sync";
+    case feature::iceberg_extended_mode_config:
+        return "iceberg_extended_mode_config";
     case feature::coordinated_compaction:
         return "coordinated_compaction";
     case feature::cloud_retention:
@@ -139,6 +145,8 @@ std::string_view to_string_view(feature f) {
         return "cloud_topics";
     case feature::tiered_cloud_topics:
         return "tiered_cloud_topics";
+    case feature::fetch_controller_snapshot_rpc:
+        return "fetch_controller_snapshot_rpc";
 
     /*
      * testing features
@@ -190,7 +198,7 @@ constexpr cluster_version latest_version = to_cluster_version(
 // a freshly initialized node will start at. All features up to this cluster
 // version will automatically be enabled when Redpanda starts.
 constexpr cluster_version earliest_version = to_cluster_version(
-  release_version::v26_1_1);
+  release_version::v26_2_1);
 
 static_assert(
   latest_version - earliest_version == 1L,
@@ -229,6 +237,7 @@ bool is_major_version_release(cluster::cluster_version version) {
     case release_version::v25_3_1:
     case release_version::v26_1_1:
     case release_version::v26_2_1:
+    case release_version::v26_3_1:
         return true;
     }
     __builtin_unreachable();
@@ -673,7 +682,7 @@ ss::future<> feature_table::await_feature(feature f, ss::abort_source& as) {
 }
 
 ss::future<>
-feature_table::await_feature_then(feature f, std::function<void(void)> fn) {
+feature_table::await_feature_then(feature f, std::function<void()> fn) {
     try {
         co_await await_feature(f);
         fn();

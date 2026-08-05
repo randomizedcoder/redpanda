@@ -86,7 +86,8 @@ bool is_supported(std::string_view name) {
        topic_property_remote_allow_gaps,
        topic_property_message_timestamp_before_max_ms,
        topic_property_message_timestamp_after_max_ms,
-       topic_property_redpanda_storage_mode});
+       topic_property_redpanda_storage_mode,
+       topic_property_redpanda_storage_mode_impl});
 
     if (
       std::any_of(
@@ -117,7 +118,7 @@ using validators = make_validator_types<
   replication_factor_must_be_greater_or_equal_to_minimum,
   vcluster_id_validator,
   write_caching_configs_validator,
-  iceberg_config_validator,
+  iceberg_create_config_validator,
   iceberg_invalid_record_action_validator,
   iceberg_target_lag_ms_validator,
   schema_registry_context_create_validator,
@@ -308,7 +309,7 @@ ss::future<response_ptr> create_topics_handler::handle(
         }
         if (r.replication_factor == -1) {
             r.replication_factor
-              = config::shard_local_cfg().default_topic_replication();
+              = config::shard_local_cfg().default_topic_replications();
         }
     }
 

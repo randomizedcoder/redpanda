@@ -42,9 +42,9 @@ inline ss::logger tlog{"test_log"};
 class storage_test_fixture : public ::testing::Test {
 public:
     ss::sstring test_dir;
-    storage::kvstore kvstore;
     storage::storage_resources resources;
     ss::sharded<features::feature_table> feature_table;
+    storage::kvstore kvstore;
 
     std::optional<model::timestamp> ts_cursor;
 
@@ -59,6 +59,7 @@ public:
           ss::this_shard_id(),
           resources,
           feature_table) {
+        resources.start().get();
         configure_unit_test_logging();
         // avoid double metric registrations - disk_log_builder and other
         // helpers also start a feature_table and other structs that register
@@ -176,7 +177,7 @@ public:
       = storage::log_append_config::fsync::no,
       bool flush_after_append = true) {
         auto lstats = log->offsets();
-        storage::log_append_config append_cfg{sync, model::no_timeout};
+        storage::log_append_config append_cfg{sync};
 
         model::offset base_offset = lstats.dirty_offset < model::offset(0)
                                       ? model::offset(0)
@@ -205,7 +206,7 @@ public:
               std::move(batches));
             auto res = std::move(reader)
                          .for_each_ref(
-                           log->make_appender(append_cfg), append_cfg.timeout)
+                           log->make_appender(append_cfg), model::no_timeout)
                          .get();
             if (flush_after_append) {
                 log->flush().get();
@@ -227,7 +228,7 @@ public:
           batch.header().last_offset_delta);
         buffer.push_back(std::move(batch));
         storage::log_append_config append_cfg{
-          storage::log_append_config::fsync::no, model::no_timeout};
+          storage::log_append_config::fsync::no};
 
         model::offset old_dirty_offset = log->offsets().dirty_offset;
         model::offset base_offset = old_dirty_offset < model::offset(0)
