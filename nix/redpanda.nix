@@ -1148,16 +1148,29 @@ REPOS_PATCH
     build --cxxopt=-Wno-macro-redefined
     build --host_cxxopt=-Wno-macro-redefined
 
-    # Disable Bazel 9's stricter header-dependency checks. The
-    # "undeclared inclusion(s) in rule" diagnostic comes from
-    # CppCompileAction's input-deps verification — turned on by default
-    # via --incompatible_validate_top_level_header_inclusions=true.
-    # Combined with feature negations for layering_check and friends so
-    # nothing else re-enables the check.
+    # Disable Bazel 9's "undeclared inclusion(s) in rule" diagnostic.
+    # Reverse-engineered from rules_cc 0.2.17's unix_cc_toolchain_config.bzl
+    # and bazel/CppCompileAction.class: the diagnostic fires via the
+    # clang-module-maps path. rules_cc's `layering_check` feature
+    #   implies = ["use_module_maps"]
+    # and `use_module_maps`
+    #   requires = [feature_set(features = ["module_maps"])]
+    # while `module_maps` is `enabled = True` by default. The flags
+    # `-fmodule-name=...` and `-fmodule-map-file=...` that module_maps
+    # injects let clang emit per-target ownership info, which Bazel
+    # then uses to validate that each included header is in the
+    # compiling target's own hdrs or a direct dep's hdrs.
+    #
+    # Negating just layering_check leaves use_module_maps and
+    # module_maps active, so the check still fires. Disable all three.
     build --noincompatible_validate_top_level_header_inclusions
     build --features=-layering_check
+    build --features=-use_module_maps
+    build --features=-module_maps
     build --features=-parse_headers
     build --host_features=-layering_check
+    build --host_features=-use_module_maps
+    build --host_features=-module_maps
     build --host_features=-parse_headers
 
     # Make jinja2/jsonschema (from pythonWithDeps) visible to genrule
