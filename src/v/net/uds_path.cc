@@ -12,10 +12,17 @@
 #include "base/seastarx.h"
 #include "base/vlog.h"
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/file-types.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/socket_defs.hh>
+#include <seastar/net/unix_address.hh>
 #include <seastar/util/log.hh>
 
+#include <fmt/format.h>
 #include <sys/file.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 
@@ -25,13 +32,14 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unistd.h>
 
 namespace net {
 
 namespace {
 
-static ss::logger udslog("net_uds");
+ss::logger udslog("net_uds");
 
 [[noreturn]] void throw_errno(const std::string& op, const ss::sstring& path) {
     const int e = errno;
@@ -40,74 +48,90 @@ static ss::logger udslog("net_uds");
         "UDS {}: path='{}': {} (errno={})", op, path, std::strerror(e), e));
 }
 
-/// Returns true if a connect(2) to `path` succeeds (some process is
-/// listening), false if ECONNREFUSED (stale socket file), rethrows for
-/// anything else.
-bool probe_connect(const ss::sstring& path) {
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        throw_errno("probe_connect socket()", path);
-    }
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    if (path.size() >= sizeof(addr.sun_path)) {
-        ::close(fd);
+/// Returns true if a connect to `path` succeeds (some process is
+/// listening), false on ECONNREFUSED (stale socket file), rethrows for
+/// anything else. Uses Seastar's asynchronous connect so the reactor is
+/// not blocked while the connection is attempted.
+ss::future<bool> probe_connect(const ss::sstring& path) {
+    if (path.size() >= sizeof(sockaddr_un{}.sun_path)) {
         throw std::runtime_error(
           fmt::format(
             "UDS probe_connect: path too long ({} bytes): '{}'",
             path.size(),
             path));
     }
-    std::memcpy(addr.sun_path, path.c_str(), path.size());
-    int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    int e = errno;
-    ::close(fd);
-    if (rc == 0) {
-        return true;
+    try {
+        // The connected_socket is discarded immediately: a successful
+        // connect is all we need to know a live peer is listening.
+        co_await ss::connect(
+          ss::socket_address(ss::unix_domain_addr(std::string(path))));
+        co_return true;
+    } catch (const std::system_error& e) {
+        if (e.code() == std::errc::connection_refused) {
+            co_return false;
+        }
+        throw;
     }
-    if (e == ECONNREFUSED) {
-        return false;
+}
+
+/// Best-effort unlink that ignores a missing file and only logs other
+/// failures. Used by graceful shutdown, which must proceed regardless.
+/// Takes `path` by value: it is invoked with a temporary and must own its
+/// argument across the co_await.
+ss::future<> best_effort_remove(ss::sstring path) {
+    try {
+        co_await ss::remove_file(path);
+    } catch (const std::filesystem::filesystem_error& e) {
+        if (e.code() != std::errc::no_such_file_or_directory) {
+            vlog(
+              udslog.warn,
+              "cleanup: remove_file('{}') failed: {}",
+              path,
+              e.what());
+        }
     }
-    errno = e;
-    throw_errno("probe_connect connect()", path);
 }
 
 } // namespace
 
-void prepare_uds_path(const ss::sstring& path) {
+ss::future<> prepare_uds_path(const ss::sstring& path) {
     std::filesystem::path fspath{std::string{path}};
     auto parent = fspath.parent_path();
     if (parent.empty()) {
         throw std::runtime_error(
           fmt::format("UDS prepare: path '{}' has no parent directory", path));
     }
-    struct stat parent_st{};
-    if (::stat(parent.c_str(), &parent_st) != 0) {
-        throw_errno("stat(parent)", path);
-    }
-    if (!S_ISDIR(parent_st.st_mode)) {
+    ss::sstring parent_str{parent.string()};
+
+    auto parent_st = co_await ss::file_stat(
+      parent_str, ss::follow_symlink::yes);
+    if (parent_st.type != ss::directory_entry_type::directory) {
         throw std::runtime_error(
           fmt::format(
             "UDS prepare: parent '{}' of '{}' is not a directory",
             parent.string(),
             path));
     }
-    if (::access(parent.c_str(), W_OK) != 0) {
-        throw_errno("access(parent, W_OK)", path);
+    if (!co_await ss::file_accessible(parent_str, ss::access_flags::write)) {
+        throw std::runtime_error(
+          fmt::format(
+            "UDS prepare: parent '{}' of '{}' is not writable",
+            parent.string(),
+            path));
     }
 
-    struct stat st{};
-    if (::stat(path.c_str(), &st) == 0) {
-        if (!S_ISSOCK(st.st_mode)) {
+    if (co_await ss::file_exists(path)) {
+        auto st = co_await ss::file_stat(path, ss::follow_symlink::yes);
+        if (st.type != ss::directory_entry_type::socket) {
             throw std::runtime_error(
               fmt::format(
                 "UDS prepare: path '{}' exists and is not a socket "
                 "(mode={:#o}); refusing to unlink",
                 path,
-                st.st_mode));
+                st.mode));
         }
         // Existing socket: probe to decide whether it is stale.
-        if (probe_connect(path)) {
+        if (co_await probe_connect(path)) {
             throw std::runtime_error(
               fmt::format(
                 "UDS prepare: path '{}' is a live socket — another broker "
@@ -118,15 +142,21 @@ void prepare_uds_path(const ss::sstring& path) {
           udslog.warn,
           "Unlinking stale UDS socket at '{}' (connect probe refused)",
           path);
-        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-            throw_errno("unlink(stale)", path);
+        try {
+            co_await ss::remove_file(path);
+        } catch (const std::filesystem::filesystem_error& e) {
+            if (e.code() != std::errc::no_such_file_or_directory) {
+                throw;
+            }
         }
-    } else if (errno != ENOENT) {
-        throw_errno("stat", path);
     }
 
-    // Advisory lock on <path>.lock. The lock fd is intentionally leaked:
-    // kernel releases on process exit, which is the desired lifetime.
+    // Advisory lock on <path>.lock. flock(2) has no Seastar asynchronous
+    // equivalent and the lock must be held on a raw fd for the lifetime of
+    // the process (the kernel releases it on exit), so this final step is
+    // intentionally synchronous. The open()+flock() pair runs once, on
+    // shard 0, during startup — not on a hot path. The lock fd is
+    // intentionally leaked: its lifetime is the process.
     ss::sstring lock_path = path + ".lock";
     int lock_fd = ::open(
       lock_path.c_str(),
@@ -148,60 +178,44 @@ void prepare_uds_path(const ss::sstring& path) {
         errno = e;
         throw_errno("flock", lock_path);
     }
-    // lock_fd intentionally leaked — lifetime = process.
 }
 
-void chmod_uds_path(const ss::sstring& path, std::optional<uint32_t> mode) {
+ss::future<>
+chmod_uds_path(const ss::sstring& path, std::optional<uint32_t> mode) {
     const mode_t m = mode.value_or(0660);
-    if (::chmod(path.c_str(), m) != 0) {
-        throw_errno(fmt::format("chmod({:#o})", m), path);
-    }
+    // static_cast preserves the full mode, including the setuid/setgid/sticky
+    // bits: Seastar's chmod passes the value straight through to ::chmod().
+    co_await ss::chmod(path, static_cast<ss::file_permissions>(m));
 }
 
-void verify_uds_bound(const ss::sstring& path) {
-    // lstat(2) does NOT follow symlinks — the whole point of this check is
-    // to detect if something replaced our target inode with a symlink
-    // between prepare_uds_path()'s stat/unlink and the subsequent bind().
-    struct stat st{};
-    if (::lstat(path.c_str(), &st) != 0) {
-        throw_errno("verify_uds_bound lstat", path);
-    }
-    if (!S_ISSOCK(st.st_mode)) {
+ss::future<> verify_uds_bound(const ss::sstring& path) {
+    // follow_symlink::no is the whole point of this check: detect if
+    // something replaced our target inode with a symlink between
+    // prepare_uds_path()'s stat/unlink and the subsequent bind().
+    auto st = co_await ss::file_stat(path, ss::follow_symlink::no);
+    if (st.type != ss::directory_entry_type::socket) {
         throw std::runtime_error(
           fmt::format(
             "UDS verify: path '{}' is not a socket after bind "
             "(mode={:#o}); possible symlink-race attack, refusing to start",
             path,
-            st.st_mode));
+            st.mode));
     }
-    const uid_t me = ::geteuid();
-    if (st.st_uid != me) {
+    const uint64_t me = ::geteuid();
+    if (st.uid != me) {
         throw std::runtime_error(
           fmt::format(
             "UDS verify: path '{}' is owned by uid {} but we run as uid {}; "
             "possible inode-swap attack, refusing to start",
             path,
-            st.st_uid,
+            st.uid,
             me));
     }
 }
 
-void cleanup_uds_path(const ss::sstring& path) {
-    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-        vlog(
-          udslog.warn,
-          "cleanup: unlink('{}') failed: {}",
-          path,
-          std::strerror(errno));
-    }
-    ss::sstring lock_path = path + ".lock";
-    if (::unlink(lock_path.c_str()) != 0 && errno != ENOENT) {
-        vlog(
-          udslog.warn,
-          "cleanup: unlink('{}') failed: {}",
-          lock_path,
-          std::strerror(errno));
-    }
+ss::future<> cleanup_uds_path(const ss::sstring& path) {
+    co_await best_effort_remove(path);
+    co_await best_effort_remove(path + ".lock");
 }
 
 } // namespace net

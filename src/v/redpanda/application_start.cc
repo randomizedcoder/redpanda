@@ -305,8 +305,8 @@ void application::start_kafka(
     // swap between prepare and bind).
     for (const auto& ep : config::node().kafka_api()) {
         if (ep.is_unix_domain()) {
-            net::chmod_uds_path(*ep.unix_path, ep.unix_socket_mode);
-            net::verify_uds_bound(*ep.unix_path);
+            net::chmod_uds_path(*ep.unix_path, ep.unix_socket_mode).get();
+            net::verify_uds_bound(*ep.unix_path).get();
         }
     }
     vlog(

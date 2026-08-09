@@ -11,6 +11,7 @@
 
 #include "base/seastarx.h"
 
+#include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 
 #include <cstdint>
@@ -23,7 +24,7 @@ namespace net {
 /// Performs the following steps on shard 0:
 ///  1. Validates the parent directory exists and is writable.
 ///  2. If `path` exists:
-///      - If it is a socket, attempts connect(2). On ECONNREFUSED the
+///      - If it is a socket, attempts a connect. On ECONNREFUSED the
 ///        socket is treated as stale and unlinked (a warning is logged).
 ///        On successful connect, throws — another broker is live.
 ///      - If it is not a socket, throws (never unlinks arbitrary files).
@@ -31,19 +32,27 @@ namespace net {
 ///     fd is owned by this process for the lifetime of the listener; it
 ///     is released when the process exits.
 ///
-/// Throws std::runtime_error on any unrecoverable precondition failure.
-void prepare_uds_path(const ss::sstring& path);
+/// The filesystem checks, the stale-socket probe, and the unlink use
+/// Seastar's asynchronous I/O interfaces so the reactor is not blocked.
+/// The final flock(2) step is synchronous: flock has no Seastar equivalent
+/// and the lock must be held on a raw fd for the process lifetime.
+///
+/// The returned future fails with std::runtime_error (or a
+/// std::filesystem::filesystem_error, which derives from it) on any
+/// unrecoverable precondition failure.
+ss::future<> prepare_uds_path(const ss::sstring& path);
 
-/// Apply `chmod(path, mode)`. Called post-listen on shard 0 after the
-/// socket inode has been created by bind(). Throws std::runtime_error on
-/// failure. `mode` defaults to 0660 if nullopt.
-void chmod_uds_path(const ss::sstring& path, std::optional<uint32_t> mode);
+/// Apply `chmod(path, mode)` asynchronously. Called post-listen on shard 0
+/// after the socket inode has been created by bind(). The full mode is
+/// applied, including the setuid/setgid/sticky bits. `mode` defaults to
+/// 0660 if nullopt. The returned future fails on error.
+ss::future<> chmod_uds_path(const ss::sstring& path, std::optional<uint32_t> mode);
 
 /// Post-bind verification (defense-in-depth).
 ///
-/// Re-stats `path` with lstat(2) and asserts that the inode we ended up
-/// with is:
-///   - a socket (`S_ISSOCK`), not a symlink / regular file / anything else;
+/// Re-stats `path` without following symlinks and asserts that the inode we
+/// ended up with is:
+///   - a socket, not a symlink / regular file / anything else;
 ///   - owned by the current effective UID.
 ///
 /// This closes the TOCTOU window between `prepare_uds_path`'s stat/unlink
@@ -52,12 +61,14 @@ void chmod_uds_path(const ss::sstring& path, std::optional<uint32_t> mode);
 /// or a file they own, the mismatch is caught here and the broker fails
 /// to start instead of serving traffic on a surprise inode.
 ///
-/// Throws std::runtime_error if the invariant is violated.
-void verify_uds_bound(const ss::sstring& path);
+/// The returned future fails with std::runtime_error if the invariant is
+/// violated.
+ss::future<> verify_uds_bound(const ss::sstring& path);
 
 /// Best-effort cleanup of a UDS path at graceful shutdown. Unlinks both
 /// `path` and `<path>.lock`. ENOENT is ignored; all other errors are
-/// logged but not thrown (shutdown must proceed).
-void cleanup_uds_path(const ss::sstring& path);
+/// logged but not propagated (shutdown must proceed), so the returned
+/// future never fails.
+ss::future<> cleanup_uds_path(const ss::sstring& path);
 
 } // namespace net

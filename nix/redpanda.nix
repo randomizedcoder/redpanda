@@ -7,7 +7,14 @@
   fetchurl,
   bazel_9,
   bazelisk,
-  llvmPackages_23,
+  # clang 22.1.8 (stable). NOT llvmPackages_23: nixpkgs only ships
+  # 23.1.0-rc1, an unreleased release candidate. That RC miscompiles the
+  # full redpanda build (isolated abseil btree repros pass, but the broker
+  # SIGABRTs on an absl::btree_node metadata invariant during cluster
+  # bootstrap: allocation_state::upsert_allocation_node). Upstream targets
+  # 23.1.0-rc2 from its own redpanda-data/llvm-project fork; nixpkgs has no
+  # rc2, so use the newest stable release instead.
+  llvmPackages_22,
   python312,
   go,
   jdk_headless,
@@ -985,10 +992,10 @@ REPOS_PATCH
 
   nativeBuildInputsDeps = [
     bazelisk
-    llvmPackages_23.libcxxClang
-    llvmPackages_23.lld
-    llvmPackages_23.llvm
-    llvmPackages_23.libcxx
+    llvmPackages_22.libcxxClang
+    llvmPackages_22.lld
+    llvmPackages_22.llvm
+    llvmPackages_22.libcxx
     pythonWithDeps
     go
     jdk_headless
@@ -1222,13 +1229,13 @@ REPOS_PATCH
       "${libtool}/share/aclocal"
       "${pkg-config}/share/aclocal"
     ]}
-    build --action_env=LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib
-    build --host_action_env=LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib
-    build --action_env=LD_LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib:${zlib}/lib
-    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_23.libcxx}/lib:${gccLib}/lib:${zlib}/lib
-    build --linkopt=-Wl,-rpath,${llvmPackages_23.libcxx}/lib
+    build --action_env=LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib
+    build --host_action_env=LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib
+    build --action_env=LD_LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --host_action_env=LD_LIBRARY_PATH=${llvmPackages_22.libcxx}/lib:${gccLib}/lib:${zlib}/lib
+    build --linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
     build --linkopt=-Wl,-rpath,${gccLib}/lib
-    build --host_linkopt=-Wl,-rpath,${llvmPackages_23.libcxx}/lib
+    build --host_linkopt=-Wl,-rpath,${llvmPackages_22.libcxx}/lib
     build --host_linkopt=-Wl,-rpath,${gccLib}/lib
     build --@protobuf//bazel/toolchains:allow_nonstandard_protoc
   '';

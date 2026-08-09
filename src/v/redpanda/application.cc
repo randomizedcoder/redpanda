@@ -231,7 +231,7 @@ void application::shutdown() {
         // must proceed.
         for (const auto& ep : config::node().kafka_api()) {
             if (ep.is_unix_domain()) {
-                net::cleanup_uds_path(*ep.unix_path);
+                net::cleanup_uds_path(*ep.unix_path).get();
             }
         }
     }

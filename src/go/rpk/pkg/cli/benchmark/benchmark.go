@@ -154,6 +154,7 @@ type benchmarkConfig struct {
 	metricsJSON            string
 	waitLeadershipBalanced bool
 	targetRateMBps         float64
+	maxRecords             int64
 }
 
 type benchmarkTiming struct {
@@ -194,6 +195,7 @@ func (cfg *benchmarkConfig) addFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&cfg.metricsJSON, "metrics-json", "", "Optional path to write final metrics JSON")
 	cmd.Flags().BoolVar(&cfg.waitLeadershipBalanced, "wait-leadership-balanced", true, "Wait for topic leadership to become balanced before starting the benchmark")
 	cmd.Flags().Float64Var(&cfg.targetRateMBps, "target-rate", 0, "Target throughput in MB/s (0 = unlimited)")
+	cmd.Flags().Int64Var(&cfg.maxRecords, "max-records", 0, "Stop after this many records are transferred post-warmup (0 = run for --duration); when set, --duration acts as a safety timeout. Transfer a fixed volume with e.g. 1 GiB = 1073741824/record-size records")
 	cmd.MarkFlagsMutuallyExclusive("reset-topic", "use-existing-topic")
 }
 
@@ -217,6 +219,9 @@ func (cfg benchmarkConfig) validate() error {
 	}
 	if cfg.durationS <= 0 {
 		return fmt.Errorf("invalid --duration %d, must be > 0", cfg.durationS)
+	}
+	if cfg.maxRecords < 0 {
+		return fmt.Errorf("invalid --max-records %d, must be >= 0", cfg.maxRecords)
 	}
 	return nil
 }
@@ -426,13 +431,22 @@ func runBenchmarkReporter(
 	for {
 		select {
 		case <-timing.runCtx.Done():
+			// Measure elapsed to the actual stop, not measureEnd: with
+			// --max-records the run ends early once the volume target is
+			// hit, so using measureEnd would understate throughput. Clamp
+			// to measureEnd so the duration-based path is unchanged (its
+			// deadline fires a hair past measureEnd).
+			endTime := time.Now()
+			if endTime.After(timing.measureEnd) {
+				endTime = timing.measureEnd
+			}
 			wait()
 			cpuEnd := readCPU()
 			if ctx.Err() == nil {
-				printStats(statsTable, stats, timing.measureEnd, timing.measureStart, hist)
+				printStats(statsTable, stats, endTime, timing.measureStart, hist)
 			}
 			if metricsJSON != "" {
-				if err := writeMetricsJSON(metricsJSON, computeMetrics(stats, timing.measureEnd, timing.measureStart, hist, cpuStart, cpuEnd)); err != nil {
+				if err := writeMetricsJSON(metricsJSON, computeMetrics(stats, endTime, timing.measureStart, hist, cpuStart, cpuEnd)); err != nil {
 					return err
 				}
 			}

@@ -96,6 +96,9 @@ func runConsumeBenchmark(fs afero.Fs, p *config.Params, cmd *cobra.Command, cfg 
 		cfg.topic,
 		cfg.clients,
 	)
+	if cfg.maxRecords > 0 {
+		fmt.Printf("max_records=%d (fixed-volume mode; --duration is a safety timeout)\n", cfg.maxRecords)
+	}
 	// Skip warmup for consume — topics have finite data and warmup would
 	// exhaust it, leaving nothing for the measurement period.
 	run.timing.measureStart = time.Now()
@@ -105,7 +108,7 @@ func runConsumeBenchmark(fs afero.Fs, p *config.Params, cmd *cobra.Command, cfg 
 		wg.Add(1)
 		go func(cl *kgo.Client) {
 			defer wg.Done()
-			runConsumerLoop(run.timing.runCtx, cl, run.timing.measureStart, stats, hist)
+			runConsumerLoop(run.timing.runCtx, cl, run.timing.measureStart, stats, hist, cfg.maxRecords, run.timing.cancel)
 		}(cl)
 	}
 
@@ -118,6 +121,8 @@ func runConsumerLoop(
 	measureStart time.Time,
 	stats *stats,
 	hist *latencyHistogram,
+	maxRecords int64,
+	stop context.CancelFunc,
 ) {
 	for {
 		if ctx.Err() != nil {
@@ -149,8 +154,15 @@ func runConsumerLoop(
 
 		if fetchRecords > 0 {
 			hist.add(fetchDuration)
-			stats.requests.Add(uint64(fetchRecords))
+			n := stats.requests.Add(uint64(fetchRecords))
 			stats.bytes.Add(uint64(fetchBytes))
+			// Fixed-volume mode: stop once the target record count is
+			// reached. stop() cancels runCtx for all consumer loops and
+			// the reporter.
+			if maxRecords > 0 && n >= uint64(maxRecords) {
+				stop()
+				return
+			}
 		}
 	}
 }

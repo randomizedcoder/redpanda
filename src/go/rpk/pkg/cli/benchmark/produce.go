@@ -113,6 +113,9 @@ func runProduceBenchmark(fs afero.Fs, p *config.Params, cmd *cobra.Command, cfg 
 			cfg.replicas,
 		)
 	}
+	if cfg.maxRecords > 0 {
+		fmt.Printf("max_records=%d (fixed-volume mode; --duration is a safety timeout)\n", cfg.maxRecords)
+	}
 	if run.timing.warmup > 0 {
 		fmt.Printf("warming up for %ds...\n", cfg.warmupS)
 	}
@@ -122,7 +125,7 @@ func runProduceBenchmark(fs afero.Fs, p *config.Params, cmd *cobra.Command, cfg 
 		wg.Add(1)
 		go func(cl *kgo.Client) {
 			defer wg.Done()
-			runProducerLoop(run.timing.runCtx, cl, cfg.topic, payload, run.timing.measureStart, stats, hist, limiter)
+			runProducerLoop(run.timing.runCtx, cl, cfg.topic, payload, run.timing.measureStart, stats, hist, limiter, cfg.maxRecords, run.timing.cancel)
 		}(cl)
 	}
 
@@ -138,6 +141,8 @@ func runProducerLoop(
 	stats *stats,
 	hist *latencyHistogram,
 	limiter *rate.Limiter,
+	maxRecords int64,
+	stop context.CancelFunc,
 ) {
 	for {
 		if ctx.Err() != nil {
@@ -166,8 +171,14 @@ func runProducerLoop(
 				return
 			}
 			hist.add(time.Since(start))
-			stats.requests.Add(1)
+			n := stats.requests.Add(1)
 			stats.bytes.Add(payloadLen)
+			// Fixed-volume mode: stop the whole run once the target record
+			// count is reached. stop() cancels runCtx, which every producer
+			// loop and the reporter observe.
+			if maxRecords > 0 && n >= uint64(maxRecords) {
+				stop()
+			}
 		})
 	}
 	// Flush remaining buffered records before exiting.

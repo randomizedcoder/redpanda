@@ -1,27 +1,31 @@
 {
   lib,
   buildGoModule,
-  fetchFromGitHub,
   installShellFiles,
 }:
 
 let
   version = "0.0.0-dev";
-  rev = "ae5f867664a0160428d904a6c9ee835d4f979bd1";
+  # Stamp only; not used to fetch. Marks this as the local UDS-enabled build.
+  rev = "local-uds";
 in
 buildGoModule {
   pname = "redpanda-rpk";
   inherit version;
 
-  src = fetchFromGitHub {
-    owner = "redpanda-data";
-    repo = "redpanda";
-    inherit rev;
-    hash = "sha256-lt0z25GBSq6aqiuE4Cedjpe3rxSa7wmve5tFv1gnzHo=";
-  };
+  # Build rpk from the LOCAL source tree so the Kafka UDS listener client
+  # support (PR #30240: `unix://` brokers via rewriteUnixBrokers / UDSDialer in
+  # pkg/kafka) is included. This previously used `fetchFromGitHub` at an
+  # upstream rev that predates the UDS patch, so the built rpk silently lacked
+  # `unix://` support while the (locally-built) broker had the UDS listener --
+  # producing "unable to parse port from addr" when a client used a unix://
+  # seed. `src/go/rpk/go.mod` is a self-contained module (no replace
+  # directives), so the source root is the module root.
+  src = ../src/go/rpk;
 
-  modRoot = "src/go/rpk";
-  vendorHash = "sha256-44doWJ3SB0FN0uYVgPEQRfaWhiC78d5+zQhx7K3La+k=";
+  # Recomputed for the local (rebased-on-dev) go.mod/go.sum; the old value was
+  # upstream ae5f867's dependency set and no longer matches.
+  vendorHash = "sha256-4Shqj+8or4trXKn6l4q+ouWNTID5hdyVfisEWXrhGiE=";
 
   ldflags =
     let

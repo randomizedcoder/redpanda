@@ -7,14 +7,32 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0
 
-# End-to-end UDS vs TCP benchmark (produce, consume, rate-limited).
+# End-to-end validation of the AF_UNIX Kafka listener via rpk, comparing a
+# `unix://` seed against a TCP seed (produce, consume, rate-limited).
 #
 # Starts a single-node Redpanda with both a TCP listener (port 9092) and
 # a UDS listener (/var/lib/redpanda/kafka.sock), then runs rpk benchmark
-# through each transport on the broker node and compares throughput,
-# latency, and CPU usage.
+# through each seed on the broker node.
 #
-# Both transports are exercised from the same machine to eliminate network
+# IMPORTANT — what these tests do and do NOT measure:
+#   rpk's franz client uses the UDS transport ONLY for the initial metadata
+#   fetch against a `unix://` seed. UDS listeners are non-advertisable by
+#   design, so once kgo has metadata it keys its per-broker connection pool
+#   on the TCP address returned in that metadata, and ALL produce/consume
+#   payload flows over TCP — including to the same broker that served the
+#   metadata. See src/go/rpk/pkg/kafka/client_franz.go (Scope of UDS in the
+#   connection lifecycle). Consequently the MB/s and latency figures below
+#   are NOT a UDS-vs-TCP data-plane comparison: they characterize the whole
+#   rpk client experience over each seed, and the two transports are expected
+#   to be ~equal. Their value is functional (the UDS bootstrap path works and
+#   carries a real workload end-to-end), not throughput.
+#
+#   Raw AF_UNIX-vs-TCP socket throughput / connect / round-trip latency — the
+#   actual ~2x UDS win — is measured by the C++ seastar microbenchmarks in
+#   src/v/net/tests: uds_throughput_bench, uds_connect_bench, uds_rtt_bench,
+#   uds_sustained_bench, uds_concurrency_bench.
+#
+# Both seeds are exercised from the same machine to eliminate network
 # variability. UDS is AF_UNIX (local-only), so the benchmark client must
 # run on the broker node.
 
@@ -52,7 +70,15 @@ class BenchResult:
 
 
 class RpkUdsBenchmarkPerf(RedpandaPerfTest):
-    """Compare rpk benchmark produce over TCP vs UDS on the same broker."""
+    """Validate the UDS Kafka listener end-to-end via rpk over a `unix://`
+    seed vs a TCP seed on the same broker.
+
+    Note: rpk uses UDS only to bootstrap metadata; produce/consume payload
+    rides the advertised TCP listener by design (see the module docstring),
+    so the throughput/latency numbers are a whole-client comparison expected
+    to be ~equal, not a UDS data-plane speedup. Raw UDS-vs-TCP socket perf
+    lives in the C++ net/tests/uds_*_bench microbenchmarks.
+    """
 
     PARTITIONS = 6
     REPLICAS = 1
@@ -68,6 +94,14 @@ class RpkUdsBenchmarkPerf(RedpandaPerfTest):
         (10240, 1),
         (10240, 10),
     ]
+
+    # Fixed-volume (1 GiB) transfer per (transport, record size). This is the
+    # "1 GB of input through Kafka" comparison, driven by
+    # `rpk benchmark produce --max-records`.
+    ONE_GIB = 1 << 30
+    ONE_GB_SIZES = [1024, 16384, 131072]  # 1 KiB, 16 KiB, 128 KiB
+    ONE_GB_CLIENTS = 8
+    ONE_GB_SAFETY_DURATION_S = 600
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         resource_settings = ResourceSettings(num_cpus=2)
@@ -101,6 +135,8 @@ class RpkUdsBenchmarkPerf(RedpandaPerfTest):
         mode: str = "produce",
         target_rate: float = 0,
         topic: str | None = None,
+        max_records: int = 0,
+        duration_s: int | None = None,
     ) -> BenchResult:
         if topic is None:
             topic = f"bench-{transport}-{record_size}b-{clients}c"
@@ -109,12 +145,16 @@ class RpkUdsBenchmarkPerf(RedpandaPerfTest):
         node.account.remove(METRICS_PATH, allow_fail=True)
         node.account.remove(LOG_PATH, allow_fail=True)
 
+        # In fixed-volume (--max-records) mode, --duration is only a safety
+        # timeout, so the caller passes a generous duration_s.
+        duration = duration_s if duration_s is not None else self.DURATION_S
+
         cmd = (
             f"{rpk} -X brokers={brokers} benchmark {mode} "
             f"--topic {topic} "
             f"--clients {clients} "
             f"--warmup {self.WARMUP_S} "
-            f"--duration {self.DURATION_S} "
+            f"--duration {duration} "
             f"--metrics-json {METRICS_PATH} "
             f"--wait-leadership-balanced={'true' if mode == 'produce' else 'false'}"
         )
@@ -128,6 +168,8 @@ class RpkUdsBenchmarkPerf(RedpandaPerfTest):
                 cmd += f" --target-rate {target_rate}"
         elif mode == "consume":
             cmd += " --use-existing-topic"
+        if max_records > 0:
+            cmd += f" --max-records {max_records}"
 
         wrapped = f"nohup {cmd} >> {LOG_PATH} 2>&1 & echo $!"
         pid = int(
@@ -137,7 +179,7 @@ class RpkUdsBenchmarkPerf(RedpandaPerfTest):
             f"Spawned rpk benchmark {mode} ({transport}) pid={pid}"
         )
 
-        timeout = self.WARMUP_S + self.DURATION_S + 120
+        timeout = self.WARMUP_S + duration + 120
         wait_until(
             lambda: not node.account.exists(f"/proc/{pid}"),
             timeout_sec=timeout,
@@ -166,6 +208,100 @@ class RpkUdsBenchmarkPerf(RedpandaPerfTest):
             cpu_user_sec=float(metrics.get("cpu_user_sec", 0)),
             cpu_sys_sec=float(metrics.get("cpu_sys_sec", 0)),
         )
+
+    @cluster(num_nodes=3)
+    def test_uds_vs_tcp_1gb(self) -> None:
+        """Push a fixed 1 GiB per seed/record-size and confirm parity.
+
+        The fixed-volume counterpart to the duration-based produce test: each
+        run produces exactly 1 GiB of record payload (via
+        `rpk benchmark produce --max-records`) over a TCP seed and a `unix://`
+        seed. --duration acts only as a safety timeout here.
+
+        This is a FUNCTIONAL test: it proves the UDS bootstrap path carries a
+        real 1 GiB workload end-to-end without errors. It is NOT a UDS
+        throughput win — the payload rides TCP in both runs (see the module
+        docstring), so the two MB/s numbers are expected to be ~equal
+        (ratio ~1.0). For the raw UDS-vs-TCP socket throughput, see the C++
+        net/tests/uds_throughput_bench / uds_sustained_bench microbenchmarks.
+        """
+        node = self.redpanda.nodes[0]
+        tcp_brokers = f"{node.account.hostname}:9092"
+        uds_brokers = f"unix://{UDS_SOCKET_PATH}"
+
+        results: list[tuple[int, int, BenchResult, BenchResult]] = []
+        for record_size in self.ONE_GB_SIZES:
+            max_records = self.ONE_GIB // record_size
+            label = (
+                f"{self._format_size(record_size)} x {max_records} records "
+                f"= 1 GiB"
+            )
+            self.logger.info(f"--- {label} ---")
+
+            tcp = self._run_bench_on_node(
+                node, "tcp", tcp_brokers, record_size, self.ONE_GB_CLIENTS,
+                max_records=max_records,
+                duration_s=self.ONE_GB_SAFETY_DURATION_S,
+            )
+            assert tcp.errors == 0, f"TCP bench errors: {tcp.errors}"
+            self.logger.info(
+                f"TCP:  {tcp.mb_per_sec:.2f} MB/s, p99 {tcp.p99_latency_us:.0f}us"
+            )
+
+            uds = self._run_bench_on_node(
+                node, "uds", uds_brokers, record_size, self.ONE_GB_CLIENTS,
+                max_records=max_records,
+                duration_s=self.ONE_GB_SAFETY_DURATION_S,
+            )
+            assert uds.errors == 0, f"UDS bench errors: {uds.errors}"
+            self.logger.info(
+                f"UDS:  {uds.mb_per_sec:.2f} MB/s, p99 {uds.p99_latency_us:.0f}us"
+            )
+
+            results.append((record_size, max_records, tcp, uds))
+
+        # Summary: throughput, derived wall-time for the 1 GiB, p99, ratios.
+        # Ratios are uds/tcp. Because payload rides TCP in both runs (UDS is
+        # bootstrap-only), the MB ratio is expected to be ~1.0; a large
+        # deviation signals measurement noise or a regression, NOT a UDS
+        # data-plane effect.
+        one_gib_mb = self.ONE_GIB / (1024 * 1024)
+        self.logger.info("")
+        self.logger.info("=" * 104)
+        self.logger.info(
+            " UDS vs TCP — fixed 1 GiB produce (rpk --max-records)"
+        )
+        self.logger.info("=" * 104)
+        self.logger.info(
+            f"{'MsgSize':>8} "
+            f"{'TCP MB/s':>10} {'UDS MB/s':>10} {'MB Ratio':>10} "
+            f"{'TCP t(s)':>10} {'UDS t(s)':>10} "
+            f"{'TCP p99':>10} {'UDS p99':>10} {'p99 Ratio':>10}"
+        )
+        self.logger.info("-" * 104)
+        for record_size, _max_records, tcp, uds in results:
+            mb_ratio = (
+                uds.mb_per_sec / tcp.mb_per_sec if tcp.mb_per_sec > 0 else 0
+            )
+            tcp_time = one_gib_mb / tcp.mb_per_sec if tcp.mb_per_sec > 0 else 0
+            uds_time = one_gib_mb / uds.mb_per_sec if uds.mb_per_sec > 0 else 0
+            p99_ratio = (
+                uds.p99_latency_us / tcp.p99_latency_us
+                if tcp.p99_latency_us > 0
+                else 0
+            )
+            self.logger.info(
+                f"{self._format_size(record_size):>8} "
+                f"{tcp.mb_per_sec:>10.2f} "
+                f"{uds.mb_per_sec:>10.2f} "
+                f"{mb_ratio:>9.2f}x "
+                f"{tcp_time:>10.2f} "
+                f"{uds_time:>10.2f} "
+                f"{tcp.p99_latency_us:>10.0f} "
+                f"{uds.p99_latency_us:>10.0f} "
+                f"{p99_ratio:>9.2f}x"
+            )
+        self.logger.info("=" * 104)
 
     def _format_size(self, size: int) -> str:
         if size >= 1024:

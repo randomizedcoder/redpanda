@@ -983,7 +983,7 @@ void application::wire_up_redpanda_services(
                       // 0 before any shard attempts to bind. Remaining
                       // shards skip these filesystem operations.
                       if (ss::this_shard_id() == 0) {
-                          net::prepare_uds_path(*ep.unix_path);
+                          net::prepare_uds_path(*ep.unix_path).get();
                       }
                       saddr = ss::socket_address(
                         ss::unix_domain_addr(std::string(*ep.unix_path)));
